@@ -4,7 +4,7 @@ lecture-localizer is at the design stage. Useful contributions include workflow 
 
 ## Discuss a change
 
-Open an issue describing the user problem, inputs, expected outputs, and how to judge success. Search existing issues first. Agree the scope before starting a feature or adding dependencies; the implementation stack and provider are not selected yet.
+Open an issue describing the user problem, inputs, expected outputs, and how to judge success. Search existing issues first. Agree the scope before starting a feature or adding dependencies. Read the [feature specification](docs/specs/001-lecture-localization/spec.md) for approved choices and remaining technical decisions.
 
 For documentation problems, link the affected file and explain the correction. Do not include credentials, personal data, restricted course material, or private provider responses in issues or pull requests. For vulnerabilities, follow [SECURITY.md](SECURITY.md).
 

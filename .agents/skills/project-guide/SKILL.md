@@ -28,7 +28,7 @@ These terms describe the current proposal, not implemented formats or approved i
 | Narration text | A separate speech-oriented rendition; editing it must not silently replace the full translation |
 | Verification report | Evidence about the produced media; container and timing checks alone do not establish translation quality |
 
-File formats, timing policy, resumption rules and acceptance criteria remain for the feature contract.
+Read the approved scenario linked in the knowledge index for resumption requirements, acceptance criteria and open technical choices.
 
 ## Development of this guide
 

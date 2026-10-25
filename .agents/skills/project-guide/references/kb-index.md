@@ -6,7 +6,7 @@ Paths are relative to the repository root.
 |---|---|
 | Purpose and status | `README.md` |
 | Work rules and checks | `AGENTS.md` |
-| Feature requirements, plans and tasks | `docs/specs/<NNN-feature>/` |
+| Approved first lecture localization scenario | `docs/specs/001-lecture-localization/spec.md` |
 | Architecture decisions | `docs/adr/` |
 
-The specification and ADR directories are currently empty.
+Architecture decisions are not yet recorded.
