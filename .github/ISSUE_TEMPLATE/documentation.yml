@@ -1,0 +1,20 @@
+name: Documentation correction
+description: Report incorrect, unclear, or missing project documentation.
+body:
+  - type: markdown
+    attributes:
+      value: Use this form for documentation problems. Do not include secrets, personal data, or sensitive security details.
+  - type: input
+    id: location
+    attributes:
+      label: File or section
+      description: Link or name the affected document and section.
+    validations:
+      required: true
+  - type: textarea
+    id: correction
+    attributes:
+      label: Problem and suggested correction
+      description: Explain what is wrong or missing, and include a source or example if available.
+    validations:
+      required: true

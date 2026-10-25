@@ -1,0 +1,27 @@
+name: Workflow proposal
+description: Describe a lecture localization need or proposed workflow.
+body:
+  - type: markdown
+    attributes:
+      value: Describe a concrete use case. Do not attach credentials, personal data, or restricted media.
+  - type: textarea
+    id: problem
+    attributes:
+      label: User and problem
+      description: Who needs this, and what is difficult in their current workflow?
+    validations:
+      required: true
+  - type: textarea
+    id: artifacts
+    attributes:
+      label: Inputs and expected outputs
+      description: Describe the available media, subtitles, languages, and desired result. Use synthetic examples where possible.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Success criteria and limits
+      description: How would you judge the result? What requires human review, and when should processing stop?
+    validations:
+      required: true
