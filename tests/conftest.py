@@ -443,7 +443,9 @@ def plant_artifact_record(
     return relative
 
 
-def plant_complete_cache(job_dir: Path) -> None:
+def plant_complete_cache(
+    job_dir: Path, data: bytes = b'synthetic cached bytes'
+) -> None:
     """Plant raw, fitted, subtitle and container records for a manifest."""
     manifest = json.loads(
         (job_dir / 'manifest.json').read_text(encoding='utf-8')
@@ -454,16 +456,22 @@ def plant_complete_cache(job_dir: Path) -> None:
             'raw_response',
             segment['id'],
             segment['synthesis_signature'],
+            data=data,
         )
         plant_artifact_record(
             job_dir,
             'fitted_audio',
             segment['id'],
             segment['fitting_signature'],
+            data=data,
         )
     plant_artifact_record(
-        job_dir, 'subtitles', None, manifest['subtitle_signature']
+        job_dir, 'subtitles', None, manifest['subtitle_signature'], data=data
     )
     plant_artifact_record(
-        job_dir, 'container_track', None, manifest['container_signature']
+        job_dir,
+        'container_track',
+        None,
+        manifest['container_signature'],
+        data=data,
     )

@@ -61,6 +61,10 @@ SDIST_ALLOWLIST = {
     "scripts",
 }
 FORBIDDEN = ("private", ".memory", ".agents", ".venv", ".github", ".git")
+SCHEMA_RESOURCES = (
+    "schemas/translation-v1.schema.json",
+    "schemas/job-v1.schema.json",
+)
 EXPECTED_SDIST = (
     "src/lecture_localizer/cli.py",
     "src/lecture_localizer/contracts.py",
@@ -69,8 +73,7 @@ EXPECTED_SDIST = (
     "src/lecture_localizer/settings.py",
     "src/lecture_localizer/storage.py",
     "src/lecture_localizer/subtitles.py",
-    "src/lecture_localizer/schemas/translation-v1.schema.json",
-    "src/lecture_localizer/schemas/job-v1.schema.json",
+    *(f"src/lecture_localizer/{name}" for name in SCHEMA_RESOURCES),
     "src/lecture_localizer/__init__.py",
     "tests/test_media.py",
     "tests/test_contracts.py",
@@ -122,10 +125,8 @@ def runtime_data_members(
             continue
         if relative.endswith(".py"):
             continue
-        if relative.startswith("schemas/"):
-            nested = relative[len("schemas/") :]
-            if "/" not in nested and nested.endswith(".json"):
-                continue
+        if relative in SCHEMA_RESOURCES:
+            continue
         offenders.append(name)
     return offenders
 
@@ -140,6 +141,10 @@ control_runtime = validate_sdist(
     ]
     + [prefix + name for name in EXPECTED_SDIST]
 )
+control_schema_data = validate_sdist(
+    [prefix + "src/lecture_localizer/schemas/manifest.json"]
+    + [prefix + name for name in EXPECTED_SDIST]
+)
 control_ok = validate_sdist(
     [prefix + name for name in SDIST_ALLOWLIST if name != "PKG-INFO"]
     + [prefix + name for name in EXPECTED_SDIST]
@@ -150,6 +155,8 @@ if control_missing is None or "missing expected product files" not in control_mi
     raise SystemExit("privacy gate failed its completeness control")
 if control_runtime is None or "runtime or user data" not in control_runtime:
     raise SystemExit("privacy gate failed its runtime data control")
+if control_schema_data is None or "runtime or user data" not in control_schema_data:
+    raise SystemExit("privacy gate failed its schema data control")
 if control_ok is not None:
     raise SystemExit(f"privacy gate failed its allowlist control: {control_ok}")
 
@@ -165,10 +172,7 @@ wheel_ok = all(
     name.startswith("lecture_localizer/") or name.startswith("lecture_localizer-")
     for name in wheel_members
 )
-SCHEMA_MEMBERS = (
-    "lecture_localizer/schemas/translation-v1.schema.json",
-    "lecture_localizer/schemas/job-v1.schema.json",
-)
+SCHEMA_MEMBERS = tuple(f"lecture_localizer/{name}" for name in SCHEMA_RESOURCES)
 missing_schemas = [name for name in SCHEMA_MEMBERS if name not in wheel_members]
 wheel_runtime = runtime_data_members(
     [

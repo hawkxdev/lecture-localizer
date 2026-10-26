@@ -1040,7 +1040,7 @@ def test_return_to_retained_signature_reuses_history(tmp_path: Path) -> None:
         variant_path, kit['video'], kit['srt']
     )
     run_prepare(kit, translation=variant_translation)
-    plant_complete_cache(kit['job'])
+    plant_complete_cache(kit['job'], data=b'different synthetic B response')
     original_path = tmp_path / 'original-restored.json'
     original_path.write_text(
         json.dumps(original, ensure_ascii=False, indent=2), encoding='utf-8'
@@ -1052,14 +1052,19 @@ def test_return_to_retained_signature_reuses_history(tmp_path: Path) -> None:
     status = read_job_status(kit['job'])
     assert status['stages']['synthesis']['state'] == 'complete'
     assert status['stages']['fitting']['state'] == 'complete'
+    assert status['stages']['subtitle']['state'] == 'complete'
+    assert status['stages']['container']['state'] == 'complete'
     assert status['reuse']['synthesis']['preserved'] == ['s001', 's002']
     assert status['reuse']['fitting']['preserved'] == ['s001', 's002']
     assert status['reuse']['synthesis']['invalidated'] == {}
     current = json.loads(manifest_path.read_text(encoding='utf-8'))
-    for record in current['artifacts']:
+    for key, record in a_records.items():
+        assert (kit['job'] / record['path']).read_bytes() == a_bytes[key]
+    later_records = current['artifacts'][len(planted['artifacts']) :]
+    assert later_records
+    for record in later_records:
         key = (record['kind'], record['segment'])
-        if key in a_bytes:
-            assert (kit['job'] / record['path']).read_bytes() == a_bytes[key]
+        assert (kit['job'] / record['path']).read_bytes() != a_bytes[key]
     paths = [record['path'] for record in current['artifacts']]
     assert len(paths) == len(set(paths))
     signatures = {record['signature'] for record in current['artifacts']}
