@@ -86,21 +86,27 @@ class CredentialValueTrap(Mapping[str, str]):
     """
 
     def __init__(self, data: dict[str, str]) -> None:
+        """Store the backing environment data."""
         self._data = data
 
     def __getitem__(self, key: str) -> str:
+        """Return a value and forbid reading credential named values."""
         if CREDENTIAL_ENV_PATTERN.search(key):
             raise AssertionError(f'credential value read attempted for {key}')
         return self._data[key]
 
     def __setitem__(self, key: str, value: str) -> None:
+        """Store a key and its value."""
         self._data[key] = value
 
     def __delitem__(self, key: str) -> None:
+        """Remove a key and its value."""
         del self._data[key]
 
     def __iter__(self) -> Iterator[str]:
+        """Iterate over the stored keys."""
         return iter(self._data)
 
     def __len__(self) -> int:
+        """Return the number of stored keys."""
         return len(self._data)

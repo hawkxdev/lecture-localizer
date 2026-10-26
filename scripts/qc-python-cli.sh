@@ -73,6 +73,7 @@ EXPECTED_SDIST = (
 
 
 def validate_sdist(raw_members: list[str]) -> str | None:
+    """Return a rejection reason for a raw member list, or None."""
     members = [name[len(prefix) :] if name.startswith(prefix) else name for name in raw_members]
     members = [name for name in members if name]
     roots = {name.split("/")[0] for name in members}
