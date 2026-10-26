@@ -13,7 +13,7 @@ Use one Git root. Code belongs in `src/`, tests in `tests/`, utilities in `scrip
 ## Checks and boundaries
 
 - Run checks locally; do not introduce GitHub Actions or external execution.
-- Product setup, test and build commands do not exist yet. From the root, `git diff --check` checks tracked changes; `gitleaks git . --no-banner --redact` requires Gitleaks and committed history. Neither tests localization.
+- Local quality runner: `scripts/qc-python-cli.sh` from the root installs `.venv` when missing, then runs Ruff format/check, mypy, the stage tests, the package build and a wheel install smoke test, propagating failures. The doctor tests require locally installed FFmpeg, ffprobe and MP4Box; full diagnostics also use them. From the root, `git diff --check` checks tracked changes; `gitleaks git . --no-banner --redact` requires Gitleaks and committed history.
 - The first commit requires explicit owner approval of the prepared result, including an empty seed. Initialization permission does not replace it.
 - Repository creation, new remotes, publication, deployment and paid provider calls require explicit authorization.
 - Preserve source media and existing outputs. Keep credentials, personal data, restricted course assets and provider responses outside Git and distribution; use original or rights-cleared synthetic fixtures. Review donor source and licensing before importing code.

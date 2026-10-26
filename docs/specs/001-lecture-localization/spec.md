@@ -2,7 +2,7 @@
 
 ## Preparation state
 
-Feature phase: `preparing`. This specification owns the scenario and its phase record. The scenario, acceptance criteria and technical choices below are approved. The initial speedup limit remains subject to listening validation. The [implementation plan](plan.md) and its stage sequence are approved. Implementation and runtime acceptance have not started. Next action: select and assign the first implementation stage. A live pilot needs its own protocol and authorization.
+Feature phase: `in_progress`. This specification owns the scenario and its phase record. The scenario, acceptance criteria and technical choices below are approved. The initial speedup limit remains subject to listening validation. The [implementation plan](plan.md) and its stage sequence are approved. Stage 1 (installable package and local tool checks) is assigned and under implementation through [issue 5](https://github.com/hawkxdev/lecture-localizer/issues/5); runtime acceptance has not started. A live pilot needs its own protocol and authorization.
 
 ## User and purpose
 
