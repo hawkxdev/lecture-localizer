@@ -1,40 +1,46 @@
+"""Tests for the command line interface."""
+
 from __future__ import annotations
 
 import json
+import os
 from importlib.metadata import version
 from pathlib import Path
 
 import pytest
 
-from conftest import real_tool_paths
+from conftest import CredentialValueTrap, real_tool_paths
 from lecture_localizer import __version__
 from lecture_localizer.cli import main
+from lecture_localizer.media import CREDENTIAL_ENV_PATTERN
 from lecture_localizer.settings import SETTINGS_ENV_VAR
 
 
-def test_help_advertises_only_doctor(capsys: pytest.CaptureFixture[str]) -> None:
+def test_help_advertises_only_doctor(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     with pytest.raises(SystemExit) as excinfo:
-        main(["--help"])
+        main(['--help'])
     assert excinfo.value.code == 0
     out = capsys.readouterr().out
-    assert "{doctor}" in out
-    assert "prepare" not in out
-    assert "assemble" not in out
-    assert "status" not in out
+    assert '{doctor}' in out
+    assert 'prepare' not in out
+    assert 'assemble' not in out
+    assert 'status' not in out
 
 
 def test_version_flag_prints_package_version(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     with pytest.raises(SystemExit) as excinfo:
-        main(["--version"])
+        main(['--version'])
     assert excinfo.value.code == 0
     assert __version__ in capsys.readouterr().out
 
 
 def test_unknown_command_exits_with_usage_code() -> None:
     with pytest.raises(SystemExit) as excinfo:
-        main(["no-such-command"])
+        main(['no-such-command'])
     assert excinfo.value.code == 2
 
 
@@ -45,32 +51,56 @@ def test_missing_command_exits_with_usage_code() -> None:
 
 
 def test_invalid_settings_exit_with_code_3(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    path = tmp_path / "bad-settings.json"
-    path.write_text(json.dumps({"api_key": "nope"}), encoding="utf-8")
+    path = tmp_path / 'bad-settings.json'
+    path.write_text(json.dumps({'api_key': 'nope'}), encoding='utf-8')
     monkeypatch.setenv(SETTINGS_ENV_VAR, str(path))
-    assert main(["doctor"]) == 3
-    assert "invalid settings" in capsys.readouterr().err
+    assert main(['doctor']) == 3
+    assert 'invalid settings' in capsys.readouterr().err
 
 
 def test_unreadable_settings_exit_with_code_7(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setenv(SETTINGS_ENV_VAR, str(tmp_path / "absent.json"))
-    assert main(["doctor"]) == 7
-    assert "cannot be read" in capsys.readouterr().err
+    monkeypatch.setenv(SETTINGS_ENV_VAR, str(tmp_path / 'absent.json'))
+    assert main(['doctor']) == 7
+    assert 'cannot be read' in capsys.readouterr().err
+
+
+def test_huge_integer_timeout_exits_3_without_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / 'huge-timeout.json'
+    path.write_text(
+        json.dumps({'subprocess_timeout_seconds': 10**400}), encoding='utf-8'
+    )
+    monkeypatch.setenv(SETTINGS_ENV_VAR, str(path))
+    assert main(['doctor']) == 3
+    captured = capsys.readouterr()
+    assert 'representable' in captured.err
+    assert 'Traceback' not in captured.err
+    assert 'Traceback' not in captured.out
 
 
 def test_installed_metadata_matches_package_version() -> None:
-    assert version("lecture-localizer") == __version__
+    assert version('lecture-localizer') == __version__
 
 
 def _require_real_tools() -> None:
+    """Fail the test when the real local media tools are absent."""
     paths = real_tool_paths()
     missing = [name for name, path in paths.items() if path is None]
     if missing:
-        pytest.fail(f"required setup prerequisite: local media tools absent: {missing}")
+        pytest.fail(
+            f'required setup prerequisite: local media tools absent: {missing}'
+        )
 
 
 def test_doctor_json_success_with_real_tools(
@@ -78,12 +108,12 @@ def test_doctor_json_success_with_real_tools(
 ) -> None:
     _require_real_tools()
     monkeypatch.delenv(SETTINGS_ENV_VAR, raising=False)
-    assert main(["doctor", "--json"]) == 0
+    assert main(['doctor', '--json']) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["ok"] is True
-    assert payload["command"] == "doctor"
-    names = {tool["name"] for tool in payload["tools"]}
-    assert names == {"ffmpeg", "ffprobe", "mp4box"}
+    assert payload['ok'] is True
+    assert payload['command'] == 'doctor'
+    names = {tool['name'] for tool in payload['tools']}
+    assert names == {'ffmpeg', 'ffprobe', 'mp4box'}
 
 
 def test_doctor_human_success_with_real_tools(
@@ -91,10 +121,10 @@ def test_doctor_human_success_with_real_tools(
 ) -> None:
     _require_real_tools()
     monkeypatch.delenv(SETTINGS_ENV_VAR, raising=False)
-    assert main(["doctor"]) == 0
+    assert main(['doctor']) == 0
     out = capsys.readouterr().out
-    assert "doctor: OK" in out
-    assert "mp4box track flag rewrite" in out
+    assert 'doctor: OK' in out
+    assert 'mp4box track flag rewrite' in out
 
 
 def test_doctor_json_failure_reports_missing_tools_exit_7(
@@ -102,14 +132,14 @@ def test_doctor_json_failure_reports_missing_tools_exit_7(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    empty = tmp_path / "empty-bin"
+    empty = tmp_path / 'empty-bin'
     empty.mkdir()
-    monkeypatch.setenv("PATH", str(empty))
+    monkeypatch.setenv('PATH', str(empty))
     monkeypatch.delenv(SETTINGS_ENV_VAR, raising=False)
-    assert main(["doctor", "--json"]) == 7
+    assert main(['doctor', '--json']) == 7
     payload = json.loads(capsys.readouterr().out)
-    assert payload["ok"] is False
-    assert all(tool["ok"] is False for tool in payload["tools"])
+    assert payload['ok'] is False
+    assert all(tool['ok'] is False for tool in payload['tools'])
 
 
 def test_doctor_json_reports_unusable_tool_exit_7(
@@ -117,17 +147,19 @@ def test_doctor_json_reports_unusable_tool_exit_7(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    unusable = tmp_path / "not-executable-ffmpeg"
-    unusable.write_text("data", encoding="utf-8")
-    settings = tmp_path / "settings.json"
-    settings.write_text(json.dumps({"ffmpeg_path": str(unusable)}), encoding="utf-8")
+    unusable = tmp_path / 'not-executable-ffmpeg'
+    unusable.write_text('data', encoding='utf-8')
+    settings = tmp_path / 'settings.json'
+    settings.write_text(
+        json.dumps({'ffmpeg_path': str(unusable)}), encoding='utf-8'
+    )
     monkeypatch.setenv(SETTINGS_ENV_VAR, str(settings))
-    assert main(["doctor", "--json"]) == 7
+    assert main(['doctor', '--json']) == 7
     payload = json.loads(capsys.readouterr().out)
-    ffmpeg = payload["tools"][0]
-    assert ffmpeg["name"] == "ffmpeg"
-    assert ffmpeg["ok"] is False
-    assert "not an executable file" in ffmpeg["detail"]
+    ffmpeg = payload['tools'][0]
+    assert ffmpeg['name'] == 'ffmpeg'
+    assert ffmpeg['ok'] is False
+    assert 'not executable' in ffmpeg['detail']
 
 
 def test_doctor_never_reads_or_prints_provider_key(
@@ -135,12 +167,27 @@ def test_doctor_never_reads_or_prints_provider_key(
 ) -> None:
     _require_real_tools()
     monkeypatch.delenv(SETTINGS_ENV_VAR, raising=False)
-    sentinel = "sk-test-doctor-sentinel"
-    monkeypatch.setenv("XAI_API_KEY", sentinel)
-    assert main(["doctor", "--json"]) == 0
+    sentinel = 'sk-test-doctor-sentinel'
+    monkeypatch.setenv('XAI_API_KEY', sentinel)
+    assert main(['doctor', '--json']) == 0
     captured = capsys.readouterr()
     assert sentinel not in captured.out
     assert sentinel not in captured.err
+
+
+def test_doctor_succeeds_without_reading_credential_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_real_tools()
+    monkeypatch.delenv(SETTINGS_ENV_VAR, raising=False)
+    canary = 'sk-test-canary-not-real'
+    safe = {
+        key: canary if CREDENTIAL_ENV_PATTERN.search(key) else value
+        for key, value in os.environ.items()
+    }
+    safe.setdefault('XAI_API_KEY', canary)
+    monkeypatch.setattr(os, 'environ', CredentialValueTrap(safe))
+    assert main(['doctor', '--json']) == 0
 
 
 def test_doctor_reports_mp4box_functional_capability(
@@ -148,12 +195,14 @@ def test_doctor_reports_mp4box_functional_capability(
 ) -> None:
     _require_real_tools()
     monkeypatch.delenv(SETTINGS_ENV_VAR, raising=False)
-    assert main(["doctor", "--json"]) == 0
+    assert main(['doctor', '--json']) == 0
     payload = json.loads(capsys.readouterr().out)
-    mp4box = next(tool for tool in payload["tools"] if tool["name"] == "mp4box")
+    mp4box = next(
+        tool for tool in payload['tools'] if tool['name'] == 'mp4box'
+    )
     rewrite = next(
         cap
-        for cap in mp4box["capabilities"]
-        if cap["requirement"] == "mp4box track flag rewrite"
+        for cap in mp4box['capabilities']
+        if cap['requirement'] == 'mp4box track flag rewrite'
     )
-    assert rewrite["ok"] is True
+    assert rewrite['ok'] is True

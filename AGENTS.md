@@ -2,7 +2,7 @@
 
 ## Project sources
 
-Read `README.md` for purpose and status, and `.agents/skills/project-guide/SKILL.md` for media concepts and project knowledge. The current phase is design; approved choices and open technical decisions belong to the [feature specification](docs/specs/001-lecture-localization/spec.md).
+Read `README.md` for purpose and status, and `.agents/skills/project-guide/SKILL.md` for media concepts and project knowledge. The current feature phase is owned by the [feature specification](docs/specs/001-lecture-localization/spec.md) Preparation state, together with its approved choices and open technical decisions.
 
 Before implementation, agree the intended user, inputs, outputs, automation boundaries, stop conditions and acceptance criteria in the feature contract. Proposed behavior is not an implementation assignment.
 

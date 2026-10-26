@@ -32,8 +32,10 @@ The runner creates `.venv` when it is missing and then, propagating every failur
 Synthetic, rights-safe media fixtures are created only in an explicit new directory:
 
 ```sh
-python scripts/make-synthetic-example.py NEW_DIRECTORY
+.venv/bin/python scripts/make-synthetic-example.py NEW_DIRECTORY
 ```
+
+The generator launches FFmpeg with a credential-scrubbed environment and uses the installed package, so run it with the project environment's Python as shown.
 
 For documentation-only changes, read the rendered text, check relative links, and run these whitespace checks from the repository root:
 
