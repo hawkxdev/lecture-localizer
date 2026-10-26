@@ -11,6 +11,4 @@ Paths are relative to the repository root.
 | Implemented media/artifact vocabulary | [project-guide body](../SKILL.md) |
 | Contribution workflow and local checks | `CONTRIBUTING.md` |
 
-The approved plan owns architecture decisions for feature 001; stage
-records and per-task evidence live with each task cycle, and no separate
-`docs/adr/` entries exist yet.
+The approved plan owns architecture decisions for feature 001; stage records and per-task evidence live with each task cycle, and no separate `docs/adr/` entries exist yet.

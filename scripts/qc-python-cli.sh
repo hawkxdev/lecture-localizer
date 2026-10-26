@@ -120,8 +120,12 @@ def runtime_data_members(
         relative = name[len(package_prefix) :]
         if not relative or relative.endswith("/"):
             continue
-        if relative.endswith(".py") or relative.startswith("schemas/"):
+        if relative.endswith(".py"):
             continue
+        if relative.startswith("schemas/"):
+            nested = relative[len("schemas/") :]
+            if "/" not in nested and nested.endswith(".json"):
+                continue
         offenders.append(name)
     return offenders
 

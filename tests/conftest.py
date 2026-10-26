@@ -416,15 +416,16 @@ def plant_artifact_record(
 ) -> str:
     """Write one synthetic cached artifact and record it in the manifest.
 
-    The bytes are clearly synthetic test data; the record ties them to
-    a stage signature so reuse decisions can be exercised without any
-    later stage execution.
+    Every record gets its own sequence numbered immutable path so
+    distinct historical response bytes stay preserved when signatures
+    change; the bytes are clearly synthetic test data.
     """
     from lecture_localizer.storage import atomic_write_json
 
     manifest_path = job_dir / 'manifest.json'
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
-    relative = f'artifacts/{kind}-{segment or "job"}.bin'
+    ordinal = len(manifest['artifacts'])
+    relative = f'artifacts/{ordinal:03d}-{kind}-{segment or "job"}.bin'
     target = job_dir / relative
     target.parent.mkdir(exist_ok=True)
     target.write_bytes(data)

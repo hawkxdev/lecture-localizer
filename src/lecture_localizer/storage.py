@@ -190,7 +190,7 @@ class JobLock:
     Every acquisition stores a unique instance token in the lock file;
     release removes the file only when it still carries this instance
     token, so an externally replaced lock is reported instead of
-    deleting another writer's lock.
+    deleting the replacement that belongs to another writer.
     """
 
     path: Path
@@ -222,16 +222,33 @@ class JobLock:
         return cls(path=path, token=token)
 
     def release(self) -> None:
-        """Remove the lock file only when this instance still owns it."""
+        """Remove the lock only when this instance still owns it.
+
+        Ownership is established positively from readable content that
+        carries this instance token. An unreadable, malformed or foreign
+        replacement stays in place and is reported; actual absence is
+        idempotent.
+        """
+        if not self.path.exists():
+            return
         try:
-            payload = _read_lock(self.path)
+            raw = self.path.read_bytes()
         except OSError as error:
             raise LockUnavailableError(
                 f'the lock at {self.path} cannot be read to confirm'
                 f' ownership: {error}',
                 kind='lock',
             ) from error
-        if payload is not None and payload.get('token') != self.token:
+        try:
+            payload = json.loads(raw.decode('utf-8'))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise LockUnavailableError(
+                f'the lock at {self.path} was replaced with unreadable'
+                ' content; it stays in place and must be inspected'
+                ' manually',
+                kind='lock',
+            ) from error
+        if not isinstance(payload, dict) or payload.get('token') != self.token:
             raise LockUnavailableError(
                 f'the lock at {self.path} was replaced by another writer'
                 ' after this instance acquired it; the replacement stays'

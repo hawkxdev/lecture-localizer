@@ -1013,3 +1013,162 @@ def test_relative_paths_persist_absolute_identity(
         settings=Settings(),
     )
     assert third.manifest['output_path'] == recorded_one
+
+
+def test_return_to_retained_signature_reuses_history(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    original = json.loads(kit['translation'].read_text(encoding='utf-8'))
+    plant_complete_cache(kit['job'])
+    manifest_path = kit['job'] / 'manifest.json'
+    planted = json.loads(manifest_path.read_text(encoding='utf-8'))
+    a_records = {
+        (record['kind'], record['segment']): record
+        for record in planted['artifacts']
+    }
+    a_bytes = {
+        key: (kit['job'] / record['path']).read_bytes()
+        for key, record in a_records.items()
+    }
+    variant = json.loads(json.dumps(original))
+    variant['segments'][0]['narration'] = 'Вариант речи для версии Б.'
+    variant_path = tmp_path / 'variant.json'
+    variant_path.write_text(
+        json.dumps(variant, ensure_ascii=False, indent=2), encoding='utf-8'
+    )
+    variant_translation = rebind_translation(
+        variant_path, kit['video'], kit['srt']
+    )
+    run_prepare(kit, translation=variant_translation)
+    plant_complete_cache(kit['job'])
+    original_path = tmp_path / 'original-restored.json'
+    original_path.write_text(
+        json.dumps(original, ensure_ascii=False, indent=2), encoding='utf-8'
+    )
+    restored_translation = rebind_translation(
+        original_path, kit['video'], kit['srt']
+    )
+    run_prepare(kit, translation=restored_translation)
+    status = read_job_status(kit['job'])
+    assert status['stages']['synthesis']['state'] == 'complete'
+    assert status['stages']['fitting']['state'] == 'complete'
+    assert status['reuse']['synthesis']['preserved'] == ['s001', 's002']
+    assert status['reuse']['fitting']['preserved'] == ['s001', 's002']
+    assert status['reuse']['synthesis']['invalidated'] == {}
+    current = json.loads(manifest_path.read_text(encoding='utf-8'))
+    for record in current['artifacts']:
+        key = (record['kind'], record['segment'])
+        if key in a_bytes:
+            assert (kit['job'] / record['path']).read_bytes() == a_bytes[key]
+    paths = [record['path'] for record in current['artifacts']]
+    assert len(paths) == len(set(paths))
+    signatures = {record['signature'] for record in current['artifacts']}
+    first_sigs = {record['signature'] for record in planted['artifacts']}
+    assert first_sigs <= signatures
+
+
+def test_genuinely_absent_signature_is_not_reused(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    plant_complete_cache(kit['job'])
+    changed = json.loads(kit['translation'].read_text(encoding='utf-8'))
+    changed['segments'][0]['narration'] = 'Совершенно новая речь.'
+    path = tmp_path / 'changed.json'
+    path.write_text(
+        json.dumps(changed, ensure_ascii=False, indent=2), encoding='utf-8'
+    )
+    result = run_prepare(
+        kit, translation=rebind_translation(path, kit['video'], kit['srt'])
+    )
+    reuse = result.reuse
+    assert 's001' not in reuse['synthesis']['preserved']
+    assert reuse['synthesis']['invalidated']['s001'] == 'signature_changed'
+
+
+def test_missing_raw_provenance_keeps_container_not_preserved(
+    tmp_path: Path,
+) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    plant_complete_cache(kit['job'])
+    manifest_path = kit['job'] / 'manifest.json'
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    manifest['artifacts'] = [
+        record
+        for record in manifest['artifacts']
+        if not (
+            record['kind'] == 'raw_response' and record['segment'] == 's001'
+        )
+    ]
+    atomic_write_json(manifest_path, manifest)
+    status = read_job_status(kit['job'])
+    assert status['stages']['fitting']['state'] == 'blocked'
+    assert status['reuse']['fitting']['invalidated']['s001'] == (
+        'missing_provenance'
+    )
+    assert status['reuse']['container']['preserved'] is False
+
+
+def test_missing_fitted_record_keeps_container_pending(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    plant_complete_cache(kit['job'])
+    manifest_path = kit['job'] / 'manifest.json'
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    manifest['artifacts'] = [
+        record
+        for record in manifest['artifacts']
+        if not (
+            record['kind'] == 'fitted_audio' and record['segment'] == 's001'
+        )
+    ]
+    atomic_write_json(manifest_path, manifest)
+    status = read_job_status(kit['job'])
+    assert status['stages']['fitting']['state'] == 'pending'
+    assert status['stages']['container']['state'] == 'blocked'
+    assert status['reuse']['container']['preserved'] is False
+    assert any(
+        'upstream stages are not complete' in b for b in status['blocked']
+    )
+
+
+def test_installed_wheel_permits_unrelated_host_projects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from lecture_localizer import jobs as jobs_module
+    from lecture_localizer.cli import main
+
+    host = tmp_path / "host dir with 'quote' and #hash"
+    package = (
+        host
+        / '.venv'
+        / 'lib'
+        / 'python3.12'
+        / 'site-packages'
+        / 'lecture_localizer'
+    )
+    package.mkdir(parents=True)
+    (host / 'pyproject.toml').write_text(
+        '[project]\nname = "some-other-project"\n', encoding='utf-8'
+    )
+    monkeypatch.setattr(jobs_module, '__file__', str(package / 'jobs.py'))
+    kit = make_kit(tmp_path, name='hostkit')
+    user_job = host / 'localization-data'
+    argv = [
+        'prepare',
+        '--video',
+        str(kit['video']),
+        '--source-srt',
+        str(kit['srt']),
+        '--translation',
+        str(kit['translation']),
+        '--job',
+        str(user_job),
+        '--output',
+        str(tmp_path / 'host-out.mp4'),
+    ]
+    assert main(argv) == 0
+    assert 'revision 1 (created)' in capsys.readouterr().out
+    assert user_job.is_dir()

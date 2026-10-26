@@ -208,3 +208,28 @@ def test_release_reports_replacement_and_keeps_foreign_lock(
     payload = json.loads((tmp_path / 'lock').read_text(encoding='utf-8'))
     assert payload['token'] == 'external-replacement-token'
     assert payload['pid'] == os.getpid()
+
+
+@pytest.mark.parametrize(
+    'replacement',
+    [
+        pytest.param(b'{partial json', id='malformed json'),
+        pytest.param(b'[]', id='non object json'),
+        pytest.param(b'\xff\xfe invalid utf8', id='invalid utf8'),
+    ],
+)
+def test_unreadable_replacement_lock_survives_release(
+    tmp_path: Path, replacement: bytes
+) -> None:
+    lock = JobLock.acquire(tmp_path)
+    lock.path.write_bytes(replacement)
+    with pytest.raises(LockUnavailableError, match='stays in place'):
+        lock.release()
+    assert lock.path.read_bytes() == replacement
+
+
+def test_release_of_absent_lock_is_idempotent(tmp_path: Path) -> None:
+    lock = JobLock.acquire(tmp_path)
+    lock.path.unlink()
+    lock.release()
+    assert not (tmp_path / 'lock').exists()

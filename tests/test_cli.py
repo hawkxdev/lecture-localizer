@@ -795,7 +795,13 @@ def test_prepare_corrupt_cache_exits_3(
     assert main(argv) == 0
     capsys.readouterr()
     plant_complete_cache(job)
-    target = job / 'artifacts' / 'raw_response-s001.bin'
+    manifest = json.loads((job / 'manifest.json').read_text(encoding='utf-8'))
+    raw_records = [
+        record
+        for record in manifest['artifacts']
+        if record['kind'] == 'raw_response'
+    ]
+    target = job / raw_records[0]['path']
     target.write_bytes(b'corrupted after planting')
     assert main(argv) == 3
     captured = capsys.readouterr()

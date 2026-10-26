@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -636,18 +637,32 @@ class PrepareResult:
     unchanged: bool
 
 
+_PROJECT_DECLARATION = re.compile(r'^name = "lecture-localizer"', re.MULTILINE)
+
+
 def _application_source_root() -> Path | None:
     """Locate this application source repository root when running from one.
 
-    Walks upward from the package file toward pyproject.toml and a
-    repository marker. Returns None for an installed copy outside a
-    source tree; no Git command is ever invoked.
+    A candidate ancestor owns this application only when its
+    pyproject.toml declares this exact project name, so an installed
+    wheel inside an unrelated host project never classifies that host
+    as the source checkout. No Git command is ever invoked; source
+    checkouts and worktrees with a .git file are covered because their
+    root pyproject.toml carries the declaration.
     """
     current = Path(__file__).resolve().parent
     for candidate in (current, *current.parents):
-        if (candidate / 'pyproject.toml').is_file() or (
-            candidate / '.git'
-        ).exists():
+        marker = candidate / 'pyproject.toml'
+        if not marker.is_file():
+            continue
+        try:
+            declared = (
+                _PROJECT_DECLARATION.search(marker.read_text(encoding='utf-8'))
+                is not None
+            )
+        except OSError:
+            declared = False
+        if declared:
             return candidate
     return None
 
@@ -989,15 +1004,12 @@ def _unit_classifications(
 ) -> dict[str, Any]:
     """Classify every required cache unit against the current inputs.
 
-    A unit is ok only when a record exists for it whose signature
-    matches the current inputs and whose bytes verify. Records for
-    older signatures stay in the artifact list as valid history but
-    never satisfy current eligibility.
+    A unit is ok when any retained record for it carries the current
+    signature and verifies: history is scanned, not just the last row,
+    so returning to an earlier signature reuses its intact response.
+    Records for other signatures stay as valid history and never decide
+    current eligibility.
     """
-    by_kind_segment: dict[str, dict[str | None, dict[str, Any]]] = {}
-    for record in artifacts:
-        kind = record['kind']
-        by_kind_segment.setdefault(kind, {})[record['segment']] = record
     segment_ids = [s['id'] for s in manifest['segments']]
 
     def classify(
@@ -1005,15 +1017,25 @@ def _unit_classifications(
     ) -> dict[str | None, str]:
         result: dict[str | None, str] = {}
         for unit, signature in expected.items():
-            record = by_kind_segment.get(kind, {}).get(unit)
-            if record is None:
+            records = [
+                record
+                for record in artifacts
+                if record['kind'] == kind and record['segment'] == unit
+            ]
+            if not records:
                 result[unit] = 'missing'
-            elif _artifact_label(record) in failed_labels:
-                result[unit] = 'corrupt'
-            elif record['signature'] != signature:
-                result[unit] = 'stale'
-            else:
+            elif any(
+                _artifact_label(record) not in failed_labels
+                and record['signature'] == signature
+                for record in records
+            ):
                 result[unit] = 'ok'
+            elif any(
+                _artifact_label(record) in failed_labels for record in records
+            ):
+                result[unit] = 'corrupt'
+            else:
+                result[unit] = 'stale'
         return result
 
     raw = classify(
@@ -1102,7 +1124,9 @@ def _cache_view(
     if container == 'corrupt':
         container_state = 'blocked'
     elif container == 'ok' and (
-        subtitle_state != 'complete' or raw_state != 'complete'
+        subtitle_state != 'complete'
+        or raw_state != 'complete'
+        or fitted_state != 'complete'
     ):
         container_state = 'blocked'
         blocked.append(
@@ -1185,7 +1209,12 @@ def _reuse_view(
         ('container', 'container_track', latest['container']),
     ):
         status = units[kind]
-        if status == 'ok':
+        if status == 'ok' and stage == 'container':
+            view = _cache_view(manifest, artifacts, failed_labels)
+            complete = view['stages']['container']['state'] == 'complete'
+        else:
+            complete = status == 'ok'
+        if status == 'ok' and complete:
             reuse[stage] = {
                 'preserved': True,
                 'invalidated': False,
