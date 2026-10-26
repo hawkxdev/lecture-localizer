@@ -1,0 +1,471 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/hawkxdev/lecture-localizer/main/src/lecture_localizer/schemas/job-v1.schema.json",
+  "title": "Localization job manifest",
+  "description": "Versioned persistent state of one localization job. Unknown versions are rejected rather than migrated.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "created_at",
+    "updated_at",
+    "revision",
+    "binding",
+    "media",
+    "output_path",
+    "policy",
+    "segments",
+    "subtitle_signature",
+    "container_signature",
+    "snapshots",
+    "artifacts",
+    "stages",
+    "history",
+    "blocked"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "created_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "updated_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "video_sha256",
+        "srt_sha256",
+        "translation_sha256",
+        "video_path",
+        "srt_path",
+        "translation_path"
+      ],
+      "properties": {
+        "video_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "srt_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "translation_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "video_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "srt_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "translation_path": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "media": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "container_format",
+        "duration_seconds",
+        "video_stream",
+        "audio_stream",
+        "audio_selection",
+        "audio_disposition"
+      ],
+      "properties": {
+        "container_format": {
+          "type": "string",
+          "minLength": 1
+        },
+        "duration_seconds": {
+          "type": ["number", "null"],
+          "exclusiveMinimum": 0
+        },
+        "video_stream": {
+          "$ref": "#/$defs/videoStream"
+        },
+        "audio_stream": {
+          "$ref": "#/$defs/audioStream"
+        },
+        "audio_selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "index"],
+          "properties": {
+            "mode": {
+              "enum": ["single", "explicit"]
+            },
+            "index": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "audio_disposition": {
+          "enum": ["copy", "convert"]
+        }
+      }
+    },
+    "output_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fitting_max_speedup",
+        "startup_narration_default",
+        "startup_original_default",
+        "startup_subtitles_default",
+        "startup_subtitles_forced"
+      ],
+      "properties": {
+        "fitting_max_speedup": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "startup_narration_default": {
+          "type": "boolean"
+        },
+        "startup_original_default": {
+          "type": "boolean"
+        },
+        "startup_subtitles_default": {
+          "type": "boolean"
+        },
+        "startup_subtitles_forced": {
+          "type": "boolean"
+        }
+      }
+    },
+    "segments": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "source_cues",
+          "window",
+          "translation_text_sha256",
+          "narration_text_sha256",
+          "synthesis_signature",
+          "fitting_signature"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "source_cues": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "window": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["start_ms", "end_ms"],
+            "properties": {
+              "start_ms": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "end_ms": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          },
+          "translation_text_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "narration_text_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "synthesis_signature": {
+            "$ref": "#/$defs/sha256"
+          },
+          "fitting_signature": {
+            "$ref": "#/$defs/sha256"
+          }
+        }
+      }
+    },
+    "subtitle_signature": {
+      "$ref": "#/$defs/sha256"
+    },
+    "container_signature": {
+      "$ref": "#/$defs/sha256"
+    },
+    "snapshots": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["translation", "narration", "source_cues"],
+      "properties": {
+        "translation": {
+          "$ref": "#/$defs/snapshotRecord"
+        },
+        "narration": {
+          "$ref": "#/$defs/snapshotRecord"
+        },
+        "source_cues": {
+          "$ref": "#/$defs/snapshotRecord"
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "segment",
+          "signature",
+          "path",
+          "sha256",
+          "created_at"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "raw_response",
+              "normalized_audio",
+              "fitted_audio",
+              "subtitles",
+              "container_track"
+            ]
+          },
+          "segment": {
+            "type": ["string", "null"],
+            "minLength": 1
+          },
+          "signature": {
+            "$ref": "#/$defs/sha256"
+          },
+          "path": {
+            "$ref": "#/$defs/relativePath"
+          },
+          "sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "created_at": {
+            "$ref": "#/$defs/timestamp"
+          }
+        }
+      }
+    },
+    "stages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "synthesis",
+        "fitting",
+        "subtitle",
+        "container"
+      ],
+      "properties": {
+        "synthesis": {
+          "$ref": "#/$defs/stageState"
+        },
+        "fitting": {
+          "$ref": "#/$defs/stageState"
+        },
+        "subtitle": {
+          "$ref": "#/$defs/stageState"
+        },
+        "container": {
+          "$ref": "#/$defs/stageState"
+        }
+      }
+    },
+    "history": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["revision", "timestamp", "invalidated"],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "timestamp": {
+            "$ref": "#/$defs/timestamp"
+          },
+          "invalidated": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "synthesis",
+              "fitting",
+              "subtitle",
+              "container"
+            ],
+            "properties": {
+              "synthesis": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "fitting": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "subtitle": {
+                "type": "boolean"
+              },
+              "container": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
+    },
+    "blocked": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "relativePath": {
+      "type": "string",
+      "pattern": "^(?!.*\\.\\.)[A-Za-z0-9_][A-Za-z0-9_/.-]*$",
+      "not": {
+        "pattern": "/$"
+      }
+    },
+    "videoStream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "codec",
+        "pix_fmt",
+        "width",
+        "height",
+        "color_transfer"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "codec": {
+          "const": "h264"
+        },
+        "pix_fmt": {
+          "const": "yuv420p"
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "color_transfer": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "audioStream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "codec",
+        "profile",
+        "channels",
+        "sample_rate_hz",
+        "language"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "codec": {
+          "enum": ["aac", "pcm_s16le", "mp3", "opus"]
+        },
+        "profile": {
+          "type": ["string", "null"]
+        },
+        "channels": {
+          "type": "integer",
+          "enum": [1, 2]
+        },
+        "sample_rate_hz": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "language": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "snapshotRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "path", "sha256"],
+      "properties": {
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "stageState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": {
+          "enum": ["pending", "blocked", "complete"]
+        }
+      }
+    }
+  }
+}

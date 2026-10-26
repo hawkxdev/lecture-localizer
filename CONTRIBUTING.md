@@ -27,7 +27,7 @@ Run the local quality runner from the repository root:
 scripts/qc-python-cli.sh
 ```
 
-The runner creates `.venv` when it is missing and then, propagating every failure: Ruff format check, Ruff check, mypy, the stage test suite, the package build, an artifact privacy gate that rejects any archive member outside the public allowlist, and a fresh-venv wheel installation smoke test that runs the `lecture-localizer` console entry. The doctor tests exercise the real local FFmpeg, ffprobe and MP4Box, so those tools must be installed for the suite to pass; this is a setup prerequisite, not a hidden skip. Full diagnostics on macOS additionally follow [README.md](README.md).
+The runner creates `.venv` when it is missing and then, propagating every failure: Ruff format check, Ruff check, mypy, the stage test suite, the package build, an artifact privacy gate that rejects any archive member outside the public allowlist, and a fresh-venv wheel installation smoke test that runs the `lecture-localizer` console entry and loads both packaged schemas from the installed wheel. The doctor tests exercise the real local FFmpeg, ffprobe and MP4Box, so those tools must be installed for the suite to pass; this is a setup prerequisite, not a hidden skip. Full diagnostics on macOS additionally follow [README.md](README.md).
 
 Synthetic, rights-safe media fixtures are created only in an explicit new directory:
 

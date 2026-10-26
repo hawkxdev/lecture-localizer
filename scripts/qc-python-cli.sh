@@ -63,10 +63,20 @@ SDIST_ALLOWLIST = {
 FORBIDDEN = ("private", ".memory", ".agents", ".venv", ".github", ".git")
 EXPECTED_SDIST = (
     "src/lecture_localizer/cli.py",
+    "src/lecture_localizer/contracts.py",
+    "src/lecture_localizer/jobs.py",
     "src/lecture_localizer/media.py",
     "src/lecture_localizer/settings.py",
+    "src/lecture_localizer/storage.py",
+    "src/lecture_localizer/subtitles.py",
+    "src/lecture_localizer/schemas/translation-v1.schema.json",
+    "src/lecture_localizer/schemas/job-v1.schema.json",
     "src/lecture_localizer/__init__.py",
     "tests/test_media.py",
+    "tests/test_contracts.py",
+    "tests/test_subtitles.py",
+    "tests/test_storage.py",
+    "tests/test_jobs.py",
     "scripts/make-synthetic-example.py",
     "scripts/qc-python-cli.sh",
 )
@@ -115,8 +125,15 @@ wheel_ok = all(
     name.startswith("lecture_localizer/") or name.startswith("lecture_localizer-")
     for name in wheel_members
 )
+SCHEMA_MEMBERS = (
+    "lecture_localizer/schemas/translation-v1.schema.json",
+    "lecture_localizer/schemas/job-v1.schema.json",
+)
+missing_schemas = [name for name in SCHEMA_MEMBERS if name not in wheel_members]
 if not wheel_ok or "lecture_localizer/cli.py" not in wheel_members:
     raise SystemExit(f"wheel has unexpected members: {wheel_members}")
+if missing_schemas:
+    raise SystemExit(f"wheel misses packaged schemas: {missing_schemas}")
 
 print(
     f"privacy gate OK (leak and completeness controls passed): "
@@ -147,6 +164,53 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 if report.get("command") != "doctor" or "ok" not in report or "tools" not in report:
     raise SystemExit("doctor JSON report has unexpected structure")
 print(f"doctor smoke JSON valid, ok={report['ok']}")
+EOF
+
+stage "installed schema resources"
+"$SMOKE/venv/bin/python" - <<'EOF'
+"""Load both packaged schemas from the installed wheel and use them."""
+
+from importlib import resources
+
+from jsonschema import Draft202012Validator
+
+TRANSLATION_SAMPLE = {
+    "schema_version": 1,
+    "source": {
+        "video_sha256": "a" * 64,
+        "srt_sha256": "b" * 64,
+    },
+    "source_language": "en",
+    "target_language": "ru",
+    "segments": [
+        {
+            "id": "s001",
+            "source_cues": [1],
+            "translation": "Проверка.",
+        }
+    ],
+}
+
+
+def load(name: str) -> dict:
+    text = (
+        resources.files("lecture_localizer")
+        / "schemas"
+        / name
+    ).read_text(encoding="utf-8")
+    import json
+
+    return json.loads(text)
+
+
+for name in ("translation-v1.schema.json", "job-v1.schema.json"):
+    schema = load(name)
+    Draft202012Validator.check_schema(schema)
+
+validator = Draft202012Validator(load("translation-v1.schema.json"))
+errors = list(validator.iter_errors(TRANSLATION_SAMPLE))
+assert not errors, errors
+print("installed schema resources OK: both schemas load and validate")
 EOF
 
 printf '\nqc-python-cli: PASS\n'

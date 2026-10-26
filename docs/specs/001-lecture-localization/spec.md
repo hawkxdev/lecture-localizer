@@ -2,7 +2,7 @@
 
 ## Preparation state
 
-Feature phase: `in_progress`. This specification owns the scenario and its phase record. The scenario, acceptance criteria and technical choices below are approved. The initial speedup limit remains subject to listening validation. The [implementation plan](plan.md) and its stage sequence are approved. Stage 1 (installable package and local tool checks) is assigned and under implementation through [issue 5](https://github.com/hawkxdev/lecture-localizer/issues/5); runtime acceptance has not started. A live pilot needs its own protocol and authorization.
+Feature phase: `in_progress`. This specification owns the scenario and its phase record. The scenario, acceptance criteria and technical choices below are approved. The initial speedup limit remains subject to listening validation. The [implementation plan](plan.md) and its stage sequence are approved. Stage 1 (installable package and local tool checks) is delivered through [PR 6](https://github.com/hawkxdev/lecture-localizer/pull/6); Stage 2 (validated persistent jobs and selective reuse) is assigned through [issue 7](https://github.com/hawkxdev/lecture-localizer/issues/7). A live pilot needs its own protocol and authorization.
 
 ## User and purpose
 
@@ -208,4 +208,4 @@ Meaning and listening quality need human review; container and timing checks alo
 
 The scenario starts with local media, matching English SRT subtitles and reviewed Russian text in JSON. Recording, platform access, transcription, translation generation and narration rewriting are outside this scenario.
 
-The runtime, command responsibilities, media tools, speech-fitting approach, audio encoding parameters and first-distribution boundary are approved above. The implementation plan must define task-level interfaces, dependency pins, tests and failure handling. Installation and paid synthesis have not started. Minimum Python compatibility, long-file handling, live speech quality and reference-player behavior remain unverified; the provisional speedup limit still needs listening validation.
+The runtime, command responsibilities, media tools, speech-fitting approach, audio encoding parameters and first-distribution boundary are approved above. The implementation plan must define task-level interfaces, dependency pins, tests and failure handling. Minimum Python compatibility, long-file handling, live speech quality and reference-player behavior remain unverified; the provisional speedup limit still needs listening validation.

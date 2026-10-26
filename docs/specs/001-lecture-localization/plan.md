@@ -239,4 +239,4 @@ Each stage runs only checks its completed code supports, maintains affected docu
 
 ## Authority and next step
 
-The owner approved this design and stage sequence for saving. Next, select and assign the first implementation stage; implementation has not started. Paid pilot, media inspection/playback, publication, merge and deployment need their actual scoped authority. Follow [CONTRIBUTING.md](../../../CONTRIBUTING.md) and the approved feature contract. No schedule, price or owner capacity is invented; dependency order is technical rather than a calendar forecast.
+The owner approved this design and stage sequence for saving. Stage 1 is delivered through [PR 6](https://github.com/hawkxdev/lecture-localizer/pull/6); Stage 2 is assigned through [issue 7](https://github.com/hawkxdev/lecture-localizer/issues/7). Paid pilot, media inspection/playback, publication, merge and deployment need their actual scoped authority. Follow [CONTRIBUTING.md](../../../CONTRIBUTING.md) and the approved feature contract. No schedule, price or owner capacity is invented; dependency order is technical rather than a calendar forecast.
