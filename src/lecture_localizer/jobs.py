@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -683,12 +682,17 @@ def prepare_job(
     source_audio: int | None,
     settings: Settings,
 ) -> PrepareResult:
-    """Validate all inputs and create or resume the persistent job."""
-    video_path = Path(os.path.abspath(video_path))
-    srt_path = Path(os.path.abspath(srt_path))
-    translation_path = Path(os.path.abspath(translation_path))
-    job_dir = Path(os.path.abspath(job_dir))
-    output_path = Path(os.path.abspath(output_path))
+    """Validate all inputs and create or resume the persistent job.
+
+    All persisted locations are canonicalized with resolve so the
+    recorded identities are stable across working directories and
+    symlink spellings of the same destination.
+    """
+    video_path = Path(video_path).expanduser().resolve()
+    srt_path = Path(srt_path).expanduser().resolve()
+    translation_path = Path(translation_path).expanduser().resolve()
+    job_dir = Path(job_dir).expanduser().resolve()
+    output_path = Path(output_path).expanduser().resolve()
     for label, path in (
         ('video', video_path),
         ('source SRT', srt_path),
