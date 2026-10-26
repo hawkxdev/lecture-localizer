@@ -2,7 +2,7 @@
 
 ## Preparation state
 
-Feature phase: `preparing`. This specification owns the scenario and its phase record. The scenario, acceptance criteria, input compatibility profile, JSON contract, timing policy and startup track defaults below are approved. The initial speedup limit remains subject to listening validation. Implementation and runtime acceptance have not started. Next action: define the speech-fitting adapter, concrete dependencies and their license boundary, audio encoding parameters and the runtime/CLI. A live pilot needs its own protocol and authorization.
+Feature phase: `preparing`. This specification owns the scenario and its phase record. The scenario, acceptance criteria and technical choices below are approved. The initial speedup limit remains subject to listening validation. The [implementation plan](plan.md) and its stage sequence are approved. Implementation and runtime acceptance have not started. Next action: select and assign the first implementation stage. A live pilot needs its own protocol and authorization.
 
 ## User and purpose
 
@@ -131,7 +131,7 @@ The first output profile is MP4 with two AAC audio tracks, original English and 
 
 QuickTime Player and IINA on macOS are the reference players for initial acceptance. Verify both audio languages, both subtitle languages and subtitles off in each player. Container inspection and decoding alone do not establish this player behavior.
 
-The input codecs and copy/conversion policy are defined above. Concrete media utilities and audio encoding parameters remain technical design choices. Selecting MP4 does not establish compatibility with every source video or player.
+The input codecs, copy/conversion policy and technical basis are defined in this specification. Selecting MP4 does not establish compatibility with every source video or player.
 
 ## Startup track defaults
 
@@ -147,6 +147,38 @@ The MP4 marks Russian narration as its default audio track; the English original
 Store these choices in job settings. Changing only startup choices rebuilds the MP4 from the existing unchanged tracks without repeating translation, synthesis or speech fitting.
 
 Verify the persisted file flags separately from actual player startup. During acceptance, record the initial audio selection and subtitle state in QuickTime Player and IINA with the user's current preferences, then check manual language selection and subtitle disabling. File metadata alone does not establish player behavior; actual startup remains unverified until those checks are performed.
+
+## Technical basis
+
+Target Python 3.12 or later, with initial platform acceptance on macOS. Minimum-version compatibility must be tested during implementation; it is not established by the current design probes. Use argparse for the CLI, synchronous HTTPX for the direct speech API, and jsonschema for structural validation. Pin dependency versions and review their complete notices when preparing the environment.
+
+Use an explicit Draft 2020-12 JSON Schema alongside strict JSON parsing and semantic checks. Schema validation alone does not detect duplicate keys already discarded by a parser or establish input-hash identity and complete ordered cue coverage.
+
+The proposed package location is `src/lecture_localizer`, exposed as `lecture-localizer`. Its command responsibilities are approved; exact arguments and exit codes belong in the implementation plan:
+
+| Command | Responsibility |
+|---|---|
+| `doctor` | Check local dependencies and required capabilities without contacting the speech API |
+| `prepare` | Validate inputs and prepare the job without API calls |
+| `run` | Execute the authorized job and resume unchanged completed work |
+| `assemble` | Assemble from retained artifacts without API calls |
+| `status` | Read job state and its report |
+
+Run stages sequentially under one job writer. Keep a versioned JSON manifest, artifact hashes and atomic checkpoints in a user-selected job directory outside the source repository. Stage signatures separate synthesis, fitting, subtitles and container settings according to the resumption rules above. No server, database or task queue is required; execution and verification remain local.
+
+Use separately installed FFmpeg, ffprobe and GPAC MP4Box through subprocesses. FFmpeg handles audio conversion, atempo and muxing; MP4Box applies the approved MP4 track flags; ffprobe and stream extraction verify the persisted result. Check required capabilities rather than treating an arbitrary version string as proof of compatibility. Do not import pyVideoTrans internals or include any source-removal step.
+
+Request xAI speech with `voice_id=eve`, `language=ru`, `speed=1.0`, WAV output at 48 kHz and `with_timestamps=false`. Preserve the complete response body before local conversion. The request mode is documentation-backed; its actual content type, decoding and listening quality still require the authorized live pilot.
+
+Use mono 48 kHz signed 16-bit PCM as the working speech representation. Place complete segments at integer sample positions, adding only the necessary silence. Build long output incrementally rather than holding the whole lecture in memory. Apply atempo only when needed and remeasure its actual output against the approved window; a computed ratio alone does not establish a successful fit.
+
+Encode Russian narration as mono AAC-LC at 48 kHz with a target bitrate of 192 kbit/s. When original PCM/MP3/Opus audio needs conversion, use AAC-LC at 48 kHz and a target 192 kbit/s while retaining its one or two channels. Compatible original AAC-LC remains copied without resampling or re-encoding. These settings do not establish perceptual transparency or verified speech quality.
+
+Before each paid request, persist the operation start. An interrupted operation without a verified complete response has an uncertain outcome and requires an explicit retry decision; do not retry paid calls or switch providers automatically. Require validated inputs, the planned request count and text volume, and explicit spending limits before paid execution. No numeric live-pilot budget is assigned by this specification.
+
+Read the key from `XAI_API_KEY`; do not store it in manifests, logs or media-process arguments. Keep credentials out of media subprocesses. Configure explicit HTTP timeouts and distinguish network inactivity from total operation duration. Creating a job, reading status and offline assembly require no provider access.
+
+Project-authored code remains MIT. HTTPX and jsonschema retain their own license and copyright notices, and the locked transitive dependency set requires review. Do not bundle Python, FFmpeg, GPAC or pyVideoTrans binaries in the first distribution. External executable use does not relabel those tools or the whole dependency set as MIT.
 
 ## Workflow
 
@@ -176,4 +208,4 @@ Meaning and listening quality need human review; container and timing checks alo
 
 The scenario starts with local media, matching English SRT subtitles and reviewed Russian text in JSON. Recording, platform access, transcription, translation generation and narration rewriting are outside this scenario.
 
-Before implementation, define the speech-fitting adapter, audio encoding parameters and the concrete dependency/license boundary. The input compatibility profile, JSON contract, timing policy and startup track defaults above are approved; the provisional speedup limit still needs listening validation. No CLI syntax or runtime has been selected. Installation and paid synthesis have not started.
+The runtime, command responsibilities, media tools, speech-fitting approach, audio encoding parameters and first-distribution boundary are approved above. The implementation plan must define task-level interfaces, dependency pins, tests and failure handling. Installation and paid synthesis have not started. Minimum Python compatibility, long-file handling, live speech quality and reference-player behavior remain unverified; the provisional speedup limit still needs listening validation.
