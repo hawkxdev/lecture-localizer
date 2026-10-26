@@ -16,6 +16,18 @@ Own lecture-localizer's media vocabulary and implementation knowledge. `README.m
 
 ## Degrees of Freedom: MEDIUM
 
+## Implemented capabilities (stage 1)
+
+| Capability | Owner |
+|---|---|
+| `lecture-localizer doctor [--json]` | `src/lecture_localizer/cli.py` |
+| Validated nonsecret settings | `src/lecture_localizer/settings.py` |
+| Tool discovery, capability probing, scrubbed subprocesses | `src/lecture_localizer/media.py` |
+| Local quality runner with artifact privacy gate | `scripts/qc-python-cli.sh` |
+| Deterministic synthetic fixtures | `scripts/make-synthetic-example.py` |
+
+Doctor verifies the real features the media profile needs: FFmpeg H.264 decoding, AAC and mov_text encoding, the atempo filter, and MP4Box track flag rewriting on a synthetic input inside a temporary directory. Missing or unusable tools exit 7, invalid settings exit 3, usage errors exit 2. Settings load from `LECTURE_LOCALIZER_SETTINGS` and reject unknown fields. Media subprocess environments are scrubbed of credential variables. The sdist ships an explicit public allowlist; the quality gate rejects any archive member outside it.
+
 ## Proposed artifact model
 
 These terms describe the current proposal, not implemented formats or approved interfaces:
