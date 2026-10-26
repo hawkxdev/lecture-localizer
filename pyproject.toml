@@ -1,0 +1,79 @@
+[build-system]
+requires = ["hatchling==1.32.4"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lecture-localizer"
+version = "0.1.0"
+description = "Localize lecture videos while preserving the original media."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "hawkxdev" }]
+dependencies = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Video",
+]
+
+[project.scripts]
+lecture-localizer = "lecture_localizer.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "build==1.6.1",
+    "mypy==2.4.0",
+    "pytest==9.1.1",
+    "ruff==0.17.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/hawkxdev/lecture-localizer"
+Issues = "https://github.com/hawkxdev/lecture-localizer/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lecture_localizer"]
+
+[tool.hatch.build.targets.sdist]
+# Explicit public allowlist. Local private layers are excluded only via
+# .git/info/exclude, so default sdist selection would archive them.
+# Hatchling force-includes .gitignore; it is a tracked public file.
+include = [
+    "/pyproject.toml",
+    "/README.md",
+    "/LICENSE",
+    "/src",
+    "/tests",
+    "/scripts",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_untyped_calls = false
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["lecture_localizer", "conftest"]
