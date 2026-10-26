@@ -52,6 +52,7 @@ def test_atomic_write_failure_preserves_previous_bytes(
     original = path.read_bytes()
 
     def fail_replace(src: object, dst: object) -> None:
+        """Simulate a full disk at the final replace step."""
         raise OSError(28, 'No space left on device')
 
     monkeypatch.setattr(os, 'replace', fail_replace)
@@ -188,3 +189,22 @@ def test_ensure_outside_rejects_job_dir_itself(tmp_path: Path) -> None:
     job.mkdir()
     with pytest.raises(StorageError, match='outside the job directory'):
         ensure_outside(job, {'output': job})
+
+
+def test_release_reports_replacement_and_keeps_foreign_lock(
+    tmp_path: Path,
+) -> None:
+    first = JobLock.acquire(tmp_path)
+    replaced = json.dumps(
+        {
+            'pid': os.getpid(),
+            'created_at': utc_now_iso(),
+            'token': 'external-replacement-token',
+        }
+    )
+    (tmp_path / 'lock').write_text(replaced, encoding='utf-8')
+    with pytest.raises(LockUnavailableError, match='was replaced'):
+        first.release()
+    payload = json.loads((tmp_path / 'lock').read_text(encoding='utf-8'))
+    assert payload['token'] == 'external-replacement-token'
+    assert payload['pid'] == os.getpid()

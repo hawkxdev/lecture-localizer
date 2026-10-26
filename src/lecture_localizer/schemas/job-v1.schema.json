@@ -342,6 +342,9 @@
                 "type": "boolean"
               }
             }
+          },
+          "rebind": {
+            "type": "boolean"
           }
         }
       }

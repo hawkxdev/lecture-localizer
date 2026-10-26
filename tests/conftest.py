@@ -405,3 +405,64 @@ class NoNetwork:
     def __getattr__(self, name: str) -> Any:
         """Fail any other socket module attribute use."""
         raise AssertionError(f'network access attempted: {name}')
+
+
+def plant_artifact_record(
+    job_dir: Path,
+    kind: str,
+    segment: str | None,
+    signature: str,
+    data: bytes = b'synthetic cached bytes',
+) -> str:
+    """Write one synthetic cached artifact and record it in the manifest.
+
+    The bytes are clearly synthetic test data; the record ties them to
+    a stage signature so reuse decisions can be exercised without any
+    later stage execution.
+    """
+    from lecture_localizer.storage import atomic_write_json
+
+    manifest_path = job_dir / 'manifest.json'
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    relative = f'artifacts/{kind}-{segment or "job"}.bin'
+    target = job_dir / relative
+    target.parent.mkdir(exist_ok=True)
+    target.write_bytes(data)
+    manifest['artifacts'].append(
+        {
+            'kind': kind,
+            'segment': segment,
+            'signature': signature,
+            'path': relative,
+            'sha256': hashlib.sha256(data).hexdigest(),
+            'created_at': '2026-10-26T12:00:00+00:00',
+        }
+    )
+    atomic_write_json(manifest_path, manifest)
+    return relative
+
+
+def plant_complete_cache(job_dir: Path) -> None:
+    """Plant raw, fitted, subtitle and container records for a manifest."""
+    manifest = json.loads(
+        (job_dir / 'manifest.json').read_text(encoding='utf-8')
+    )
+    for segment in manifest['segments']:
+        plant_artifact_record(
+            job_dir,
+            'raw_response',
+            segment['id'],
+            segment['synthesis_signature'],
+        )
+        plant_artifact_record(
+            job_dir,
+            'fitted_audio',
+            segment['id'],
+            segment['fitting_signature'],
+        )
+    plant_artifact_record(
+        job_dir, 'subtitles', None, manifest['subtitle_signature']
+    )
+    plant_artifact_record(
+        job_dir, 'container_track', None, manifest['container_signature']
+    )

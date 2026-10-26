@@ -28,6 +28,7 @@ from lecture_localizer.storage import sha256_bytes
 
 
 def _document(path: Path) -> TranslationDocument:
+    """Load one translation document for assertion helpers."""
     return load_translation_document(path)
 
 
@@ -209,3 +210,75 @@ def test_load_job_manifest_rejects_schema_violations(
 def test_manifest_hash_fields_use_hex_digests(tmp_path: Path) -> None:
     digest = sha256_bytes(b'test')
     assert len(digest) == 64
+
+
+def test_uppercase_digests_are_accepted(tmp_path: Path) -> None:
+    payload = translation_payload('A' * 64, 'B' * 64, default_segments())
+    path = tmp_path / 'upper.json'
+    path.write_text(json.dumps(payload), encoding='utf-8')
+    document = load_translation_document(path)
+    assert document.video_sha256 == 'A' * 64
+    verify_binding(document, 'a' * 64, 'b' * 64)
+
+
+def test_distinct_literal_ids_are_preserved(tmp_path: Path) -> None:
+    segments = [
+        {'id': 's1', 'source_cues': [1], 'translation': 'Первая.'},
+        {'id': ' s1', 'source_cues': [2], 'translation': 'Вторая.'},
+    ]
+    payload = translation_payload('a' * 64, 'b' * 64, segments)
+    path = tmp_path / 'ids.json'
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+    document = load_translation_document(path)
+    assert [segment.id for segment in document.segments] == ['s1', ' s1']
+
+
+def test_true_duplicate_ids_are_rejected(tmp_path: Path) -> None:
+    segments = [
+        {'id': ' s1', 'source_cues': [1], 'translation': 'Первая.'},
+        {'id': ' s1', 'source_cues': [2], 'translation': 'Вторая.'},
+    ]
+    payload = translation_payload('a' * 64, 'b' * 64, segments)
+    path = tmp_path / 'dup.json'
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+    with pytest.raises(ContractError, match='duplicate segment id'):
+        load_translation_document(path)
+
+
+def test_integral_float_cue_is_normalized(tmp_path: Path) -> None:
+    segments = [
+        {'id': 's1', 'source_cues': [1.0], 'translation': 'Первая.'},
+        {'id': 's2', 'source_cues': [2.0], 'translation': 'Вторая.'},
+    ]
+    payload = translation_payload('a' * 64, 'b' * 64, segments)
+    path = tmp_path / 'floats.json'
+    path.write_text(json.dumps(payload), encoding='utf-8')
+    document = load_translation_document(path)
+    assert document.segments[0].source_cues == (1,)
+    assert document.segments[1].source_cues == (2,)
+
+
+def test_fractional_cue_is_rejected_by_schema(tmp_path: Path) -> None:
+    segments = [{'id': 's1', 'source_cues': [1.5], 'translation': 'X.'}]
+    payload = translation_payload('a' * 64, 'b' * 64, segments)
+    path = tmp_path / 'fractional.json'
+    path.write_text(json.dumps(payload), encoding='utf-8')
+    with pytest.raises(ContractError, match='fails schema validation'):
+        load_translation_document(path)
+
+
+def test_huge_integer_cue_fails_as_invalid_json(tmp_path: Path) -> None:
+    huge_digits = '1' * 5000
+    text = (
+        '{"schema_version": 1,'
+        ' "source": {"video_sha256": "' + 'a' * 64 + '",'
+        ' "srt_sha256": "' + 'b' * 64 + '"},'
+        ' "source_language": "en", "target_language": "ru",'
+        ' "segments": [{"id": "s1", "source_cues": ['
+        + huge_digits
+        + '], "translation": "X."}]}'
+    )
+    path = tmp_path / 'huge.json'
+    path.write_text(text, encoding='utf-8')
+    with pytest.raises(ContractError, match='not valid JSON'):
+        strict_json_loads(path.read_text(encoding='utf-8'))

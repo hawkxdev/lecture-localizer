@@ -541,6 +541,7 @@ def test_settings_drive_the_dependency_matrix_through_the_cli(
         DEFAULT_CUES,
         default_segments,
         make_media,
+        plant_complete_cache,
         write_srt,
         write_translation,
     )
@@ -556,6 +557,15 @@ def test_settings_drive_the_dependency_matrix_through_the_cli(
     argv = _prepare_argv(video, srt, translation, job, tmp_path / 'out.mp4')
     assert main(argv) == 0
     capsys.readouterr()
+    plant_complete_cache(job)
+    payload = _status_json(job, capsys)
+    stages = payload['stages']
+    assert all(stages[s]['state'] == 'complete' for s in stages)
+    reuse = payload['reuse']
+    assert reuse['synthesis']['preserved'] == ['s001', 's002']
+    assert reuse['subtitle']['preserved'] is True
+    assert reuse['container']['preserved'] is True
+
     fitting_settings = tmp_path / 'fitting.json'
     fitting_settings.write_text(
         json.dumps({'fitting_max_speedup': 1.15}), encoding='utf-8'
@@ -563,12 +573,17 @@ def test_settings_drive_the_dependency_matrix_through_the_cli(
     assert main([*argv, '--settings', str(fitting_settings)]) == 0
     capsys.readouterr()
     payload = _status_json(job, capsys)
-    invalidated = payload['reuse']
-    assert invalidated['synthesis']['invalidated'] == {}
-    assert invalidated['fitting']['invalidated'] == {
+    reuse = payload['reuse']
+    assert reuse['synthesis']['invalidated'] == {}
+    assert reuse['synthesis']['preserved'] == ['s001', 's002']
+    assert reuse['fitting']['invalidated'] == {
         's001': 'signature_changed',
         's002': 'signature_changed',
     }
+    assert reuse['container']['invalidated'] == 'signature_changed'
+    assert reuse['subtitle']['preserved'] is True
+
+    plant_complete_cache(job)
     defaults_settings = tmp_path / 'combined.json'
     defaults_settings.write_text(
         json.dumps(
@@ -585,7 +600,8 @@ def test_settings_drive_the_dependency_matrix_through_the_cli(
     reuse = payload['reuse']
     assert reuse['synthesis']['invalidated'] == {}
     assert reuse['fitting']['invalidated'] == {}
-    assert reuse['container']['invalidated'] is True
+    assert reuse['subtitle']['preserved'] is True
+    assert reuse['container']['invalidated'] == 'signature_changed'
     assert reuse['container']['preserved'] is False
 
 
@@ -596,3 +612,192 @@ def _status_json(
     assert main(['status', '--job', str(job), '--json']) == 0
     payload: dict[str, Any] = json.loads(capsys.readouterr().out)
     return payload
+
+
+def test_prepare_overlap_and_utf8_exit_3_with_positive_control(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_real_tools()
+    monkeypatch.delenv(SETTINGS_ENV_VAR, raising=False)
+    from conftest import default_segments, make_media
+
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    video = make_media(kit / 'lecture.mp4')
+    overlap_srt = kit / 'overlap.srt'
+    overlap_srt.write_text(
+        '1\n00:00:00,000 --> 00:00:01,500\nFirst.\n\n'
+        '2\n00:00:00,500 --> 00:00:02,000\nOverlapping second.\n',
+        encoding='utf-8',
+    )
+    from conftest import write_translation
+
+    translation = write_translation(
+        kit / 'overlap.json', video, overlap_srt, default_segments()
+    )
+    argv = _prepare_argv(
+        video,
+        overlap_srt,
+        translation,
+        tmp_path / 'overlap-job',
+        tmp_path / 'overlap-out.mp4',
+    )
+    assert main(argv) == 3
+    captured = capsys.readouterr()
+    assert 'invalid subtitles' in captured.err
+    assert 'overlaps segment' in captured.err
+    assert 'Traceback' not in captured.out + captured.err
+
+    broken_srt = kit / 'broken.srt'
+    broken_srt.write_bytes(b'\xff\xfe not utf8')
+    translation = write_translation(
+        kit / 'broken.json', video, broken_srt, default_segments()
+    )
+    argv = _prepare_argv(
+        video,
+        broken_srt,
+        translation,
+        tmp_path / 'broken-job',
+        tmp_path / 'broken-out.mp4',
+    )
+    assert main(argv) == 3
+    assert 'not valid UTF-8' in capsys.readouterr().err
+
+
+def test_prepare_huge_integer_exits_3(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_real_tools()
+    monkeypatch.delenv(SETTINGS_ENV_VAR, raising=False)
+    from conftest import DEFAULT_CUES, make_media, write_srt
+
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    video = make_media(kit / 'lecture.mp4')
+    srt = write_srt(kit / 'lecture.srt', DEFAULT_CUES)
+    huge_digits = '1' * 5000
+    segments = [{'id': 's1', 'source_cues': [10**5000], 'translation': 'X.'}]
+    del huge_digits, segments
+    translation_text = (
+        '{"schema_version": 1,'
+        ' "source": {"video_sha256": "'
+        + hashlib.sha256(video.read_bytes()).hexdigest()
+        + '",'
+        ' "srt_sha256": "'
+        + hashlib.sha256(srt.read_bytes()).hexdigest()
+        + '"},'
+        ' "source_language": "en", "target_language": "ru",'
+        ' "segments": [{"id": "s1", "source_cues": ['
+        + '1' * 5000
+        + '], "translation": "X."}]}'
+    )
+    translation = kit / 'huge.json'
+    translation.write_text(translation_text, encoding='utf-8')
+    argv = _prepare_argv(
+        video, srt, translation, tmp_path / 'job', tmp_path / 'out.mp4'
+    )
+    assert main(argv) == 3
+    captured = capsys.readouterr()
+    assert 'invalid input' in captured.err
+    assert 'Traceback' not in captured.out + captured.err
+
+
+def test_prepare_accepts_integral_float_cues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_real_tools()
+    monkeypatch.delenv(SETTINGS_ENV_VAR, raising=False)
+    from conftest import DEFAULT_CUES, make_media, write_srt, write_translation
+
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    video = make_media(kit / 'lecture.mp4')
+    srt = write_srt(kit / 'lecture.srt', DEFAULT_CUES)
+    segments = [
+        {'id': 's001', 'source_cues': [1.0], 'translation': 'Первая.'},
+        {'id': 's002', 'source_cues': [2.0], 'translation': 'Вторая.'},
+    ]
+    translation = write_translation(kit / 'floats.json', video, srt, segments)
+    argv = _prepare_argv(
+        video, srt, translation, tmp_path / 'job', tmp_path / 'out.mp4'
+    )
+    assert main(argv) == 0
+    capsys.readouterr()
+    payload = _status_json(tmp_path / 'job', capsys)
+    assert payload['segment_count'] == 2
+
+
+def test_prepare_repo_local_job_exits_3(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_real_tools()
+    monkeypatch.delenv(SETTINGS_ENV_VAR, raising=False)
+    from conftest import (
+        DEFAULT_CUES,
+        default_segments,
+        make_media,
+        write_srt,
+        write_translation,
+    )
+    from lecture_localizer.jobs import _application_source_root
+
+    root = _application_source_root()
+    assert root is not None
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    video = make_media(kit / 'lecture.mp4')
+    srt = write_srt(kit / 'lecture.srt', DEFAULT_CUES)
+    translation = write_translation(
+        kit / 'translation.json', video, srt, default_segments()
+    )
+    nested_job = root / 'src' / 'lecture_localizer' / 'cli-probe-job'
+    argv = _prepare_argv(
+        video, srt, translation, nested_job, tmp_path / 'out.mp4'
+    )
+    assert main(argv) == 3
+    assert 'outside the application source' in capsys.readouterr().err
+    assert not nested_job.exists()
+
+
+def test_prepare_corrupt_cache_exits_3(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _require_real_tools()
+    monkeypatch.delenv(SETTINGS_ENV_VAR, raising=False)
+    from conftest import (
+        DEFAULT_CUES,
+        default_segments,
+        make_media,
+        plant_complete_cache,
+        write_srt,
+        write_translation,
+    )
+
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    video = make_media(kit / 'lecture.mp4')
+    srt = write_srt(kit / 'lecture.srt', DEFAULT_CUES)
+    translation = write_translation(
+        kit / 'translation.json', video, srt, default_segments()
+    )
+    job = tmp_path / 'job'
+    argv = _prepare_argv(video, srt, translation, job, tmp_path / 'out.mp4')
+    assert main(argv) == 0
+    capsys.readouterr()
+    plant_complete_cache(job)
+    target = job / 'artifacts' / 'raw_response-s001.bin'
+    target.write_bytes(b'corrupted after planting')
+    assert main(argv) == 3
+    captured = capsys.readouterr()
+    assert 'artifact integrity check failed' in captured.err
+    assert 'Traceback' not in captured.out + captured.err

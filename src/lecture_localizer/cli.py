@@ -22,6 +22,7 @@ from lecture_localizer.storage import (
     LockUnavailableError,
     StorageError,
 )
+from lecture_localizer.subtitles import SubtitlesError
 
 EXIT_OK = 0
 EXIT_INVALID_INPUT = 3
@@ -167,6 +168,9 @@ def _prepare_error_exit(error: Exception) -> int:
     if isinstance(error, ContractError):
         print(f'invalid input: {error}', file=sys.stderr)
         return EXIT_INVALID_INPUT
+    if isinstance(error, SubtitlesError):
+        print(f'invalid subtitles: {error}', file=sys.stderr)
+        return EXIT_INVALID_INPUT
     if isinstance(error, LockUnavailableError):
         print(f'job lock unavailable: {error}', file=sys.stderr)
         return EXIT_TOOL_FAILURE
@@ -246,6 +250,7 @@ def _run_prepare(args: argparse.Namespace) -> int:
     except (DestinationExistsError, ContractError) as error:
         return _prepare_error_exit(error)
     except (
+        SubtitlesError,
         LockUnavailableError,
         StorageError,
         MediaToolError,

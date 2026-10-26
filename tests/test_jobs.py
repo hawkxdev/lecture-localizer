@@ -16,6 +16,8 @@ from conftest import (
     default_segments,
     fake_ffprobe,
     make_media,
+    plant_artifact_record,
+    plant_complete_cache,
     probe_payload,
     rebind_translation,
     require_real_media,
@@ -173,6 +175,7 @@ def test_inspect_media_uses_fake_probe_payload(tmp_path: Path) -> None:
 
 
 def _profile_settings(tmp_path: Path, payload: dict[str, Any]) -> Settings:
+    """Settings pointing ffprobe at one canned payload script."""
     fake = fake_ffprobe(tmp_path, payload)
     return Settings(ffprobe_path=str(fake['ffprobe']))
 
@@ -208,6 +211,7 @@ def test_unsupported_video_codec_and_pixels(tmp_path: Path) -> None:
 def _select_from(
     tmp_path: Path, payload: dict[str, Any]
 ) -> Callable[[int | None], tuple[Any, str, str]]:
+    """Build a selection probe bound to one canned probe payload."""
     from lecture_localizer.jobs import _select_audio, inspect_media
 
     video = tmp_path / 'v.mp4'
@@ -217,6 +221,7 @@ def _select_from(
     def select(
         source_audio: int | None,
     ) -> tuple[Any, str, str]:
+        """Run selection once for the prepared probe facts."""
         selected, mode, disposition = _select_audio(facts, source_audio)
         return selected, mode, disposition
 
@@ -540,6 +545,7 @@ def test_interruption_between_snapshots_and_manifest(
     kit = make_kit(tmp_path)
 
     def interrupted(payload_path: object, data: object) -> None:
+        """Simulate user interruption during the manifest write."""
         raise KeyboardInterrupt
 
     monkeypatch.setattr(
@@ -576,6 +582,7 @@ def test_disk_failure_during_manifest_update_is_visible(
     translation = rebind_translation(path, kit['video'], kit['srt'])
 
     def no_space(payload_path: object, data: object) -> None:
+        """Simulate a full disk during the manifest write."""
         raise OSError(28, 'No space left on device')
 
     monkeypatch.setattr('lecture_localizer.jobs.atomic_write_json', no_space)
@@ -609,12 +616,16 @@ def test_verified_artifact_makes_stage_complete_and_reusable(
     assert status['blocked'] == []
 
 
-def test_corrupt_artifact_cannot_pass_as_reusable(tmp_path: Path) -> None:
+def test_corrupt_artifact_fails_prepare_and_keeps_status_blocked(
+    tmp_path: Path,
+) -> None:
     kit = make_kit(tmp_path)
     run_prepare(kit)
     plant_all_synthesis_artifacts(kit['job'])
     corrupt_target = kit['job'] / 'artifacts' / 'raw_response-s002.bin'
     corrupt_target.write_bytes(b'tampered bytes')
+    with pytest.raises(ContractError, match='artifact integrity check'):
+        run_prepare(kit)
     status = read_job_status(kit['job'])
     assert status['stages']['synthesis']['state'] == 'blocked'
     assert status['reuse']['synthesis']['preserved'] == ['s001']
@@ -623,11 +634,6 @@ def test_corrupt_artifact_cannot_pass_as_reusable(tmp_path: Path) -> None:
     )
     assert any(
         'raw_response artifact for s002' in b for b in status['blocked']
-    )
-    result = run_prepare(kit)
-    assert any(
-        'raw_response artifact for s002' in b
-        for b in result.manifest['blocked']
     )
 
 
@@ -740,3 +746,270 @@ def test_prepare_and_status_make_zero_network_calls(
     status = read_job_status(kit['job'])
     assert status['command'] == 'status'
     assert 'sk-sentinel-not-real' not in json.dumps(status)
+
+
+def test_rebind_srt_accepts_updated_translation(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    first = run_prepare(kit)
+    old_snapshots = {
+        kind: record['path']
+        for kind, record in first.manifest['snapshots'].items()
+    }
+    changed_srt = write_srt(
+        tmp_path / 'changed.srt',
+        [
+            (0, 900, 'First spoken line.'),
+            (900, 2000, 'Second spoken line.'),
+        ],
+    )
+    kit['srt'] = changed_srt
+    rebind_translation(kit['translation'], kit['video'], changed_srt)
+    result = run_prepare(kit)
+    assert result.unchanged is False
+    manifest = result.manifest
+    assert manifest['revision'] == 2
+    assert manifest['binding']['srt_sha256'] == sha256(changed_srt)
+    entry = manifest['history'][-1]
+    assert entry.get('rebind') is True
+    assert entry['invalidated']['subtitle'] is True
+    assert entry['invalidated']['fitting'] == ['s001', 's002']
+    assert entry['invalidated']['synthesis'] == []
+    assert entry['invalidated']['container'] is True
+    assert manifest['segments'][0]['window'] == {'start_ms': 0, 'end_ms': 900}
+    new_names = {record['path'] for record in manifest['snapshots'].values()}
+    assert new_names.isdisjoint(set(old_snapshots.values()))
+    for relative in old_snapshots.values():
+        assert (kit['job'] / relative).is_file()
+
+
+def test_rebind_video_accepts_updated_translation(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    replanted = make_media(tmp_path / 'reencoded' / 'lecture.mp4', seconds=2.2)
+    kit['video'] = replanted
+    rebind_translation(kit['translation'], replanted, kit['srt'])
+    result = run_prepare(kit)
+    manifest = result.manifest
+    entry = manifest['history'][-1]
+    assert entry.get('rebind') is True
+    assert entry['invalidated']['container'] is True
+    assert entry['invalidated']['subtitle'] is False
+    assert entry['invalidated']['synthesis'] == []
+    assert entry['invalidated']['fitting'] == []
+    assert manifest['media']['video_stream']['codec'] == 'h264'
+
+
+def test_container_signature_tracks_original_stream_bytes(
+    tmp_path: Path,
+) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    first_signature = read_job_status(kit['job'])
+    other = make_media(tmp_path / 'other-audio' / 'lecture.mp4', seconds=2.2)
+    kit['video'] = other
+    rebind_translation(kit['translation'], other, kit['srt'])
+    result = run_prepare(kit)
+    identity_before = first_signature['media']['audio_stream']
+    identity_after = result.manifest['media']['audio_stream']
+    assert identity_before['codec'] == identity_after['codec']
+    assert identity_before['channels'] == identity_after['channels']
+    assert identity_before['profile'] == identity_after['profile']
+    original_media = tmp_path / 'src' / 'lecture.mp4'
+    assert other.read_bytes() != original_media.read_bytes()
+    entry = result.manifest['history'][-1]
+    assert entry.get('rebind') is True
+    assert entry['invalidated']['container'] is True
+
+
+def test_stale_translation_without_rebind_is_rejected(
+    tmp_path: Path,
+) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    other = make_media(tmp_path / 'stale-video' / 'lecture.mp4', seconds=2.2)
+    with pytest.raises(ContractError, match='source binding mismatch'):
+        prepare_job(
+            video_path=other,
+            srt_path=kit['srt'],
+            translation_path=kit['translation'],
+            job_dir=tmp_path / 'stale-job',
+            output_path=tmp_path / 'stale-out.mp4',
+            source_audio=None,
+            settings=Settings(),
+        )
+
+
+def test_changed_translation_invalidates_cached_subtitle_and_container(
+    tmp_path: Path,
+) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    plant_complete_cache(kit['job'])
+    changed = json.loads(kit['translation'].read_text(encoding='utf-8'))
+    changed['segments'][0]['translation'] = 'Обновлённый перевод.'
+    path = tmp_path / 'changed-translation.json'
+    path.write_text(
+        json.dumps(changed, ensure_ascii=False, indent=2), encoding='utf-8'
+    )
+    result = run_prepare(
+        kit, translation=rebind_translation(path, kit['video'], kit['srt'])
+    )
+    reuse = result.reuse
+    assert reuse['subtitle']['invalidated'] == 'signature_changed'
+    assert reuse['subtitle']['preserved'] is False
+    assert reuse['container']['invalidated'] == 'signature_changed'
+    assert reuse['container']['preserved'] is False
+    assert reuse['synthesis']['preserved'] == ['s001', 's002']
+    status = read_job_status(kit['job'])
+    assert status['stages']['subtitle']['state'] == 'pending'
+    assert status['stages']['container']['state'] == 'pending'
+
+
+def test_partial_cache_reports_synthesis_pending(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    manifest = json.loads(
+        (kit['job'] / 'manifest.json').read_text(encoding='utf-8')
+    )
+    segment = manifest['segments'][0]
+    plant_artifact_record(
+        kit['job'],
+        'raw_response',
+        segment['id'],
+        segment['synthesis_signature'],
+    )
+    status = read_job_status(kit['job'])
+    assert status['stages']['synthesis']['state'] == 'pending'
+    assert status['stages']['fitting']['state'] == 'pending'
+    reuse = status['reuse']
+    assert reuse['synthesis']['preserved'] == ['s001']
+    assert reuse['synthesis']['invalidated'] == {'s002': 'initial_revision'}
+    assert reuse['synthesis']['pending'] == []
+
+
+def test_historical_records_do_not_block_current_completion(
+    tmp_path: Path,
+) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    plant_complete_cache(kit['job'])
+    changed = json.loads(kit['translation'].read_text(encoding='utf-8'))
+    changed['segments'][0]['narration'] = 'Новый текст речи первой.'
+    path = tmp_path / 'changed-narration.json'
+    path.write_text(
+        json.dumps(changed, ensure_ascii=False, indent=2), encoding='utf-8'
+    )
+    run_prepare(
+        kit, translation=rebind_translation(path, kit['video'], kit['srt'])
+    )
+    plant_complete_cache(kit['job'])
+    status = read_job_status(kit['job'])
+    assert status['stages']['synthesis']['state'] == 'complete'
+    assert status['reuse']['synthesis']['preserved'] == ['s001', 's002']
+
+
+def test_missing_raw_under_fitted_work_blocks(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    manifest = json.loads(
+        (kit['job'] / 'manifest.json').read_text(encoding='utf-8')
+    )
+    segment = manifest['segments'][0]
+    plant_artifact_record(
+        kit['job'],
+        'fitted_audio',
+        segment['id'],
+        segment['fitting_signature'],
+    )
+    status = read_job_status(kit['job'])
+    assert status['stages']['synthesis']['state'] == 'pending'
+    assert status['stages']['fitting']['state'] == 'blocked'
+    assert any(
+        'required synthesis artifact for s001' in b for b in status['blocked']
+    )
+    assert status['reuse']['fitting']['invalidated']['s001'] == (
+        'missing_provenance'
+    )
+
+
+def test_defaults_only_change_invalidates_only_container(
+    tmp_path: Path,
+) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    plant_complete_cache(kit['job'])
+    flipped = Settings(startup_narration_default=False)
+    result = run_prepare(kit, settings=flipped)
+    reuse = result.reuse
+    assert reuse['container']['invalidated'] == 'signature_changed'
+    assert reuse['subtitle']['preserved'] is True
+    assert reuse['synthesis']['preserved'] == ['s001', 's002']
+    assert reuse['fitting']['preserved'] == ['s001', 's002']
+
+
+def test_invalid_utf8_srt_raises_contract_error(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    kit['srt'].write_bytes(b'\xff\xfe broken')
+    rebind_translation(kit['translation'], kit['video'], kit['srt'])
+    with pytest.raises(ContractError, match='not valid UTF-8'):
+        run_prepare(kit)
+
+
+def test_repo_local_job_is_rejected_before_writes(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    from lecture_localizer.jobs import _application_source_root
+
+    root = _application_source_root()
+    assert root is not None
+    nested = root / 'src' / 'lecture_localizer' / 'probe-job-correction'
+    with pytest.raises(ContractError, match='outside the application source'):
+        run_prepare(kit, job=nested)
+    assert not nested.exists()
+
+
+def test_relative_paths_persist_absolute_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kit = make_kit(tmp_path, name='relsrc')
+    work_one = tmp_path / 'work-one'
+    work_two = tmp_path / 'work-two'
+    work_one.mkdir()
+    work_two.mkdir()
+    monkeypatch.chdir(work_one)
+    first = prepare_job(
+        video_path=kit['video'],
+        srt_path=kit['srt'],
+        translation_path=kit['translation'],
+        job_dir=kit['job'],
+        output_path=Path('out.mp4'),
+        source_audio=None,
+        settings=Settings(),
+    )
+    recorded_one = first.manifest['output_path']
+    assert Path(recorded_one).is_absolute()
+    assert Path(recorded_one) == (work_one / 'out.mp4')
+    monkeypatch.chdir(work_two)
+    second = prepare_job(
+        video_path=kit['video'],
+        srt_path=kit['srt'],
+        translation_path=kit['translation'],
+        job_dir=kit['job'],
+        output_path=Path('out.mp4'),
+        source_audio=None,
+        settings=Settings(),
+    )
+    assert second.unchanged is False
+    assert second.manifest['output_path'] == str(work_two / 'out.mp4')
+    assert second.manifest['output_path'] != recorded_one
+    monkeypatch.chdir(work_one)
+    third = prepare_job(
+        video_path=kit['video'],
+        srt_path=kit['srt'],
+        translation_path=kit['translation'],
+        job_dir=kit['job'],
+        output_path=Path('out.mp4'),
+        source_audio=None,
+        settings=Settings(),
+    )
+    assert third.manifest['output_path'] == recorded_one

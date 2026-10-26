@@ -74,7 +74,9 @@ def strict_json_loads(data: bytes | str) -> Any:
             object_pairs_hook=_build_object,
             parse_constant=_reject_constant,
         )
-    except json.JSONDecodeError as error:
+    except ContractError:
+        raise
+    except ValueError as error:
         raise ContractError(f'input is not valid JSON: {error}') from error
 
 
@@ -125,6 +127,18 @@ def _require_nonblank(value: str, field: str, segment_id: str) -> None:
         )
 
 
+def _normalize_cue(value: Any) -> int:
+    """Normalize one schema valid cue number to an integer.
+
+    JSON Schema integer semantics accept 1.0 and 1 as the same value,
+    so integral floats are normalized here; fractional values never
+    reach this point because the schema already rejected them.
+    """
+    if isinstance(value, float):
+        return int(value)
+    return int(value)
+
+
 def load_translation_document(path: str | Path) -> TranslationDocument:
     """Strictly parse and validate translation input semantically."""
     raw_bytes = Path(path).read_bytes()
@@ -141,16 +155,16 @@ def load_translation_document(path: str | Path) -> TranslationDocument:
         narration = raw_segment.get('narration')
         if narration is not None:
             _require_nonblank(narration, 'narration', segment_id)
-        unique_id = segment_id.strip()
-        if unique_id in seen_ids:
-            raise ContractError(
-                f'duplicate segment id after trimming: {unique_id!r}'
-            )
-        seen_ids.add(unique_id)
+        if segment_id in seen_ids:
+            raise ContractError(f'duplicate segment id: {segment_id!r}')
+        seen_ids.add(segment_id)
         segments.append(
             TranslationSegment(
                 id=segment_id,
-                source_cues=tuple(raw_segment['source_cues']),
+                source_cues=tuple(
+                    _normalize_cue(value)
+                    for value in raw_segment['source_cues']
+                ),
                 translation=raw_segment['translation'],
                 narration=narration,
             )
@@ -167,15 +181,20 @@ def load_translation_document(path: str | Path) -> TranslationDocument:
 def verify_binding(
     document: TranslationDocument, video_sha256: str, srt_sha256: str
 ) -> None:
-    """Verify the translation source hashes match the supplied inputs."""
-    if document.video_sha256 != video_sha256:
+    """Verify the translation source hashes match the supplied inputs.
+
+    Digest spelling is compared case insensitively because uppercase and
+    lowercase spell the same hexadecimal value; malformed digests are
+    already rejected by the schema.
+    """
+    if document.video_sha256.lower() != video_sha256.lower():
         raise ContractError(
             'translation source binding mismatch: translation is bound to '
             f'video {document.video_sha256} but the supplied video hashes '
             f'to {video_sha256}; supply a translation bound to the current '
             'inputs'
         )
-    if document.srt_sha256 != srt_sha256:
+    if document.srt_sha256.lower() != srt_sha256.lower():
         raise ContractError(
             'translation source binding mismatch: translation is bound to '
             f'srt {document.srt_sha256} but the supplied SRT hashes to '

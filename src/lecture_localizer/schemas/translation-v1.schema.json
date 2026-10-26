@@ -23,11 +23,11 @@
       "properties": {
         "video_sha256": {
           "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
+          "pattern": "^[0-9a-fA-F]{64}$"
         },
         "srt_sha256": {
           "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
+          "pattern": "^[0-9a-fA-F]{64}$"
         }
       }
     },

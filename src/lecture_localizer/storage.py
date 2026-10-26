@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -184,16 +185,30 @@ def _describe_lock(path: Path) -> str:
 
 @dataclass
 class JobLock:
-    """Exclusive one writer lock for a job directory."""
+    """Exclusive one writer lock for a job directory.
+
+    Every acquisition stores a unique instance token in the lock file;
+    release removes the file only when it still carries this instance
+    token, so an externally replaced lock is reported instead of
+    deleting another writer's lock.
+    """
 
     path: Path
+    token: str
 
     @classmethod
     def acquire(cls, job_dir: Path) -> JobLock:
         """Create the lock file atomically or explain the blocker."""
         job_dir.mkdir(parents=True, exist_ok=True)
         path = job_dir / 'lock'
-        payload = json.dumps({'pid': os.getpid(), 'created_at': utc_now_iso()})
+        token = secrets.token_hex(16)
+        payload = json.dumps(
+            {
+                'pid': os.getpid(),
+                'created_at': utc_now_iso(),
+                'token': token,
+            }
+        )
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         except FileExistsError as error:
@@ -204,10 +219,25 @@ class JobLock:
             handle.write(payload.encode('utf-8'))
             handle.flush()
             os.fsync(handle.fileno())
-        return cls(path=path)
+        return cls(path=path, token=token)
 
     def release(self) -> None:
-        """Remove the lock file this instance owns."""
+        """Remove the lock file only when this instance still owns it."""
+        try:
+            payload = _read_lock(self.path)
+        except OSError as error:
+            raise LockUnavailableError(
+                f'the lock at {self.path} cannot be read to confirm'
+                f' ownership: {error}',
+                kind='lock',
+            ) from error
+        if payload is not None and payload.get('token') != self.token:
+            raise LockUnavailableError(
+                f'the lock at {self.path} was replaced by another writer'
+                ' after this instance acquired it; the replacement stays'
+                ' in place and must be inspected manually',
+                kind='lock',
+            )
         self.path.unlink(missing_ok=True)
 
     def __enter__(self) -> JobLock:

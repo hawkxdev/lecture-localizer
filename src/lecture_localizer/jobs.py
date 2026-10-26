@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -45,12 +46,6 @@ STAGE_NAMES = ('synthesis', 'fitting', 'subtitle', 'container')
 SUPPORTED_CONTAINERS = frozenset({'mp4', 'mov', 'matroska'})
 SUPPORTED_AUDIO_CODECS = frozenset({'aac', 'pcm_s16le', 'mp3', 'opus'})
 HDR_TRANSFERS = frozenset({'smpte2084', 'arib-std-b67'})
-_STAGE_BY_KIND = {
-    'raw_response': 'synthesis',
-    'fitted_audio': 'fitting',
-    'subtitles': 'subtitle',
-    'container_track': 'container',
-}
 SYNTHESIS_SETTINGS: dict[str, Any] = {
     'provider': 'xai',
     'voice': 'eve',
@@ -378,13 +373,22 @@ def _synthesis_signature(segment: TranslationSegment) -> str:
     )
 
 
-def _fitting_signature(segment: TranslationSegment, max_speedup: float) -> str:
-    """Signature of the fitting work for one segment."""
+def _fitting_signature(
+    segment: TranslationSegment,
+    window: SegmentWindow,
+    max_speedup: float,
+) -> str:
+    """Signature of the fitting work for one segment.
+
+    The window is part of the fitting identity: the same speech placed
+    on a different source interval is different fitting work.
+    """
     return _signature(
         {
             'kind': 'fitting-v1',
             'synthesis': _synthesis_signature(segment),
             'max_speedup': max_speedup,
+            'window': {'start_ms': window.start_ms, 'end_ms': window.end_ms},
         }
     )
 
@@ -519,41 +523,6 @@ def _artifact_label(record: dict[str, Any]) -> str:
     return f'{record["kind"]} artifact for {record["segment"] or "the job"}'
 
 
-def _stage_state(
-    stage: str,
-    artifacts: list[dict[str, Any]],
-    failed_labels: frozenset[str],
-    segments: list[dict[str, Any]],
-    manifest: dict[str, Any],
-) -> str:
-    """Roll one stage state up from artifacts and integrity."""
-    records = [
-        record
-        for record in artifacts
-        if _STAGE_BY_KIND.get(record['kind']) == stage
-    ]
-    if not records:
-        return 'pending'
-    if any(_artifact_label(record) in failed_labels for record in records):
-        return 'blocked'
-    if stage in ('synthesis', 'fitting'):
-        key = f'{stage}_signature'
-        expected = {s['id']: s[key] for s in segments}
-        if all(
-            record['signature'] == expected.get(record['segment'])
-            for record in records
-        ):
-            return 'complete'
-        return 'pending'
-    signature_field = (
-        'subtitle_signature' if stage == 'subtitle' else 'container_signature'
-    )
-    signature = manifest[signature_field]
-    if all(record['signature'] == signature for record in records):
-        return 'complete'
-    return 'pending'
-
-
 def _candidate_segments(
     document: TranslationDocument,
     windows: dict[str, SegmentWindow],
@@ -579,7 +548,7 @@ def _candidate_segments(
                 ),
                 'synthesis_signature': _synthesis_signature(segment),
                 'fitting_signature': _fitting_signature(
-                    segment, settings.fitting_max_speedup
+                    segment, window, settings.fitting_max_speedup
                 ),
             }
         )
@@ -627,8 +596,14 @@ def _container_signature(
     fitting_sigs: list[str],
     selected: Any,
     policy: dict[str, Any],
+    video_hash: str,
 ) -> str:
-    """Signature of the container assembly work."""
+    """Signature of the container assembly work.
+
+    The source video digest is part of the identity: container assembly
+    copies the actual original stream packets, so a different input file
+    with equal codec facts is still different container work.
+    """
     return _signature(
         {
             'kind': 'container-v1',
@@ -646,6 +621,7 @@ def _container_signature(
                 for key in sorted(policy)
                 if key.startswith('startup_')
             },
+            'source_video_sha256': video_hash,
         }
     )
 
@@ -661,6 +637,43 @@ class PrepareResult:
     unchanged: bool
 
 
+def _application_source_root() -> Path | None:
+    """Locate this application source repository root when running from one.
+
+    Walks upward from the package file toward pyproject.toml and a
+    repository marker. Returns None for an installed copy outside a
+    source tree; no Git command is ever invoked.
+    """
+    current = Path(__file__).resolve().parent
+    for candidate in (current, *current.parents):
+        if (candidate / 'pyproject.toml').is_file() or (
+            candidate / '.git'
+        ).exists():
+            return candidate
+    return None
+
+
+def _reject_source_tree_paths(job_dir: Path, output_path: Path) -> None:
+    """Reject job runtime data inside this application source tree.
+
+    The approved technical basis keeps job data outside the source
+    repository; runtime data under the package root can otherwise be
+    packaged as product content by a local build.
+    """
+    root = _application_source_root()
+    if root is None:
+        return
+    resolved_root = root.resolve()
+    for name, path in (('job directory', job_dir), ('output', output_path)):
+        resolved = path.resolve()
+        if resolved == resolved_root or resolved_root in resolved.parents:
+            raise ContractError(
+                f'the {name} must stay outside the application source'
+                f' repository at {resolved_root}; job data is not product'
+                ' content and must not be packaged or committed'
+            )
+
+
 def prepare_job(
     video_path: Path,
     srt_path: Path,
@@ -671,6 +684,11 @@ def prepare_job(
     settings: Settings,
 ) -> PrepareResult:
     """Validate all inputs and create or resume the persistent job."""
+    video_path = Path(os.path.abspath(video_path))
+    srt_path = Path(os.path.abspath(srt_path))
+    translation_path = Path(os.path.abspath(translation_path))
+    job_dir = Path(os.path.abspath(job_dir))
+    output_path = Path(os.path.abspath(output_path))
     for label, path in (
         ('video', video_path),
         ('source SRT', srt_path),
@@ -678,6 +696,7 @@ def prepare_job(
     ):
         if not path.is_file():
             raise ContractError(f'{label} input not found: {path}')
+    _reject_source_tree_paths(job_dir, output_path)
     ensure_distinct_files(
         {
             'video': video_path,
@@ -703,7 +722,13 @@ def prepare_job(
     srt_hash = sha256_file(srt_path)
     document = load_translation_document(translation_path)
     verify_binding(document, video_hash, srt_hash)
-    cues = parse_srt(srt_path.read_text(encoding='utf-8'))
+    try:
+        srt_text = srt_path.read_text(encoding='utf-8')
+    except UnicodeDecodeError as error:
+        raise ContractError(
+            f'source SRT is not valid UTF-8: {srt_path}'
+        ) from error
+    cues = parse_srt(srt_text)
     windows = derive_windows(cues, document.segments)
     facts = inspect_media(video_path, settings)
     _validate_video(facts)
@@ -713,7 +738,6 @@ def prepare_job(
         stored: dict[str, Any] | None = None
         if manifest_path.exists():
             stored = load_job_manifest(manifest_path)
-            _verify_stored_binding(stored, video_hash, srt_hash)
             snapshot_failures = verify_integrity(
                 job_dir, _snapshot_integrity_records(stored)
             )
@@ -724,6 +748,17 @@ def prepare_job(
                     f' {names}; the referenced immutable snapshots are'
                     ' missing or corrupted; inspect the job directory'
                     ' before any recovery'
+                )
+            artifact_failures = verify_integrity(
+                job_dir, _artifact_integrity_records(stored['artifacts'])
+            )
+            if artifact_failures:
+                names = ', '.join(r.label for r in artifact_failures)
+                raise ContractError(
+                    'job artifact integrity check failed for:'
+                    f' {names}; recorded cached bytes are corrupt and'
+                    ' reusable work cannot be decided until the job'
+                    ' directory is inspected'
                 )
         else:
             _ensure_create_ready(job_dir)
@@ -761,22 +796,24 @@ def prepare_job(
     )
 
 
-def _verify_stored_binding(
+def _stored_binding_changed(
     stored: dict[str, Any], video_hash: str, srt_hash: str
-) -> None:
-    """Require an updated translation binding after source changes."""
+) -> bool:
+    """Return True when the job was prepared for different source bytes.
+
+    A supplied translation that already verifies against the current
+    inputs is an explicit rebind; the job then recomputes affected work
+    from the changed inputs and preserves the old revisions and
+    artifacts. Mismatched translations never reach this point because
+    verify_binding rejects them first.
+    """
     binding = stored['binding']
-    if (
-        binding['video_sha256'] != video_hash
-        or binding['srt_sha256'] != srt_hash
-    ):
-        raise ContractError(
-            'source binding changed: the job was prepared for video'
-            f' {binding["video_sha256"]} and srt {binding["srt_sha256"]}'
-            f' but the supplied inputs hash to {video_hash} and'
-            f' {srt_hash}; supply a translation whose source hashes'
-            ' match the current inputs to rebind this job'
-        )
+    video_value = binding['video_sha256']
+    srt_value = binding['srt_sha256']
+    return (
+        str(video_value).lower() != video_hash.lower()
+        or str(srt_value).lower() != srt_hash.lower()
+    )
 
 
 def _ensure_create_ready(job_dir: Path) -> None:
@@ -827,6 +864,10 @@ def _build_job_state(
         [s['fitting_signature'] for s in segments],
         selected,
         policy,
+        video_hash,
+    )
+    rebind = stored is not None and _stored_binding_changed(
+        stored, video_hash, srt_hash
     )
     if stored is None:
         invalidated: dict[str, Any] = {
@@ -880,10 +921,17 @@ def _build_job_state(
             )
         else:
             snapshots = dict(stored['snapshots'])
-    artifact_failures = verify_integrity(
-        job_dir, _artifact_integrity_records(previous_artifacts)
-    )
+    artifact_failures: tuple[IntegrityRecord, ...] = ()
     failed_labels = _integrity_failure_labels(artifact_failures)
+    view = _cache_view(
+        {
+            'segments': segments,
+            'subtitle_signature': subtitle_sig,
+            'container_signature': container_sig,
+        },
+        previous_artifacts,
+        failed_labels,
+    )
     manifest: dict[str, Any] = {
         'schema_version': 1,
         'created_at': created_at,
@@ -912,32 +960,17 @@ def _build_job_state(
         'container_signature': container_sig,
         'snapshots': snapshots,
         'artifacts': previous_artifacts,
-        'stages': {
-            stage: {
-                'state': _stage_state(
-                    stage,
-                    previous_artifacts,
-                    failed_labels,
-                    segments,
-                    _stage_view_manifest(
-                        subtitle_sig, container_sig, segments
-                    ),
-                )
-            }
-            for stage in STAGE_NAMES
-        },
+        'stages': view['stages'],
         'history': base_history,
-        'blocked': [
-            f'artifact integrity failure: {failure.label} at'
-            f' {failure.relative_path}'
-            for failure in artifact_failures
-        ],
+        'blocked': view['blocked'],
     }
     history_entry = {
         'revision': base_revision + (0 if stored is None else 1),
         'timestamp': now,
         'invalidated': invalidated,
     }
+    if rebind:
+        history_entry['rebind'] = True
     if stored is not None and _content_view(manifest) == _content_view(stored):
         return stored, invalidated, False, True
     manifest['revision'] = base_revision + (0 if stored is None else 1)
@@ -945,16 +978,146 @@ def _build_job_state(
     return manifest, invalidated, stored is None, False
 
 
-def _stage_view_manifest(
-    subtitle_sig: str,
-    container_sig: str,
-    segments: list[dict[str, Any]],
+def _unit_classifications(
+    manifest: dict[str, Any],
+    artifacts: list[dict[str, Any]],
+    failed_labels: frozenset[str],
 ) -> dict[str, Any]:
-    """Minimal manifest view consumed by the stage rollup."""
+    """Classify every required cache unit against the current inputs.
+
+    A unit is ok only when a record exists for it whose signature
+    matches the current inputs and whose bytes verify. Records for
+    older signatures stay in the artifact list as valid history but
+    never satisfy current eligibility.
+    """
+    by_kind_segment: dict[str, dict[str | None, dict[str, Any]]] = {}
+    for record in artifacts:
+        kind = record['kind']
+        by_kind_segment.setdefault(kind, {})[record['segment']] = record
+    segment_ids = [s['id'] for s in manifest['segments']]
+
+    def classify(
+        kind: str, expected: dict[str | None, str]
+    ) -> dict[str | None, str]:
+        result: dict[str | None, str] = {}
+        for unit, signature in expected.items():
+            record = by_kind_segment.get(kind, {}).get(unit)
+            if record is None:
+                result[unit] = 'missing'
+            elif _artifact_label(record) in failed_labels:
+                result[unit] = 'corrupt'
+            elif record['signature'] != signature:
+                result[unit] = 'stale'
+            else:
+                result[unit] = 'ok'
+        return result
+
+    raw = classify(
+        'raw_response',
+        {s['id']: s['synthesis_signature'] for s in manifest['segments']},
+    )
+    fitted = classify(
+        'fitted_audio',
+        {s['id']: s['fitting_signature'] for s in manifest['segments']},
+    )
+    subtitle = classify('subtitles', {None: manifest['subtitle_signature']})[
+        None
+    ]
+    container = classify(
+        'container_track', {None: manifest['container_signature']}
+    )[None]
     return {
-        'subtitle_signature': subtitle_sig,
-        'container_signature': container_sig,
-        'segments': segments,
+        'units': {
+            'raw_response': raw,
+            'fitted_audio': fitted,
+            'subtitles': subtitle,
+            'container_track': container,
+        },
+        'segment_ids': segment_ids,
+    }
+
+
+def _cache_view(
+    manifest: dict[str, Any],
+    artifacts: list[dict[str, Any]],
+    failed_labels: frozenset[str],
+) -> dict[str, Any]:
+    """Compute one consistent stage and blocker view of the current cache.
+
+    Stage completeness requires every required current unit, verified
+    integrity and complete upstream provenance: fitted audio never
+    stands in for a missing raw response, and container work requires
+    complete upstream stages.
+    """
+    model = _unit_classifications(manifest, artifacts, failed_labels)
+    raw = model['units']['raw_response']
+    fitted = model['units']['fitted_audio']
+    subtitle = model['units']['subtitles']
+    container = model['units']['container_track']
+    segment_ids: list[str] = model['segment_ids']
+
+    blocked: list[str] = []
+    provenance_missing = [
+        segment_id
+        for segment_id in segment_ids
+        if raw.get(segment_id) != 'ok'
+        and fitted.get(segment_id) not in (None, 'missing')
+    ]
+    for segment_id in provenance_missing:
+        blocked.append(
+            f'required synthesis artifact for {segment_id} is missing or'
+            ' not current while downstream fitted work exists; processed'
+            ' audio cannot replace the raw response'
+        )
+    raw_state: str
+    if any(status == 'corrupt' for status in raw.values()):
+        raw_state = 'blocked'
+    elif all(raw.get(segment_id) == 'ok' for segment_id in segment_ids):
+        raw_state = 'complete'
+    else:
+        raw_state = 'pending'
+    fitted_state: str
+    corrupt_fitted = any(status == 'corrupt' for status in fitted.values())
+    if corrupt_fitted or provenance_missing:
+        fitted_state = 'blocked'
+    elif (
+        all(fitted.get(segment_id) == 'ok' for segment_id in segment_ids)
+        and raw_state == 'complete'
+    ):
+        fitted_state = 'complete'
+    else:
+        fitted_state = 'pending'
+    subtitle_state: str
+    if subtitle == 'corrupt':
+        subtitle_state = 'blocked'
+    elif subtitle == 'ok':
+        subtitle_state = 'complete'
+    else:
+        subtitle_state = 'pending'
+    container_state: str
+    if container == 'corrupt':
+        container_state = 'blocked'
+    elif container == 'ok' and (
+        subtitle_state != 'complete' or raw_state != 'complete'
+    ):
+        container_state = 'blocked'
+        blocked.append(
+            'container artifact matches the current inputs but required'
+            ' upstream stages are not complete'
+        )
+    elif container == 'ok':
+        container_state = 'complete'
+    else:
+        container_state = 'pending'
+    return {
+        'stages': {
+            'synthesis': {'state': raw_state},
+            'fitting': {'state': fitted_state},
+            'subtitle': {'state': subtitle_state},
+            'container': {'state': container_state},
+        },
+        'blocked': blocked,
+        'units': model['units'],
     }
 
 
@@ -971,38 +1134,37 @@ def _reuse_view(
 ) -> dict[str, Any]:
     """Summarize preserved, invalidated and pending work from a manifest.
 
-    A verified artifact whose signature matches the current inputs is
-    proof of completed reusable work; the latest invalidation entry only
-    explains segments that have no such artifact yet.
+    The reuse view consumes the same current eligibility model as the
+    stage rollup: only records matching the current inputs with verified
+    bytes count as preserved work.
     """
     latest = manifest['history'][-1]['invalidated']
     artifacts = manifest.get('artifacts', [])
     initial = manifest['revision'] == 1 and len(manifest['history']) == 1
+    model = _unit_classifications(manifest, artifacts, failed_labels)
+    units = model['units']
     reuse: dict[str, Any] = {}
     for stage, kind in (
         ('synthesis', 'raw_response'),
         ('fitting', 'fitted_audio'),
     ):
-        by_segment = {
-            record['segment']: record
-            for record in artifacts
-            if record['kind'] == kind
-        }
         preserved: list[str] = []
         invalidated: dict[str, str] = {}
         pending: list[str] = []
         for segment in manifest['segments']:
             segment_id = segment['id']
-            record = by_segment.get(segment_id)
-            if record is not None and _artifact_label(record) in failed_labels:
+            status = units[kind].get(segment_id, 'missing')
+            if status == 'ok':
+                if stage == 'fitting' and units['raw_response'].get(
+                    segment_id
+                ) not in (None, 'ok'):
+                    invalidated[segment_id] = 'missing_provenance'
+                else:
+                    preserved.append(segment_id)
+            elif status == 'corrupt':
                 invalidated[segment_id] = 'artifact_corrupt'
-            elif (
-                record is not None
-                and record['signature'] != segment[f'{stage}_signature']
-            ):
+            elif status == 'stale':
                 invalidated[segment_id] = 'signature_changed'
-            elif record is not None:
-                preserved.append(segment_id)
             elif segment_id in latest[stage]:
                 invalidated[segment_id] = (
                     'initial_revision' if initial else 'signature_changed'
@@ -1014,24 +1176,39 @@ def _reuse_view(
             'invalidated': invalidated,
             'pending': pending,
         }
-    for stage, flag in (
-        ('subtitle', latest['subtitle']),
-        ('container', latest['container']),
+    for stage, kind, flag in (
+        ('subtitle', 'subtitles', latest['subtitle']),
+        ('container', 'container_track', latest['container']),
     ):
-        records = [
-            record
-            for record in artifacts
-            if _STAGE_BY_KIND.get(record['kind']) == stage
-        ]
-        corrupt = any(
-            _artifact_label(record) in failed_labels for record in records
-        )
-        has_artifact = bool(records)
-        reuse[stage] = {
-            'preserved': has_artifact and not corrupt,
-            'invalidated': (flag and not has_artifact) or corrupt,
-            'pending': not has_artifact,
-        }
+        status = units[kind]
+        if status == 'ok':
+            reuse[stage] = {
+                'preserved': True,
+                'invalidated': False,
+                'pending': False,
+            }
+        elif status == 'corrupt':
+            reuse[stage] = {
+                'preserved': False,
+                'invalidated': 'artifact_corrupt',
+                'pending': False,
+            }
+        elif status == 'stale' or flag:
+            reuse[stage] = {
+                'preserved': False,
+                'invalidated': (
+                    'signature_changed'
+                    if status == 'stale' or not initial
+                    else 'initial_revision'
+                ),
+                'pending': False,
+            }
+        else:
+            reuse[stage] = {
+                'preserved': False,
+                'invalidated': False,
+                'pending': True,
+            }
     return reuse
 
 
@@ -1060,18 +1237,8 @@ def read_job_status(job_dir: Path) -> dict[str, Any]:
             f'artifact integrity failure: {failure.label} at'
             f' {failure.relative_path}'
         )
-    stages = {
-        stage: {
-            'state': _stage_state(
-                stage,
-                artifacts,
-                failed_labels,
-                manifest['segments'],
-                manifest,
-            )
-        }
-        for stage in STAGE_NAMES
-    }
+    cache = _cache_view(manifest, artifacts, failed_labels)
+    blocked.extend(cache['blocked'])
     return {
         'command': 'status',
         'job_dir': str(job_dir),
@@ -1083,7 +1250,7 @@ def read_job_status(job_dir: Path) -> dict[str, Any]:
         'output_path': manifest['output_path'],
         'media': manifest['media'],
         'segment_count': len(manifest['segments']),
-        'stages': stages,
+        'stages': cache['stages'],
         'reuse': _reuse_view(manifest, failed_labels),
         'blocked': blocked,
     }
