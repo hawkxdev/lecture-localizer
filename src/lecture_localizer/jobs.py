@@ -9,6 +9,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +66,6 @@ SUPPORTED_AUDIO_CODECS = frozenset({'aac', 'pcm_s16le', 'mp3', 'opus'})
 HDR_TRANSFERS = frozenset({'smpte2084', 'arib-std-b67'})
 UNRESOLVED_OPERATION_STATES = frozenset({'reserved', 'started', 'uncertain'})
 OPERATIONS_SCHEMA = load_schema('operations-v1.schema.json')
-COST_COMPARISON_TOLERANCE = 1e-12
 SYNTHESIS_SETTINGS: dict[str, Any] = {
     'provider': 'xai',
     'voice': 'eve',
@@ -1584,7 +1584,7 @@ def _require_execution_permission(
             'explicit numeric spending limits are required before paid'
             ' execution; no request was sent and no key was read',
         )
-    estimated_cost = limits.price_per_request * planned_count
+    estimated_cost = Fraction(str(limits.price_per_request)) * planned_count
     if planned_count > limits.max_requests:
         raise PaidExecutionDenied(
             'limits_exceeded',
@@ -1597,18 +1597,14 @@ def _require_execution_permission(
             f'planning {text_chars} text characters exceeds the explicit'
             f' limit of {limits.max_text_chars}; no request was sent',
         )
-    if (
-        estimated_cost
-        > limits.max_cost_estimate
-        + abs(limits.max_cost_estimate) * COST_COMPARISON_TOLERANCE
-    ):
+    if estimated_cost > Fraction(str(limits.max_cost_estimate)):
         raise PaidExecutionDenied(
             'limits_exceeded',
-            f'estimated cost {estimated_cost} above the explicit limit'
+            f'estimated cost {float(estimated_cost)} above the explicit limit'
             f' {limits.max_cost_estimate} on basis'
             f' {limits.price_basis!r}; no request was sent',
         )
-    return estimated_cost
+    return float(estimated_cost)
 
 
 def _read_speech_key(reader: Callable[[str], str | None]) -> str:

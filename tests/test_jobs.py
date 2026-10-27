@@ -36,6 +36,7 @@ from lecture_localizer.jobs import (
     PaidExecutionDenied,
     PrepareResult,
     SpendingLimits,
+    _require_execution_permission,
     execute_speech_operations,
     prepare_job,
     preview_speech_operations,
@@ -2175,3 +2176,39 @@ def test_exact_cost_ceiling_permits_planned_requests(
         key_reader=lambda name: KEY_MATERIAL,
     )
     assert result.completed == ('s001', 's002')
+
+
+@pytest.mark.parametrize('price', [0.50000000000025, 0.5000000001])
+def test_nonzero_cost_ceiling_refuses_any_excess(
+    tmp_path: Path, price: float
+) -> None:
+    job = _prepare_simple_job(tmp_path)
+    limits = SpendingLimits(
+        max_requests=10,
+        max_text_chars=100000,
+        max_cost_estimate=1.0,
+        price_per_request=price,
+        price_basis='invented boundary control',
+    )
+    transport = FakeTransport(AssertionError('transport must never be called'))
+    with pytest.raises(PaidExecutionDenied, match='estimated cost'):
+        execute_speech_operations(
+            job,
+            allow_paid=True,
+            limits=limits,
+            transport=transport,
+            key_reader=trap_reader,
+        )
+    assert transport.requests == []
+    assert not (job / 'operations.json').exists()
+
+
+def test_decimal_cost_ceiling_accepts_exact_three_request_total() -> None:
+    limits = SpendingLimits(
+        max_requests=3,
+        max_text_chars=100,
+        max_cost_estimate=0.3,
+        price_per_request=0.1,
+        price_basis='invented decimal boundary control',
+    )
+    assert _require_execution_permission(True, limits, 3, 30) == 0.3
