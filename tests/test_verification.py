@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
-import subprocess
+import time
+from collections.abc import Generator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from container_fixtures import (
@@ -14,15 +16,16 @@ from container_fixtures import (
     candidate_request,
     encode_narration_aac,
     encode_original_aac,
+    make_container_copy,
     make_shifted_audio,
     make_shifted_source,
     prepared_tracks,
     write_fake_tools,
+    write_packet_wrapper,
     write_srt_entries,
 )
 
 from conftest import make_media, require_real_media
-from lecture_localizer import verification as verification_module
 from lecture_localizer.mux import TrackProfile, build_candidate
 from lecture_localizer.settings import Settings
 from lecture_localizer.verification import (
@@ -206,8 +209,8 @@ def test_verify_missing_candidate_is_a_failed_report(
         (2000, True),
         (2005, True),
         (1985, True),
-        (1950, False),
-        (1900, False),
+        (2080, False),
+        (2500, False),
     ],
 )
 def test_verify_narration_padding_boundaries(
@@ -476,7 +479,8 @@ def test_verify_detects_shifted_narration(tmp_path: Path) -> None:
     assert not report.ok
     assert 'narration_packets' in report.failed_checks
     shifted_check = _check(report, 'narration_packets')
-    assert 'pts_time' in shifted_check.detail
+    assert 'moved from' in shifted_check.detail
+    assert shifted_check.measured['packets'] == 0
 
 
 def test_verify_detects_video_configuration_crop(tmp_path: Path) -> None:
@@ -521,75 +525,246 @@ def test_verify_preserves_nonzero_input_timeline(tmp_path: Path) -> None:
     assert video_packets.measured['packets'] > 0
 
 
-class _RecordingStream:
-    """Line iterator that records how much was consumed."""
-
-    def __init__(self, lines: list[str]) -> None:
-        self._lines = lines
-        self.consumed = 0
-
-    def __iter__(self) -> _RecordingStream:
-        return self
-
-    def __next__(self) -> str:
-        if self.consumed >= len(self._lines):
-            raise StopIteration
-        line = self._lines[self.consumed]
-        self.consumed += 1
-        return line
-
-
-class _FakeProcess:
-    """Popen stand in with a recorded stdout stream."""
-
-    def __init__(self, lines: list[str]) -> None:
-        self.stdout = _RecordingStream(lines)
-
-    def wait(self, timeout: float | None = None) -> int:
-        return 0
-
-    def kill(self) -> None:
-        return None
-
-
 def test_packet_fingerprint_streaming_is_bounded(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    first_packet = [
-        'packets.packet.0.codec_type="video"',
-        'packets.packet.0.pts_time="0.000000"',
-        'packets.packet.0.dts_time="0.000000"',
-        'packets.packet.0.duration_time="0.100000"',
-        'packets.packet.0.size="256"',
-        'packets.packet.0.data="\\n00000000: 00ff 00ff  first.\\n"',
-    ]
-    second_packet = [
-        'packets.packet.1.codec_type="video"',
-        'packets.packet.1.pts_time="0.100000"',
-        'packets.packet.1.dts_time="0.100000"',
-        'packets.packet.1.duration_time="0.100000"',
-        'packets.packet.1.size="256"',
-        'packets.packet.1.data="\\n00000000: 11ee 11ee  second.\\n"',
-    ]
-    lines = [*first_packet, *second_packet]
-    fake_process = _FakeProcess(lines)
-    monkeypatch.setattr(
-        subprocess,
-        'Popen',
-        lambda *args, **kwargs: fake_process,
+    """The first fingerprint must not require the whole child output."""
+    real_ffprobe = shutil.which('ffprobe')
+    assert real_ffprobe is not None
+    slow_ffprobe = tmp_path / 'tooling' / 'bounded-ffprobe'
+    slow_ffprobe.parent.mkdir(parents=True, exist_ok=True)
+    script = (
+        '#!/bin/sh\n'
+        "printf '%s\\n' \
+"
+        '  \'packets.packet.0.pts_time="0.000000"\' \
+'
+        '  \'packets.packet.0.dts_time="0.000000"\' \
+'
+        '  \'packets.packet.0.duration_time="0.100000"\' \
+'
+        '  \'packets.packet.0.size="256"\' \
+'
+        '  \'packets.packet.0.data="0000"\'\n'
+        "printf '%s\\n' 'packets.packet.1.pts_time=\"1.000000\"'\n"
+        'sleep 3\n'
+        "printf '%s\\n' 'packets.packet.1.dts_time=\"1.000000\"' \
+"
+        '  \'packets.packet.1.duration_time="0.100000"\' \
+'
+        '  \'packets.packet.1.size="256"\' \
+'
+        '  \'packets.packet.1.data="1111"\'\n'
+        f'exec {shlex.quote(real_ffprobe)} "$@"\n'
     )
-    fingerprints = verification_module._stream_packet_fingerprints(
-        Path('ffprobe'),
-        Path('media'),
+    slow_ffprobe.write_text(script, encoding='utf-8')
+    slow_ffprobe.chmod(0o755)
+    from lecture_localizer.verification import _stream_packet_fingerprints
+
+    started = time.monotonic()
+    fingerprints = _stream_packet_fingerprints(
+        slow_ffprobe,
+        Path('ignored-media'),
         '0',
-        1.0,
+        30.0,
     )
     first = next(fingerprints)
-    assert first[0] == '0.000000'
+    elapsed = time.monotonic() - started
+    assert first == (
+        '0.000000',
+        '0.000000',
+        '0.100000',
+        '256',
+        first[4],
+    )
     assert len(first[4]) == 64
-    consumed = fake_process.stdout.consumed
-    assert consumed == len(first_packet) + 1
-    assert consumed < len(lines)
-    second = next(fingerprints)
-    assert second[0] == '0.100000'
-    assert second[4] != first[4]
+    assert elapsed < 2.0, elapsed
+    cast(Generator[tuple[str, ...], None, None], fingerprints).close()
+
+
+def test_verify_detects_missing_narration_against_declared_timeline(
+    tmp_path: Path,
+) -> None:
+    require_real_media()
+    staging = tmp_path / 'prepared'
+    staging.mkdir()
+    video = make_media(staging / 'lecture4.mp4', seconds=4.0, use_cache=False)
+    narration = encode_narration_aac(staging / 'narration.m4a', seconds=2.0)
+    english = write_srt_entries(
+        staging / 'english.srt',
+        [(0, 2000, 'First half line.'), (2000, 4000, 'Second half line.')],
+    )
+    russian = write_srt_entries(
+        staging / 'russian.srt',
+        [
+            (0, 2000, 'Первая половина перевода целиком.'),
+            (2000, 4000, 'Вторая половина перевода целиком.'),
+        ],
+    )
+    tracks = {
+        'video': video,
+        'narration': narration,
+        'english': english,
+        'russian': russian,
+    }
+    destination = tmp_path / 'staging' / 'short-timeline.mp4'
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    request = candidate_request(tracks, destination)
+    build_candidate(request, Settings())
+    report = verify_candidate(
+        destination,
+        _expectation(tracks, narration_end_ms=4000),
+        Settings(),
+    )
+    assert not report.ok
+    duration_check = _check(report, 'narration_duration')
+    assert not duration_check.ok
+    assert 'short of the declared' in duration_check.detail
+    assert duration_check.measured['narration_padding_ms'] == -2000.0
+
+
+def test_verify_accepts_full_four_second_timeline(tmp_path: Path) -> None:
+    require_real_media()
+    staging = tmp_path / 'prepared'
+    staging.mkdir()
+    video = make_media(staging / 'lecture4.mp4', seconds=4.0, use_cache=False)
+    narration = encode_narration_aac(staging / 'narration.m4a', seconds=4.0)
+    english = write_srt_entries(
+        staging / 'english.srt',
+        [(0, 2000, 'First half line.'), (2000, 4000, 'Second half line.')],
+    )
+    russian = write_srt_entries(
+        staging / 'russian.srt',
+        [
+            (0, 2000, 'Первая половина перевода целиком.'),
+            (2000, 4000, 'Вторая половина перевода целиком.'),
+        ],
+    )
+    tracks = {
+        'video': video,
+        'narration': narration,
+        'english': english,
+        'russian': russian,
+    }
+    destination = tmp_path / 'staging' / 'full-timeline.mp4'
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    build_candidate(candidate_request(tracks, destination), Settings())
+    report = verify_candidate(
+        destination,
+        _expectation(tracks, narration_end_ms=4000),
+        Settings(),
+    )
+    assert report.ok, report.failed_checks
+
+
+def _packet_wrapper(tmp_path: Path, mode: str) -> tuple[Settings, str]:
+    """Return settings whose ffprobe faults only packet probes."""
+    real_ffprobe = shutil.which('ffprobe')
+    assert real_ffprobe is not None
+    import os
+
+    wrapper = write_packet_wrapper(tmp_path / 'tooling', real_ffprobe)
+    os.environ['FAKE_PACKET_MODE'] = mode
+    settings = Settings(
+        ffmpeg_path=shutil.which('ffmpeg'),
+        ffprobe_path=str(wrapper),
+    )
+    return settings, mode
+
+
+_PACKET_CHECKS = (
+    'video_packets',
+    'narration_packets',
+    'copied_original_packets',
+)
+
+
+def test_verify_garbage_packet_output_is_rejected(tmp_path: Path) -> None:
+    require_real_media()
+    tracks, destination = _candidate(tmp_path)
+    settings, _ = _packet_wrapper(tmp_path, 'garbage')
+    try:
+        report = verify_candidate(destination, _expectation(tracks), settings)
+    finally:
+        import os
+
+        del os.environ['FAKE_PACKET_MODE']
+    assert not report.ok
+    for name in _PACKET_CHECKS:
+        check = _check(report, name)
+        assert not check.ok
+        assert 'unusable packet output' in check.detail
+
+
+def test_verify_empty_packet_output_is_rejected(tmp_path: Path) -> None:
+    require_real_media()
+    tracks, destination = _candidate(tmp_path)
+    settings, _ = _packet_wrapper(tmp_path, 'empty')
+    try:
+        report = verify_candidate(destination, _expectation(tracks), settings)
+    finally:
+        import os
+
+        del os.environ['FAKE_PACKET_MODE']
+    assert not report.ok
+    for name in _PACKET_CHECKS:
+        check = _check(report, name)
+        assert not check.ok
+        assert 'no packets were reported' in check.detail
+
+
+def test_verify_stalled_packet_output_times_out(tmp_path: Path) -> None:
+    require_real_media()
+    tracks, destination = _candidate(tmp_path)
+    import os
+    import time as time_module
+
+    wrapper = write_packet_wrapper(
+        tmp_path / 'tooling', shutil.which('ffprobe') or 'ffprobe'
+    )
+    os.environ['FAKE_PACKET_MODE'] = 'stall'
+    settings = Settings(
+        ffmpeg_path=shutil.which('ffmpeg'),
+        ffprobe_path=str(wrapper),
+        subprocess_timeout_seconds=1.0,
+    )
+    try:
+        started = time_module.monotonic()
+        report = verify_candidate(destination, _expectation(tracks), settings)
+        elapsed = time_module.monotonic() - started
+    finally:
+        del os.environ['FAKE_PACKET_MODE']
+    # Three packet probes hit the 1s deadline each; a stalled child that
+    # finished naturally would need at least 15s for the 5s sleeps.
+    assert elapsed < 8.0, elapsed
+    assert not report.ok
+    for name in _PACKET_CHECKS:
+        check = _check(report, name)
+        assert not check.ok
+        assert 'stalled packet output' in check.detail
+
+
+def test_verify_accepts_mkv_and_mov_sources(tmp_path: Path) -> None:
+    require_real_media()
+    for extension in ('mkv', 'mov'):
+        tracks = prepared_tracks(tmp_path / f'prepared-{extension}')
+        alt_video = make_container_copy(
+            tracks['video'],
+            tmp_path / f'prepared-{extension}' / f'source.{extension}',
+        )
+        alt_tracks = {**tracks, 'video': alt_video}
+        destination = tmp_path / f'staging-{extension}' / 'candidate.mp4'
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        build_candidate(
+            candidate_request(alt_tracks, destination),
+            Settings(),
+        )
+        report = verify_candidate(
+            destination,
+            _expectation(alt_tracks),
+            Settings(),
+        )
+        assert report.ok, (extension, report.failed_checks)
+        for name in ('video_packets', 'copied_original_packets'):
+            check = _check(report, name)
+            assert check.ok, (extension, check.detail)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import tempfile
@@ -91,6 +92,7 @@ class MuxResult:
     ffmpeg_argv: tuple[str, ...]
     mp4box_argv: tuple[str, ...]
     track_ids: TrackIds
+    timescale: int
 
 
 def _validate_profile(profile: TrackProfile) -> None:
@@ -137,14 +139,14 @@ def _validate_paths(request: MuxRequest) -> None:
 def _probe_input_streams(
     ffprobe: Path, video_path: Path, timeout_seconds: float
 ) -> list[dict[str, Any]]:
-    """Return index and codec type rows for one media input."""
+    """Return index, codec type and clock rows for one media input."""
     result = checked_run_strict(
         [
             str(ffprobe),
             '-v',
             'error',
             '-show_entries',
-            'stream=index,codec_type',
+            'stream=index,codec_type,time_base,sample_rate',
             '-of',
             'json',
             str(video_path),
@@ -160,6 +162,8 @@ def _probe_input_streams(
             {
                 'index': int(stream['index']),
                 'codec_type': str(stream['codec_type']),
+                'time_base': stream.get('time_base'),
+                'sample_rate': stream.get('sample_rate'),
             }
             for stream in streams
         ]
@@ -221,6 +225,75 @@ def _input_layout(
     return video_map, '1:0', 2
 
 
+_MAX_MP4_TIMESCALE = 2**31 - 1
+_FALLBACK_TIMESCALE = 48000
+
+
+def _clock_values(
+    streams: list[dict[str, Any]], selected_index: int | None
+) -> list[int]:
+    """Return clock denominators of one stream and its sample rate."""
+    values: list[int] = []
+    for stream in streams:
+        if int(stream['index']) != selected_index:
+            continue
+        time_base = stream.get('time_base')
+        if isinstance(time_base, str) and '/' in time_base:
+            denominator = time_base.rsplit('/', 1)[1]
+            if denominator.isdigit() and int(denominator) > 0:
+                values.append(int(denominator))
+        sample_rate = stream.get('sample_rate')
+        if sample_rate is not None:
+            rate = _positive_int(sample_rate)
+            if rate is not None:
+                values.append(rate)
+    return values
+
+
+def _positive_int(value: object) -> int | None:
+    """Return one value as a positive int when it is one."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.isdigit():
+        return int(value) if int(value) > 0 else None
+    return None
+
+
+def _movie_timescale(
+    video_streams: list[dict[str, Any]],
+    video_index: int,
+    original_streams: list[dict[str, Any]],
+    original_index: int,
+    narration_streams: list[dict[str, Any]],
+) -> int:
+    """Derive the movie timescale from the actual stream clocks.
+
+    The timescale is the least common multiple of every copied clock
+    denominator and audio sample rate, so packet timestamps of the
+    copied streams stay exactly representable in the output container.
+    MP4 timescales are 32 bit, so an exotic clock combination that
+    exceeds that range falls back to the approved audio rate; the
+    verification measured clock bounds still cover the rounding.
+    """
+    values = [
+        *_clock_values(video_streams, video_index),
+        *_clock_values(original_streams, original_index),
+        *_clock_values(narration_streams, 0),
+    ]
+    values.append(_FALLBACK_TIMESCALE)
+    scale = math.lcm(*values)
+    if scale > _MAX_MP4_TIMESCALE:
+        audio_rates = [
+            value
+            for value in values
+            if value != _FALLBACK_TIMESCALE and value >= 8000
+        ]
+        scale = math.lcm(*audio_rates, _FALLBACK_TIMESCALE)
+        if scale > _MAX_MP4_TIMESCALE:
+            return _FALLBACK_TIMESCALE
+    return scale
+
+
 def _ffmpeg_argv(
     request: MuxRequest,
     ffmpeg: Path,
@@ -228,6 +301,7 @@ def _ffmpeg_argv(
     original_map: str,
     narration_input: int,
     output_path: Path,
+    timescale: int,
 ) -> tuple[str, ...]:
     """Build the explicit five stream ffmpeg assembly command."""
     inputs = [str(request.video_path)]
@@ -254,6 +328,8 @@ def _ffmpeg_argv(
     argv.extend(
         [
             '-copyts',
+            '-movie_timescale',
+            str(timescale),
             '-c:v',
             'copy',
             '-c:a',
@@ -344,11 +420,19 @@ def _apply_track_flags(
     output: Path,
     profile: TrackProfile,
     ids: TrackIds,
+    timescale: int,
     timeout_seconds: float,
 ) -> tuple[str, ...]:
-    """Apply profile flags by track id into the owned output file."""
+    """Apply profile flags by track id into the owned output file.
+
+    The movie timescale is restated so the MP4Box pass keeps the exact
+    clock the FFmpeg assembly used and copied timestamps stay
+    representable without rounding.
+    """
     argv = (
         str(mp4box),
+        '-timescale',
+        str(timescale),
         *_profile_operations(profile, ids),
         str(source),
         '-out',
@@ -426,8 +510,31 @@ def build_candidate(request: MuxRequest, settings: Settings) -> MuxResult:
         streams = _probe_input_streams(
             ffprobe, request.video_path, timeout_seconds
         )
+        original_streams = streams
+        narration_streams = _probe_input_streams(
+            ffprobe, request.narration_path, timeout_seconds
+        )
+        if isinstance(request.original_audio, ConvertedAudioTrack):
+            original_streams = _probe_input_streams(
+                ffprobe,
+                request.original_audio.path,
+                timeout_seconds,
+            )
         video_map, original_map, narration_input = _input_layout(
             request, streams
+        )
+        video_index = _video_stream_index(streams, request.video_path)
+        original_index = (
+            request.original_audio.stream_index
+            if isinstance(request.original_audio, CopiedAudioStream)
+            else 0
+        )
+        timescale = _movie_timescale(
+            streams,
+            video_index,
+            original_streams,
+            original_index,
+            narration_streams,
         )
         ffmpeg_temp = _owned_temp(request.destination, 'ffmpeg')
         mp4box_temp = _owned_temp(request.destination, 'mp4box')
@@ -438,6 +545,7 @@ def build_candidate(request: MuxRequest, settings: Settings) -> MuxResult:
             original_map,
             narration_input,
             ffmpeg_temp,
+            timescale,
         )
         checked_run_strict(ffmpeg_argv, timeout_seconds)
         ids = _resolve_track_ids(mp4box, ffmpeg_temp, timeout_seconds)
@@ -447,6 +555,7 @@ def build_candidate(request: MuxRequest, settings: Settings) -> MuxResult:
             mp4box_temp,
             request.profile,
             ids,
+            timescale,
             timeout_seconds,
         )
         _deliver_no_clobber(mp4box_temp, request.destination)
@@ -461,4 +570,5 @@ def build_candidate(request: MuxRequest, settings: Settings) -> MuxResult:
         ffmpeg_argv=ffmpeg_argv,
         mp4box_argv=mp4box_argv,
         track_ids=ids,
+        timescale=timescale,
     )

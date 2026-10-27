@@ -577,10 +577,27 @@ def test_build_candidate_real_preserves_nonzero_start_timeline(
     assert candidate_video[0][0] == '2.000000'
     source_audio = packet_fingerprints(shifted_video, '1')
     candidate_audio = packet_fingerprints(destination, '1')
-    assert len(candidate_audio) == len(source_audio)
-    for source_row, candidate_row in zip(
-        source_audio, candidate_audio, strict=True
-    ):
-        assert source_row[3] == candidate_row[3]
-        assert source_row[2] == candidate_row[2]
-        assert abs(float(source_row[0]) - float(candidate_row[0])) <= 0.002
+    assert candidate_audio == source_audio
+
+
+def test_build_candidate_real_derives_lcm_timescale(tmp_path: Path) -> None:
+    import math
+
+    require_real_media()
+    tracks = prepared_tracks(tmp_path)
+    destination = tmp_path / 'staging' / 'lcm-candidate.mp4'
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    result = build_candidate(
+        candidate_request(tracks, destination), Settings()
+    )
+    expected = math.lcm(10240, 44100, 48000)
+    assert result.timescale == expected
+    assert packet_fingerprints(tracks['video'], '0') == packet_fingerprints(
+        destination, '0'
+    )
+    assert packet_fingerprints(tracks['video'], '1') == packet_fingerprints(
+        destination, '1'
+    )
+    assert packet_fingerprints(
+        tracks['narration'], '0'
+    ) == packet_fingerprints(destination, '2')

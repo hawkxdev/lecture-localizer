@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
+import os
+import selectors
 import subprocess
 import tempfile
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,12 +31,19 @@ NARRATION_CHANNELS = 1
 AAC_FRAME_SAMPLES = 1024
 PRIMING_TOLERANCE_FRAMES = 2
 ARTIFACT_ROUNDING_MS = 1
-# Container timescale conversion and edit list reconstruction move
-# copied audio presentation timestamps by well under one millisecond
-# on this toolchain (observed 0.771 ms for a 44.1 kHz source); the
-# smallest representable AAC frame is 1024 samples, about 21.3 ms, so
-# this bound cannot hide a real placement shift.
-AUDIO_TIMESTAMP_TOLERANCE_S = 0.002
+FALLBACK_TICK_S = 0.001
+_PACKET_FIELDS = ('pts_time', 'dts_time', 'duration_time', 'size', 'data')
+
+
+def _deregister(
+    selector_object: selectors.BaseSelector, descriptor: int
+) -> None:
+    """Unregister one descriptor when it is still registered."""
+    with contextlib.suppress(KeyError):
+        selector_object.unregister(descriptor)
+
+
+_ABSENT_TIMING = ('n/a', '', 'none', 'nan', '?')
 
 _EXPECTED_ROLES = (
     ('video', 'h264'),
@@ -149,7 +160,7 @@ def _probe_streams(
             '-show_data',
             '-show_entries',
             'stream=index,codec_name,codec_type,profile,channels,'
-            'sample_rate,duration,width,height,extradata',
+            'sample_rate,duration,width,height,extradata,time_base',
             '-show_entries',
             'format=duration',
             '-of',
@@ -190,8 +201,11 @@ def _stream_packet_fingerprints(
 
     Each row carries presentation timestamps, duration, size and the
     digest of the packet payload, so whole media data is never retained
-    in memory. The returned iterator must be consumed for the child
-    exit status to be observed.
+    in memory. The read enforces the subprocess deadline during the
+    blocking stream itself, every packet must carry the complete field
+    set, and a stream that ends without packets is a tool error rather
+    than an empty success. The child is killed and reaped on every
+    abnormal exit.
     """
     argv = [
         str(ffprobe),
@@ -210,54 +224,109 @@ def _stream_packet_fingerprints(
             argv,
             stdout=subprocess.PIPE,
             stderr=stderr_file,
-            text=True,
+            bufsize=0,
             env=scrubbed_environment(),
         )
         assert process.stdout is not None
+        descriptor = process.stdout.fileno()
+        selector_object = selectors.DefaultSelector()
+        selector_object.register(descriptor, selectors.EVENT_READ)
+        registered = True
+        deadline = time.monotonic() + timeout_seconds
         fields: dict[str, str] = {}
         current_index: str | None = None
+        packet_count = 0
+        buffer = b''
+
+        def fail(message: str) -> MediaToolError:
+            """Kill and reap the child, then raise the tool error."""
+            _deregister(selector_object, descriptor)
+            nonlocal registered
+            registered = False
+            process.kill()
+            process.wait()
+            return MediaToolError(f'{message}: {media_path}')
+
         try:
-            for raw_line in process.stdout:
-                line = raw_line.strip()
-                if not line or '=' not in line:
-                    continue
-                key, _, value = line.partition('=')
-                parts = key.split('.')
-                if len(parts) < 4 or parts[:2] != ['packets', 'packet']:
-                    continue
-                field_name = parts[3]
-                if current_index is None:
-                    current_index = parts[2]
-                elif parts[2] != current_index:
-                    yield _fingerprint(fields)
-                    fields = {}
-                    current_index = parts[2]
-                fields[field_name] = value.strip('"')
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise fail(
+                        f'stalled packet output, no data within'
+                        f' {timeout_seconds}s'
+                    )
+                events = selector_object.select(remaining)
+                if not events:
+                    raise fail(
+                        f'stalled packet output, no data within'
+                        f' {timeout_seconds}s'
+                    )
+                chunk = os.read(descriptor, 65536)
+                if not chunk:
+                    break
+                buffer += chunk
+                while b'\n' in buffer:
+                    raw_line, buffer = buffer.split(b'\n', 1)
+                    line = raw_line.decode('utf-8', 'replace').strip()
+                    if not line or '=' not in line:
+                        continue
+                    key, _, value = line.partition('=')
+                    parts = key.split('.')
+                    if len(parts) < 4 or parts[:2] != ['packets', 'packet']:
+                        continue
+                    field_name = parts[3]
+                    if current_index is None:
+                        current_index = parts[2]
+                    elif parts[2] != current_index:
+                        packet_count += 1
+                        yield _fingerprint(fields, media_path)
+                        fields = {}
+                        current_index = parts[2]
+                    fields[field_name] = value.strip('"')
+            if buffer.strip():
+                raise fail('unusable packet output, trailing partial row')
             if fields:
-                yield _fingerprint(fields)
+                packet_count += 1
+                yield _fingerprint(fields, media_path)
+            if packet_count == 0:
+                raise fail('unusable packet output, no packets were reported')
+            _deregister(selector_object, descriptor)
+            registered = False
+            process.stdout.close()
+            return_code = process.wait(timeout=timeout_seconds)
+            stderr_file.seek(0)
+            noise = stderr_file.read().decode('utf-8', 'replace').strip()
+            if return_code != 0 or noise:
+                raise fail(
+                    f'unusable packet output, exit {return_code}'
+                    f' {noise.splitlines()[-1:]}'
+                )
         except BaseException:
+            if registered:
+                _deregister(selector_object, descriptor)
             process.kill()
             process.wait()
             raise
-        process.stdout.close()
-        return_code = process.wait(timeout=timeout_seconds)
-        stderr_file.seek(0)
-        noise = stderr_file.read().decode('utf-8', 'replace').strip()
-        if return_code != 0 or noise:
+
+
+def _fingerprint(fields: dict[str, str], media_path: Path) -> tuple[str, ...]:
+    """Return one compared packet row with a bounded payload digest.
+
+    Every packet must carry the complete compared field set; a packet
+    missing a field is unusable tool evidence rather than a gap.
+    """
+    for field_name in _PACKET_FIELDS:
+        if field_name not in fields:
             raise MediaToolError(
-                f'unusable ffprobe packet output for {media_path}:'
-                f' exit {return_code} {noise.splitlines()[-1:]}'
+                f'unusable packet output for {media_path}: packet is'
+                f' missing {field_name}'
             )
-
-
-def _fingerprint(fields: dict[str, str]) -> tuple[str, ...]:
-    """Return one compared packet row with a bounded payload digest."""
     return (
-        fields.get('pts_time', ''),
-        fields.get('dts_time', ''),
-        fields.get('duration_time', ''),
-        fields.get('size', ''),
-        hashlib.sha256(fields.get('data', '').encode('utf-8')).hexdigest(),
+        fields['pts_time'],
+        fields['dts_time'],
+        fields['duration_time'],
+        fields['size'],
+        hashlib.sha256(fields['data'].encode('utf-8')).hexdigest(),
     )
 
 
@@ -265,16 +334,19 @@ def _compare_streamed_packets(
     check_name: str,
     candidate_packets: Iterator[tuple[str, ...]],
     source_packets: Iterator[tuple[str, ...]],
-    timestamp_tolerance_s: float,
+    tick_bound_s: float,
 ) -> CheckResult:
     """Compare two packet streams one row at a time.
 
-    Payload, size and duration must match exactly. Presentation
-    timestamps must match within the documented container rounding
-    bound: zero for the video copy, one small audio bound derived from
-    timescale and edit list reconstruction for copied audio.
+    Payload and size must match exactly. Timing is compared with the
+    measured rational clock precision of the two streams: the bound is
+    the sum of both reported time base ticks, so a millisecond clock
+    like Matroska covers its own quantization while real shifts stay
+    visible. Presentation timestamps are required on both sides; DTS is
+    compared only when both containers actually store it.
     """
     index = 0
+    skipped_dts = 0
     while True:
         candidate = next(candidate_packets, None)
         source = next(source_packets, None)
@@ -283,7 +355,7 @@ def _compare_streamed_packets(
                 name=check_name,
                 ok=True,
                 detail='copied packets match the source stream',
-                measured={'packets': index},
+                measured={'packets': index, 'dts_skipped': skipped_dts},
             )
         if candidate is None or source is None:
             return CheckResult(
@@ -295,7 +367,7 @@ def _compare_streamed_packets(
                     f' {index} packets, source has'
                     f' {"at least" if source is not None else "only"} {index}'
                 ),
-                measured={'packets': index},
+                measured={'packets': index, 'dts_skipped': skipped_dts},
             )
         if candidate[3] != source[3] or candidate[4] != source[4]:
             return CheckResult(
@@ -306,51 +378,116 @@ def _compare_streamed_packets(
                     ' copied source; copied streams must keep identical'
                     ' packets'
                 ),
-                measured={'packets': index},
+                measured={'packets': index, 'dts_skipped': skipped_dts},
             )
-        for position, field_name in ((0, 'pts_time'), (1, 'dts_time')):
-            candidate_value, source_value = (
+        if (
+            candidate[1].lower() in _ABSENT_TIMING
+            or source[1].lower() in _ABSENT_TIMING
+        ):
+            skipped_dts += 1
+        else:
+            result = _compare_timing(
+                check_name,
+                index,
+                1,
+                'dts_time',
+                candidate,
+                source,
+                tick_bound_s,
+            )
+            if result is not None:
+                return result
+        result = _compare_timing(
+            check_name,
+            index,
+            0,
+            'pts_time',
+            candidate,
+            source,
+            tick_bound_s,
+        )
+        if result is not None:
+            return result
+        try:
+            duration_difference = abs(float(candidate[2]) - float(source[2]))
+        except ValueError:
+            result = _timing_mismatch(
+                check_name,
+                index,
+                'duration_time',
+                candidate[2],
+                source[2],
+                tick_bound_s,
+            )
+            if result is not None:
+                return result
+        else:
+            if duration_difference > tick_bound_s:
+                return _timing_mismatch(
+                    check_name,
+                    index,
+                    'duration_time',
+                    candidate[2],
+                    source[2],
+                    tick_bound_s,
+                )
+        index += 1
+
+
+def _compare_timing(
+    check_name: str,
+    index: int,
+    position: int,
+    field_name: str,
+    candidate: tuple[str, ...],
+    source: tuple[str, ...],
+    tick_bound_s: float,
+) -> CheckResult | None:
+    """Compare one timing field within the measured clock bound."""
+    try:
+        difference = abs(float(candidate[position]) - float(source[position]))
+    except ValueError:
+        if candidate[position] != source[position]:
+            return _timing_mismatch(
+                check_name,
+                index,
+                field_name,
                 candidate[position],
                 source[position],
+                tick_bound_s,
             )
-            try:
-                difference = abs(float(candidate_value) - float(source_value))
-            except ValueError:
-                if candidate_value != source_value:
-                    return CheckResult(
-                        name=check_name,
-                        ok=False,
-                        detail=(
-                            f'packet {index} has unusable {field_name}'
-                            f' values {candidate_value!r} versus'
-                            f' {source_value!r}'
-                        ),
-                        measured={'packets': index},
-                    )
-                continue
-            if difference > timestamp_tolerance_s:
-                return CheckResult(
-                    name=check_name,
-                    ok=False,
-                    detail=(
-                        f'packet {index} {field_name} moved from'
-                        f' {source_value} to {candidate_value}, above the'
-                        f' {timestamp_tolerance_s} s container rounding'
-                        ' bound'
-                    ),
-                    measured={'packets': index},
-                )
-        if candidate[2] != source[2]:
-            return CheckResult(
-                name=check_name,
-                ok=False,
-                detail=(
-                    f'packet {index} duration differs: candidate'
-                    f' {candidate[2]}, source {source[2]}'
-                ),
-                measured={'packets': index},
-            )
-        index += 1
+        return None
+    if difference > tick_bound_s:
+        return _timing_mismatch(
+            check_name,
+            index,
+            field_name,
+            candidate[position],
+            source[position],
+            tick_bound_s,
+        )
+    return None
+
+
+def _timing_mismatch(
+    check_name: str,
+    index: int,
+    field_name: str,
+    candidate_value: str,
+    source_value: str,
+    tick_bound_s: float,
+) -> CheckResult:
+    """Build the named failure for one timing field outside the bound."""
+    return CheckResult(
+        name=check_name,
+        ok=False,
+        detail=(
+            f'packet {index} {field_name} moved from {source_value} to'
+            f' {candidate_value}, above the measured clock bound of'
+            f' {tick_bound_s} s'
+        ),
+        measured={'packets': index},
+    )
 
 
 def _stream_row(stream: dict[str, Any]) -> dict[str, Any]:
@@ -717,6 +854,18 @@ def _check_narration_duration(
             detail=mismatch,
             measured=measured,
         )
+    if candidate_ms < expectation.narration_end_ms - PRIMING_TOLERANCE_MS:
+        return CheckResult(
+            name='narration_duration',
+            ok=False,
+            detail=(
+                f'narration is {abs(measured["narration_padding_ms"])} ms'
+                ' short of the declared narration end; the prepared'
+                ' content is missing from the timeline, which measured'
+                ' codec padding cannot explain'
+            ),
+            measured=measured,
+        )
     if candidate_ms > expectation.narration_end_ms + PRIMING_TOLERANCE_MS:
         return CheckResult(
             name='narration_duration',
@@ -781,6 +930,18 @@ def _check_original_duration(
             name='original_duration',
             ok=False,
             detail=mismatch,
+            measured=measured,
+        )
+    if candidate_ms < expectation.original_end_ms - PRIMING_TOLERANCE_MS:
+        return CheckResult(
+            name='original_duration',
+            ok=False,
+            detail=(
+                f'original is {abs(measured["original_padding_ms"])} ms'
+                ' short of the declared original end; the prepared'
+                ' content is missing from the timeline, which measured'
+                ' codec padding cannot explain'
+            ),
             measured=measured,
         )
     if candidate_ms > expectation.original_end_ms + PRIMING_TOLERANCE_MS:
@@ -988,15 +1149,55 @@ def _video_stream_row(payload: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _stream_tick(stream: dict[str, Any]) -> float | None:
+    """Return one stream time base tick in seconds when reported."""
+    time_base = stream.get('time_base')
+    if not isinstance(time_base, str) or '/' not in time_base:
+        return None
+    denominator = time_base.rsplit('/', 1)[1]
+    if not denominator.isdigit() or int(denominator) <= 0:
+        return None
+    return 1.0 / int(denominator)
+
+
+def _pairwise_tick_bound(
+    candidate_stream: dict[str, Any], source_stream: dict[str, Any]
+) -> float:
+    """Bound timing differences by the measured rational clocks.
+
+    The bound is the sum of both reported time base ticks, the exact
+    rational precision each container actually stores. A millisecond
+    clock like Matroska therefore covers its own quantization without
+    any universal epsilon, and containers that report no clock fall
+    back to the one millisecond resolution such formats store.
+    """
+    candidate_tick = _stream_tick(candidate_stream)
+    source_tick = _stream_tick(source_stream)
+    if candidate_tick is None or source_tick is None:
+        return FALLBACK_TICK_S
+    return candidate_tick + source_tick
+
+
+def _row_by_index(
+    payload: dict[str, Any], stream_index: int
+) -> dict[str, Any]:
+    """Return one stream row of a payload by absolute index."""
+    for stream in payload.get('streams', []):
+        if stream.get('index') == stream_index:
+            return dict(stream)
+    return {}
+
+
 def _run_packet_check(
     check_name: str,
     ffprobe: Path,
     timeout_seconds: float,
     candidate_path: Path,
     candidate_selector: str,
+    candidate_stream: dict[str, Any],
     source_path: Path,
     source_selector: str,
-    timestamp_tolerance_s: float,
+    source_stream: dict[str, Any],
 ) -> CheckResult:
     """Stream and compare one copied candidate stream with its source."""
     try:
@@ -1008,7 +1209,7 @@ def _run_packet_check(
             _stream_packet_fingerprints(
                 ffprobe, source_path, source_selector, timeout_seconds
             ),
-            timestamp_tolerance_s,
+            _pairwise_tick_bound(candidate_stream, source_stream),
         )
     except MediaToolError as error:
         return _not_evaluated(check_name, str(error))
@@ -1025,7 +1226,7 @@ def _verify_with_tools(
     checks: list[CheckResult] = []
     measured: dict[str, Any] = {
         'priming_tolerance_ms': PRIMING_TOLERANCE_MS,
-        'audio_timestamp_tolerance_s': AUDIO_TIMESTAMP_TOLERANCE_S,
+        'fallback_tick_s': FALLBACK_TICK_S,
         'artifact_rounding_ms': ARTIFACT_ROUNDING_MS,
     }
     checks.append(_check_candidate_file(candidate))
@@ -1096,6 +1297,9 @@ def _verify_with_tools(
         checks.append(
             _check_container_duration(payload.get('format') or {}, expectation)
         )
+    source_video_row = _video_stream_row(source_payload)
+    artifact_audio_row = _audio_stream_row(artifact_payload)
+    original_audio_row = _audio_stream_row(original_artifact_payload)
     checks.append(
         _run_packet_check(
             'video_packets',
@@ -1103,9 +1307,10 @@ def _verify_with_tools(
             timeout_seconds,
             candidate,
             '0',
+            streams[0],
             expectation.video_source,
             str(_video_stream_index_of(source_payload)),
-            0.0,
+            source_video_row,
         )
     )
     checks.append(
@@ -1115,9 +1320,10 @@ def _verify_with_tools(
             timeout_seconds,
             candidate,
             '2',
+            streams[2],
             expectation.narration_packet_source,
             str(_audio_stream_index_of(artifact_payload)),
-            AUDIO_TIMESTAMP_TOLERANCE_S,
+            artifact_audio_row,
         )
     )
     if expectation.original_is_copied:
@@ -1128,9 +1334,13 @@ def _verify_with_tools(
                 timeout_seconds,
                 candidate,
                 '1',
+                streams[1],
                 expectation.original_packet_source,
                 str(expectation.original_packet_stream_index),
-                AUDIO_TIMESTAMP_TOLERANCE_S,
+                _row_by_index(
+                    original_artifact_payload,
+                    expectation.original_packet_stream_index,
+                ),
             )
         )
     else:
@@ -1141,9 +1351,10 @@ def _verify_with_tools(
                 timeout_seconds,
                 candidate,
                 '1',
+                streams[1],
                 expectation.original_packet_source,
                 str(_audio_stream_index_of(original_artifact_payload)),
-                AUDIO_TIMESTAMP_TOLERANCE_S,
+                original_audio_row,
             )
         )
     with tempfile.TemporaryDirectory(

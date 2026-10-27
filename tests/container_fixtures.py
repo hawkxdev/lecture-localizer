@@ -227,7 +227,7 @@ def prepared_tracks(tmp_path: Path) -> dict[str, Any]:
     plus the declared expectation numbers used across lane C tests.
     """
     staging = tmp_path / 'prepared'
-    staging.mkdir(exist_ok=True)
+    staging.mkdir(parents=True, exist_ok=True)
     video = make_media(staging / 'lecture.mp4')
     narration = encode_narration_aac(staging / 'narration.m4a')
     english = write_srt_entries(staging / 'english.srt', EN_CUES)
@@ -535,6 +535,70 @@ def build_cropped_candidate(tracks: dict[str, Any], destination: Path) -> Path:
     if result.returncode != 0:
         raise RuntimeError(f'ffmpeg failed: {result.stderr}')
     return destination
+
+
+def make_container_copy(source: Path, destination: Path) -> Path:
+    """Stream copy one media file into another container."""
+    ffmpeg = shutil.which('ffmpeg')
+    if ffmpeg is None:
+        raise RuntimeError('required setup prerequisite: ffmpeg absent')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [
+            ffmpeg,
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-i',
+            str(source),
+            '-c',
+            'copy',
+            '-y',
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+        env=scrubbed_environment(),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f'ffmpeg failed: {result.stderr}')
+    return destination
+
+
+def write_packet_wrapper(bin_dir: Path, real_ffprobe: str) -> Path:
+    """Write a ffprobe wrapper that faults only packet probes.
+
+    The wrapper delegates everything except packet probes to the real
+    tool; the packet behavior is selected through FAKE_PACKET_MODE:
+    garbage output, empty output or a stalled child.
+    """
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    wrapper = bin_dir / 'ffprobe'
+    script = (
+        '#!/bin/sh\n'
+        'for argument in "$@"; do\n'
+        '  if [ "$argument" = "-show_packets" ]; then\n'
+        '    case "$FAKE_PACKET_MODE" in\n'
+        "      garbage) printf 'not flat output at all\\n'; exit 0 ;;\n"
+        '      empty) exit 0 ;;\n'
+        '      stall) sleep 5; exit 0 ;;\n'
+        '    esac\n'
+        '  fi\n'
+        'done\n'
+        f'exec {shlex_quote(real_ffprobe)} "$@"\n'
+    )
+    wrapper.write_text(script, encoding='utf-8')
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def shlex_quote(value: str) -> str:
+    """Quote one value for safe shell embedding."""
+    import shlex
+
+    return shlex.quote(value)
 
 
 def subtitle_entries(cues: list[tuple[int, int, str]]) -> list[SubtitleEntry]:
