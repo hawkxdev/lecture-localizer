@@ -262,6 +262,29 @@ def _write_silence(handle: BinaryIO, frames: int) -> None:
         remaining -= step
 
 
+def _verify_pcm_record(path: Path, sha256_hex: str, frames: int) -> None:
+    """Verify one PCM file against its recorded hash and frame count."""
+    actual = sha256_file(path)
+    if actual != sha256_hex:
+        raise AudioError(
+            f'PCM artifact {path} no longer matches its recorded'
+            f' integrity: expected {sha256_hex}, found {actual}',
+            kind='speech',
+        )
+    measured = _pcm_frames(path)
+    if measured != frames:
+        raise AudioError(
+            f'PCM artifact {path} holds {measured} frames but its record'
+            f' declares {frames}',
+            kind='speech',
+        )
+
+
+def _verify_speech_artifact(speech: NormalizedSpeech) -> None:
+    """Verify recorded integrity of one normalized speech artifact."""
+    _verify_pcm_record(speech.path, speech.sha256, speech.frames)
+
+
 def _copy_pcm(handle: BinaryIO, source: Path, frames: int) -> None:
     """Stream exactly the recorded PCM frames from one file."""
     expected = frames * BYTES_PER_SAMPLE
@@ -303,43 +326,52 @@ def _validate_wav_structure(source: Path) -> None:
     FFmpeg exits successfully on a structurally truncated file and
     silently returns only the decodable prefix, so completion is
     established from the declared RIFF and chunk sizes rather than
-    from the tool exit code.
+    from the tool exit code. Headers are walked with seeks and
+    bounded reads, never by retaining payload bytes in memory.
     """
     try:
-        raw = source.read_bytes()
+        actual_size = source.stat().st_size
+        with open(source, 'rb') as handle:
+            header = handle.read(12)
+            if (
+                len(header) < 12
+                or header[0:4] != b'RIFF'
+                or header[8:12] != b'WAVE'
+            ):
+                raise AudioError(
+                    f'retained speech is not a RIFF WAVE file: {source}',
+                    kind='speech',
+                )
+            riff_size = int.from_bytes(header[4:8], 'little')
+            if riff_size != actual_size - 8:
+                raise AudioError(
+                    f'retained speech is truncated: the RIFF header'
+                    f' declares {riff_size + 8} bytes but the file holds'
+                    f' {actual_size}: {source}',
+                    kind='speech',
+                )
+            position = 12
+            found_data = False
+            while position + 8 <= actual_size:
+                handle.seek(position)
+                chunk_header = handle.read(8)
+                chunk_id = chunk_header[0:4]
+                chunk_size = int.from_bytes(chunk_header[4:8], 'little')
+                content_end = position + 8 + chunk_size
+                if content_end > actual_size:
+                    label = chunk_id.decode('ascii', 'replace')
+                    raise AudioError(
+                        f'retained speech is truncated inside its'
+                        f' {label!r} chunk: {source}',
+                        kind='speech',
+                    )
+                if chunk_id == b'data':
+                    found_data = True
+                position = content_end + (chunk_size & 1)
     except OSError as error:
         raise AudioError(
             f'retained speech is unreadable: {error}', kind='speech'
         ) from error
-    if len(raw) < 12 or raw[0:4] != b'RIFF' or raw[8:12] != b'WAVE':
-        raise AudioError(
-            f'retained speech is not a RIFF WAVE file: {source}',
-            kind='speech',
-        )
-    riff_size = int.from_bytes(raw[4:8], 'little')
-    if riff_size != len(raw) - 8:
-        raise AudioError(
-            f'retained speech is truncated: the RIFF header declares'
-            f' {riff_size + 8} bytes but the file holds {len(raw)}:'
-            f' {source}',
-            kind='speech',
-        )
-    position = 12
-    found_data = False
-    while position + 8 <= len(raw):
-        chunk_id = raw[position : position + 4]
-        chunk_size = int.from_bytes(raw[position + 4 : position + 8], 'little')
-        content_end = position + 8 + chunk_size
-        if content_end > len(raw):
-            label = chunk_id.decode('ascii', 'replace')
-            raise AudioError(
-                f'retained speech is truncated inside its {label!r}'
-                f' chunk: {source}',
-                kind='speech',
-            )
-        if chunk_id == b'data':
-            found_data = True
-        position = content_end + (chunk_size & 1)
     if not found_data:
         raise AudioError(
             f'retained speech has no PCM data chunk: {source}',
@@ -426,8 +458,12 @@ def fit_segment(
     Shorter speech keeps normal speed and is placed as is. Longer
     speech is fitted with the pitch preserving atempo filter only up
     to the configured maximum, and the fitted output is measured
-    again: an overrun is refused, never trimmed.
+    again: an overrun is refused, never trimmed. The supplied
+    artifact is verified against its recorded integrity first, so
+    replaced or truncated PCM is refused before any fitting or
+    copying.
     """
+    _verify_speech_artifact(placement.speech)
     start_frame, end_frame = _window_frames(
         placement.start_ms, placement.end_ms
     )
@@ -625,7 +661,11 @@ def stream_timeline(
             cursor = 0
             for fit in fits:
                 assert fit.pcm_path is not None
+                assert fit.pcm_sha256 is not None
                 _write_silence(handle, fit.start_frame - cursor)
+                _verify_pcm_record(
+                    fit.pcm_path, fit.pcm_sha256, fit.placed_frames
+                )
                 _copy_pcm(handle, fit.pcm_path, fit.placed_frames)
                 cursor = fit.start_frame + fit.placed_frames
             _write_silence(handle, total_frames - cursor)

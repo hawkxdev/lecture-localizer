@@ -152,6 +152,97 @@ def test_normalize_wav_rejects_missing_corrupt_and_empty_speech(
     _assert_no_partials(tmp_path)
 
 
+def test_fit_and_timeline_verify_supplied_artifact_integrity(
+    tmp_path: Path,
+) -> None:
+    speech = _speech(tmp_path, 'unit', 4_800)
+    destination = tmp_path / 'timeline.pcm'
+    fit = fit_segment(
+        _place('s001', 0, 100, speech),
+        max_speedup=DEFAULT_FITTING_MAX_SPEEDUP,
+        work_dir=tmp_path / 'work',
+        ffmpeg_path='unused-ffmpeg',
+        timeout_seconds=_TIMEOUT,
+    )
+    assert fit.disposition == 'normal'
+    data = bytearray(speech.path.read_bytes())
+    data[0] ^= 0xFF
+    speech.path.write_bytes(bytes(data))
+    with pytest.raises(AudioError, match='integrity') as bad_fit:
+        fit_segment(
+            _place('s001', 0, 100, speech),
+            max_speedup=DEFAULT_FITTING_MAX_SPEEDUP,
+            work_dir=tmp_path / 'work',
+            ffmpeg_path='unused-ffmpeg',
+            timeout_seconds=_TIMEOUT,
+        )
+    assert bad_fit.value.kind == 'speech'
+    with pytest.raises(AudioError, match='integrity') as bad_stream:
+        stream_timeline(
+            [_place('s001', 0, 100, speech)],
+            total_frames=4_800,
+            destination=destination,
+            max_speedup=DEFAULT_FITTING_MAX_SPEEDUP,
+            work_dir=tmp_path / 'work',
+            ffmpeg_path='unused-ffmpeg',
+            timeout_seconds=_TIMEOUT,
+        )
+    assert bad_stream.value.kind == 'speech'
+    assert not destination.exists()
+    _assert_no_partials(tmp_path)
+
+
+def test_timeline_refuses_tampered_fitted_artifact(
+    tools: dict[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    speech = _speech(tmp_path, 'long', 52_000)
+    real_fit = audio_module.fit_segment
+
+    def fit_then_tamper(placement: SegmentPlacement, **kwargs: Any) -> Any:
+        fit = real_fit(placement, **kwargs)
+        if fit.disposition == 'fitted':
+            assert fit.pcm_path is not None
+            data = bytearray(fit.pcm_path.read_bytes())
+            data[4] ^= 0xFF
+            fit.pcm_path.write_bytes(bytes(data))
+        return fit
+
+    monkeypatch.setattr(audio_module, 'fit_segment', fit_then_tamper)
+    destination = tmp_path / 'timeline.pcm'
+    with pytest.raises(AudioError, match='integrity') as tampered:
+        stream_timeline(
+            [_place('s001', 0, 1_000, speech)],
+            total_frames=96_000,
+            destination=destination,
+            max_speedup=DEFAULT_FITTING_MAX_SPEEDUP,
+            work_dir=tmp_path / 'work',
+            ffmpeg_path=tools['ffmpeg_path'],
+            timeout_seconds=_TIMEOUT,
+        )
+    assert tampered.value.kind == 'speech'
+    assert not destination.exists()
+    _assert_no_partials(tmp_path)
+
+
+def test_wav_validation_reads_bounded_memory(
+    tools: dict[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden_read_bytes(self: Path) -> bytes:
+        raise AssertionError('unbounded read_bytes used for WAV input')
+
+    monkeypatch.setattr(Path, 'read_bytes', forbidden_read_bytes)
+    pcm = ats.pcm_bytes(2_000_000)
+    raw = ats.write_wav(tmp_path / 'large.wav', pcm)
+    record = normalize_wav(
+        raw,
+        tmp_path / 'norm.pcm',
+        ffmpeg_path=tools['ffmpeg_path'],
+        timeout_seconds=_TIMEOUT,
+    )
+    assert record.frames == 2_000_000
+    assert record.path.stat().st_size == 4_000_000
+
+
 def test_normalize_wav_requires_complete_wav_structure(
     tools: dict[str, str], tmp_path: Path
 ) -> None:
@@ -702,6 +793,40 @@ def test_convertible_originals_convert_preserving_channels(
     assert facts['codec_name'] == 'aac'
     assert facts['profile'] == 'LC'
     assert facts['channels'] == channels
+
+
+@pytest.mark.parametrize('channels', [1, 2])
+def test_original_aac_copy_preserves_ordered_packets(
+    tools: dict[str, str], tmp_path: Path, channels: int
+) -> None:
+    source = ats.render_original(
+        tools['ffmpeg_path'],
+        tmp_path / f'packets-{channels}ch.mp4',
+        codec_args=(
+            '-c:a',
+            'aac',
+            '-b:a',
+            '96k',
+            '-ac',
+            str(channels),
+            '-ar',
+            '48000',
+        ),
+    )
+    destination = tmp_path / f'packets-prepared-{channels}ch.m4a'
+    result = prepare_original_audio(
+        source,
+        0,
+        destination,
+        ffmpeg_path=tools['ffmpeg_path'],
+        ffprobe_path=tools['ffprobe_path'],
+        timeout_seconds=_TIMEOUT,
+    )
+    assert result.disposition == 'copied'
+    original_rows = ats.packet_rows(tools['ffprobe_path'], source)
+    prepared_rows = ats.packet_rows(tools['ffprobe_path'], destination)
+    assert len(original_rows) >= 40
+    assert prepared_rows == original_rows
 
 
 def test_original_unsupported_missing_stream_and_profile_refused(

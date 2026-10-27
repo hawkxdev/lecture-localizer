@@ -157,6 +157,38 @@ def decoded_frames(ffmpeg_path: str, media: Path, work_dir: Path) -> int:
         decoded.unlink(missing_ok=True)
 
 
+def packet_rows(
+    ffprobe_path: str, media: Path, stream: int = 0
+) -> list[tuple[str, str, str, str]]:
+    """Return ordered pts, dts, duration and size rows of one stream."""
+    result = subprocess.run(
+        [
+            ffprobe_path,
+            '-v',
+            'error',
+            '-select_streams',
+            str(stream),
+            '-show_entries',
+            'packet=pts,dts,duration,size',
+            '-of',
+            'csv=p=0',
+            str(media),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+        env=scrubbed_environment(),
+    )
+    assert result.returncode == 0, result.stderr
+    rows: list[tuple[str, str, str, str]] = []
+    for line in result.stdout.splitlines():
+        parts = line.split(',')
+        if len(parts) == 4:
+            rows.append((parts[0], parts[1], parts[2], parts[3]))
+    return rows
+
+
 def render_original(
     ffmpeg_path: str,
     destination: Path,
