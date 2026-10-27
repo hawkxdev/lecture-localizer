@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -222,3 +223,87 @@ def derive_windows(
         previous_end = end_ms
         previous_id = segment.id
     return windows
+
+
+class TranslatedSegmentRef(Protocol):
+    """Read view of one translation segment for subtitle generation."""
+
+    @property
+    def id(self) -> str:
+        """Return the stable segment identifier."""
+        ...
+
+    @property
+    def source_cues(self) -> tuple[int, ...]:
+        """Return the ordered source cue positions."""
+        ...
+
+    @property
+    def translation(self) -> str:
+        """Return the full reviewed translation text."""
+        ...
+
+
+@dataclass(frozen=True)
+class SubtitleEntry:
+    """One subtitle cue with its window and complete text."""
+
+    start_ms: int
+    end_ms: int
+    text: str
+
+
+def _format_timestamp(total_ms: int) -> str:
+    """Render integer milliseconds as an SRT timestamp."""
+    hour, rest = divmod(total_ms, _MS_PER_HOUR)
+    minute, rest = divmod(rest, _MS_PER_MINUTE)
+    second, millis = divmod(rest, _MS_PER_SECOND)
+    return f'{hour:02d}:{minute:02d}:{second:02d},{millis:03d}'
+
+
+def render_srt(entries: Sequence[SubtitleEntry]) -> str:
+    """Render cue entries as SRT text with ordinal numbering."""
+    blocks: list[str] = []
+    for number, entry in enumerate(entries, start=1):
+        if entry.end_ms <= entry.start_ms:
+            raise SubtitlesError(
+                f'cue {number} end must be after its start:'
+                f' {entry.start_ms} .. {entry.end_ms}'
+            )
+        if not entry.text.strip():
+            raise SubtitlesError(f'cue {number} has blank text')
+        blocks.append(
+            f'{number}\n'
+            f'{_format_timestamp(entry.start_ms)} --> '
+            f'{_format_timestamp(entry.end_ms)}\n'
+            f'{entry.text}\n'
+        )
+    return '\n'.join(blocks)
+
+
+def russian_subtitle_entries(
+    cues: tuple[SourceCue, ...],
+    segments: tuple[TranslatedSegmentRef, ...],
+) -> tuple[SubtitleEntry, ...]:
+    """Build one full translation cue per segment on its derived window.
+
+    Russian subtitles always carry the complete reviewed translation
+    text; narration wording is never substituted for the translation.
+    """
+    windows = derive_windows(cues, segments)
+    return tuple(
+        SubtitleEntry(
+            start_ms=windows[segment.id].start_ms,
+            end_ms=windows[segment.id].end_ms,
+            text=segment.translation,
+        )
+        for segment in segments
+    )
+
+
+def russian_srt(
+    cues: tuple[SourceCue, ...],
+    segments: tuple[TranslatedSegmentRef, ...],
+) -> str:
+    """Render the complete Russian subtitle file for the candidate."""
+    return render_srt(russian_subtitle_entries(cues, segments))
