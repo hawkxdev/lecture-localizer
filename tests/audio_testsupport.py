@@ -159,17 +159,19 @@ def decoded_frames(ffmpeg_path: str, media: Path, work_dir: Path) -> int:
 
 def packet_rows(
     ffprobe_path: str, media: Path, stream: int = 0
-) -> list[tuple[str, str, str, str]]:
-    """Return ordered pts, dts, duration and size rows of one stream."""
+) -> list[tuple[str, str, str, str, str]]:
+    """Return ordered pts, dts, duration, size and payload hash rows."""
     result = subprocess.run(
         [
             ffprobe_path,
             '-v',
             'error',
+            '-show_data_hash',
+            'md5',
             '-select_streams',
             str(stream),
             '-show_entries',
-            'packet=pts,dts,duration,size',
+            'packet=pts,dts,duration,size,data_hash',
             '-of',
             'csv=p=0',
             str(media),
@@ -181,12 +183,36 @@ def packet_rows(
         env=scrubbed_environment(),
     )
     assert result.returncode == 0, result.stderr
-    rows: list[tuple[str, str, str, str]] = []
+    rows: list[tuple[str, str, str, str, str]] = []
     for line in result.stdout.splitlines():
         parts = line.split(',')
-        if len(parts) == 4:
-            rows.append((parts[0], parts[1], parts[2], parts[3]))
+        if len(parts) < 5:
+            continue
+        payload_hashes = [part for part in parts if ':' in part]
+        rows.append(
+            (
+                parts[0],
+                parts[1],
+                parts[2],
+                parts[3],
+                payload_hashes[0] if payload_hashes else '',
+            )
+        )
     return rows
+
+
+def flip_last_payload_byte(source: Path, destination: Path) -> int:
+    """Copy one media file flipping one byte inside its mdat payload."""
+    data = bytearray(source.read_bytes())
+    marker = data.find(b'mdat')
+    assert marker >= 4, 'mdat atom not found'
+    header_start = marker - 4
+    atom_size = int.from_bytes(data[header_start : header_start + 4], 'big')
+    payload_end = header_start + atom_size if atom_size else len(data)
+    flip_offset = payload_end - 8
+    data[flip_offset] ^= 0xFF
+    destination.write_bytes(bytes(data))
+    return flip_offset
 
 
 def render_original(

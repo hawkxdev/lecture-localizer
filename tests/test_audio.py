@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -190,6 +191,48 @@ def test_fit_and_timeline_verify_supplied_artifact_integrity(
     assert bad_stream.value.kind == 'speech'
     assert not destination.exists()
     _assert_no_partials(tmp_path)
+
+
+def test_fit_and_timeline_reject_relabelled_format(
+    tmp_path: Path,
+) -> None:
+    speech = _speech(tmp_path, 'unit', 4_800)
+    relabelled = replace(
+        speech,
+        sample_rate=24_000,
+        channels=2,
+        sample_format='f32le',
+    )
+    fit = fit_segment(
+        _place('s001', 0, 100, speech),
+        max_speedup=DEFAULT_FITTING_MAX_SPEEDUP,
+        work_dir=tmp_path / 'work',
+        ffmpeg_path='unused-ffmpeg',
+        timeout_seconds=_TIMEOUT,
+    )
+    assert fit.disposition == 'normal'
+    destination = tmp_path / 'timeline.pcm'
+    with pytest.raises(AudioError, match='canonical') as bad_fit:
+        fit_segment(
+            _place('s001', 0, 100, relabelled),
+            max_speedup=DEFAULT_FITTING_MAX_SPEEDUP,
+            work_dir=tmp_path / 'work',
+            ffmpeg_path='unused-ffmpeg',
+            timeout_seconds=_TIMEOUT,
+        )
+    assert bad_fit.value.kind == 'speech'
+    with pytest.raises(AudioError, match='canonical') as bad_stream:
+        stream_timeline(
+            [_place('s001', 0, 100, relabelled)],
+            total_frames=4_800,
+            destination=destination,
+            max_speedup=DEFAULT_FITTING_MAX_SPEEDUP,
+            work_dir=tmp_path / 'work',
+            ffmpeg_path='unused-ffmpeg',
+            timeout_seconds=_TIMEOUT,
+        )
+    assert bad_stream.value.kind == 'speech'
+    assert not destination.exists()
 
 
 def test_timeline_refuses_tampered_fitted_artifact(
@@ -826,7 +869,53 @@ def test_original_aac_copy_preserves_ordered_packets(
     original_rows = ats.packet_rows(tools['ffprobe_path'], source)
     prepared_rows = ats.packet_rows(tools['ffprobe_path'], destination)
     assert len(original_rows) >= 40
+    assert all(row[4].startswith('MD5:') for row in prepared_rows)
     assert prepared_rows == original_rows
+
+
+def test_packet_oracle_detects_size_preserving_payload_mutation(
+    tools: dict[str, str], tmp_path: Path
+) -> None:
+    source = ats.render_original(
+        tools['ffmpeg_path'],
+        tmp_path / 'payload-original.mp4',
+        codec_args=(
+            '-c:a',
+            'aac',
+            '-b:a',
+            '96k',
+            '-ac',
+            '2',
+            '-ar',
+            '48000',
+        ),
+    )
+    destination = tmp_path / 'payload-prepared.m4a'
+    prepare_original_audio(
+        source,
+        0,
+        destination,
+        ffmpeg_path=tools['ffmpeg_path'],
+        ffprobe_path=tools['ffprobe_path'],
+        timeout_seconds=_TIMEOUT,
+    )
+    tampered = tmp_path / 'payload-tampered.m4a'
+    ats.flip_last_payload_byte(destination, tampered)
+    assert tampered.stat().st_size == destination.stat().st_size
+    prepared_rows = ats.packet_rows(tools['ffprobe_path'], destination)
+    mutated_rows = ats.packet_rows(tools['ffprobe_path'], tampered)
+    assert len(mutated_rows) == len(prepared_rows) >= 40
+    changed = [
+        index
+        for index, (before, after) in enumerate(
+            zip(prepared_rows, mutated_rows, strict=False)
+        )
+        if before != after
+    ]
+    assert changed >= [0]
+    for index in changed:
+        assert prepared_rows[index][:4] == mutated_rows[index][:4]
+        assert prepared_rows[index][4] != mutated_rows[index][4]
 
 
 def test_original_unsupported_missing_stream_and_profile_refused(

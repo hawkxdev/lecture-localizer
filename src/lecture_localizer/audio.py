@@ -281,8 +281,25 @@ def _verify_pcm_record(path: Path, sha256_hex: str, frames: int) -> None:
 
 
 def _verify_speech_artifact(speech: NormalizedSpeech) -> None:
-    """Verify recorded integrity of one normalized speech artifact."""
+    """Verify recorded integrity and canonical format of one artifact.
+
+    Hash and frame checks alone accept a record relabelled with a
+    foreign format, so the declared canonical working representation
+    is validated before any fitting or copying.
+    """
     _verify_pcm_record(speech.path, speech.sha256, speech.frames)
+    if (
+        speech.sample_rate != SAMPLE_RATE
+        or speech.channels != CHANNELS
+        or speech.sample_format != SAMPLE_FORMAT
+    ):
+        raise AudioError(
+            f'normalized speech artifact {speech.path} declares'
+            f' {speech.sample_rate!r} Hz {speech.channels!r} channel'
+            f' {speech.sample_format!r}, expected the canonical'
+            f' {SAMPLE_RATE} Hz {CHANNELS} channel {SAMPLE_FORMAT}',
+            kind='speech',
+        )
 
 
 def _copy_pcm(handle: BinaryIO, source: Path, frames: int) -> None:
