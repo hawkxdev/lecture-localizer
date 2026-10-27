@@ -27,6 +27,7 @@ REQUIRED_SAMPLE_RATE_HZ = 48000
 WAVE_FORMAT_PCM = 1
 WAVE_FORMAT_EXTENSIBLE = 0xFFFE
 PCM_SUBFORMAT_GUID = bytes.fromhex('0100000000001000800000aa00389b71')
+SUPPORTED_BITS_PER_SAMPLE = frozenset({8, 16, 24, 32})
 MAX_TEXT_CHARS = 60000
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0
 DEFAULT_READ_TIMEOUT_SECONDS = 120.0
@@ -487,6 +488,7 @@ def _parse_wav_stream(handle: Any, file_size: int) -> WavFacts:
     head = handle.read(12)
     if len(head) < 12 or head[0:4] != b'RIFF' or head[8:12] != b'WAVE':
         raise _invalid('missing RIFF WAVE header')
+    riff_size = struct.unpack('<I', head[4:8])[0]
     fmt: WavFacts | None = None
     data_bytes: int | None = None
     position = 12
@@ -504,13 +506,31 @@ def _parse_wav_stream(handle: Any, file_size: int) -> WavFacts:
             body = handle.read(min(chunk_size, 64))
             if len(body) < 16:
                 raise _invalid('truncated fmt chunk')
-            audio_format, channels, rate, _, _, bits = struct.unpack(
-                '<HHIIHH', body[:16]
-            )
+            (
+                audio_format,
+                channels,
+                rate,
+                byte_rate,
+                block_align,
+                bits,
+            ) = struct.unpack('<HHIIHH', body[:16])
             if channels < 1:
                 raise _invalid('implausible channel count')
-            if bits % 8 != 0 or bits == 0:
-                raise _invalid('implausible bits per sample')
+            if bits not in SUPPORTED_BITS_PER_SAMPLE:
+                raise _invalid(
+                    f'unsupported bits per sample {bits}; expected one'
+                    ' of 8, 16, 24 or 32 bit PCM'
+                )
+            if block_align != channels * (bits // 8):
+                raise _invalid(
+                    f'block align {block_align} does not match'
+                    f' {channels} channels of {bits} bit samples'
+                )
+            if byte_rate != rate * block_align:
+                raise _invalid(
+                    f'byte rate {byte_rate} does not match the declared'
+                    f' sample rate {rate} and block align {block_align}'
+                )
             if audio_format == WAVE_FORMAT_EXTENSIBLE:
                 _validate_extensible_pcm(chunk_size, body)
             elif audio_format != WAVE_FORMAT_PCM:
@@ -541,6 +561,20 @@ def _parse_wav_stream(handle: Any, file_size: int) -> WavFacts:
         raise _invalid('no fmt chunk found')
     if data_bytes is None:
         raise _invalid('no data chunk found')
+    if data_bytes == 0:
+        raise _invalid(
+            'the data chunk is empty, so the response carries no speech'
+        )
+    if data_bytes % (fmt.channels * (fmt.bits_per_sample // 8)) != 0:
+        raise _invalid(
+            'declared data size is not a whole number of complete'
+            ' sample frames'
+        )
+    if riff_size is not None and riff_size + 8 > file_size:
+        raise _invalid(
+            'the declared RIFF size exceeds the received bytes; the'
+            ' response is truncated'
+        )
     if fmt.sample_rate_hz != REQUIRED_SAMPLE_RATE_HZ:
         raise _invalid(
             f'sample rate {fmt.sample_rate_hz} does not match the'

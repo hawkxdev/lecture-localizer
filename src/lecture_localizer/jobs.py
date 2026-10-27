@@ -1739,6 +1739,15 @@ def _retain_evidence(
     }
 
 
+def _redact_secrets(text: str, secrets: tuple[str, ...]) -> str:
+    """Remove known credential values from persisted diagnostics."""
+    redacted = text
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, '[redacted]')
+    return redacted
+
+
 def _publish_raw_artifact(
     job_dir: Path,
     manifest: dict[str, Any],
@@ -1748,9 +1757,15 @@ def _publish_raw_artifact(
     receipt: Any,
     now: str,
 ) -> dict[str, Any]:
-    """Publish the validated response as an immutable raw artifact."""
+    """Publish the validated response as an immutable raw artifact.
+
+    The artifact name is an opaque safe token derived from the segment
+    id; the original id is retained as the record metadata so the
+    supported nonempty unique id contract stays unrestricted.
+    """
     ordinal = len(manifest['artifacts'])
-    relative = f'artifacts/{ordinal:03d}-raw_response-{segment["id"]}.wav'
+    safe_token = sha256_bytes(segment['id'].encode('utf-8'))[:16]
+    relative = f'artifacts/{ordinal:03d}-raw_response-{safe_token}.wav'
     move_new_file(sink, job_dir / relative)
     artifact = {
         'kind': 'raw_response',
@@ -1789,10 +1804,13 @@ def _run_operation_attempt(
     client: SpeechClient,
     now_fn: Callable[[], str],
     linked: bool,
+    redactor: Callable[[str], str],
 ) -> str:
     """Reserve the attempt durably, perform HTTP once and record it.
 
     Returns the operation verdict: completed, failed or uncertain.
+    Persisted failure diagnostics pass through the redactor so no
+    configured credential value can survive into the journal.
     """
     text = _posted_text(job_dir, manifest, segment['id'])
     validate_posted_text(text)
@@ -1832,7 +1850,10 @@ def _run_operation_attempt(
                 attempt,
                 'failed',
                 now_fn(),
-                failure={'kind': failure.kind, 'detail': failure.detail},
+                failure={
+                    'kind': failure.kind,
+                    'detail': redactor(failure.detail),
+                },
                 evidence=evidence,
                 response=response_record,
             )
@@ -1846,7 +1867,7 @@ def _run_operation_attempt(
                 if isinstance(failure, UncertainSpeechFailure)
                 else 'storage_error'
             )
-            detail = str(failure)
+            detail = redactor(str(failure))
             evidence = _retain_evidence(
                 job_dir, sink, operation_id, attempt_number
             )
@@ -1927,6 +1948,7 @@ def _execute_one_segment(
     limits: SpendingLimits,
     client: SpeechClient,
     now_fn: Callable[[], str],
+    redactor: Callable[[str], str],
 ) -> str:
     """Reserve one new operation and run its first attempt."""
     text = _posted_text(job_dir, manifest, segment['id'])
@@ -1947,6 +1969,7 @@ def _execute_one_segment(
         client,
         now_fn,
         linked=False,
+        redactor=redactor,
     )
 
 
@@ -1963,7 +1986,12 @@ def _run_guarded_planning(
     list[str],
     int,
 ]:
-    """Verify provenance, plan segments and apply the spending guards."""
+    """Verify provenance, plan segments and apply the spending guards.
+
+    Every newly planned fragment passes provider text validation before
+    any permission decision, key access or journal mutation, so
+    invalid input never becomes a recorded provider operation.
+    """
     manifest = load_job_manifest(job_dir / MANIFEST_NAME)
     journal = load_operations_journal(job_dir)
     _verify_job_integrity(job_dir, manifest)
@@ -1974,6 +2002,7 @@ def _run_guarded_planning(
     total_chars = 0
     for segment in planned:
         text = _posted_text(job_dir, manifest, segment['id'])
+        validate_posted_text(text)
         total_chars += len(text)
     if planned and require_permission:
         _require_execution_permission(
@@ -2055,6 +2084,11 @@ def execute_speech_operations(
             )
         key = _read_speech_key(reader)
         client = SpeechClient(key, transport=transport)
+
+        def redactor(detail: str, _key: str = key) -> str:
+            """Keep the configured credential out of persisted text."""
+            return _redact_secrets(detail, (_key,))
+
         manifest_path = job_dir / MANIFEST_NAME
         journal_path = job_dir / OPERATIONS_NAME
         writable_journal = _new_journal(journal, now_fn())
@@ -2086,6 +2120,7 @@ def execute_speech_operations(
                 limits,
                 client,
                 now_fn,
+                redactor,
             )
             executed += 1
             if verdict == 'completed':
@@ -2121,6 +2156,55 @@ def _latest_failure_kind(journal: dict[str, Any], segment_id: str) -> str:
             if attempt['verdict'] == 'completed':
                 return 'completed'
     return 'unknown'
+
+
+def _validate_operation_provenance(
+    job_dir: Path,
+    operation: dict[str, Any],
+    manifest: dict[str, Any],
+    text: str,
+) -> None:
+    """Verify the journal's recorded posted text provenance.
+
+    The recorded snapshot record, text hash and character count must
+    match the current manifest snapshot and the actual frozen text;
+    any mismatch is damaged provenance that blocks the retry while
+    keeping the journal preserved.
+    """
+    operation_id = operation['operation_id']
+    snapshot = manifest['snapshots']['narration']
+    recorded = operation['posted_text_snapshot']
+    if (
+        recorded['path'] != snapshot['path']
+        or recorded['sha256'] != snapshot['sha256']
+    ):
+        raise ContractError(
+            f'operation {operation_id} recorded text snapshot'
+            f' {recorded["path"]} which does not match the current'
+            f' narration snapshot {snapshot["path"]}; the journal'
+            ' provenance is damaged and the operation stays unresolved'
+        )
+    actual_snapshot = job_dir / snapshot['path']
+    if sha256_file(actual_snapshot) != snapshot['sha256']:
+        raise ContractError(
+            f'narration snapshot {snapshot["path"]} no longer matches'
+            f' its recorded digest; operation {operation_id} stays'
+            ' unresolved until the job is inspected'
+        )
+    if operation['posted_text_sha256'] != _segment_text_hash(text):
+        raise ContractError(
+            f'operation {operation_id} recorded posted text hash'
+            f' {operation["posted_text_sha256"]} but the current text'
+            ' hashes differently; the journal provenance is damaged'
+            ' and the operation stays unresolved'
+        )
+    if operation['posted_text_chars'] != len(text):
+        raise ContractError(
+            f'operation {operation_id} recorded'
+            f' {operation["posted_text_chars"]} posted text characters'
+            f' but the current text has {len(text)}; the journal'
+            ' provenance is damaged and the operation stays unresolved'
+        )
 
 
 def retry_uncertain_operation(
@@ -2192,6 +2276,8 @@ def retry_uncertain_operation(
                 ' hashes differently; changed narration requires fresh'
                 ' planning instead of a retry'
             )
+        _validate_operation_provenance(job_dir, operation, manifest, text)
+        validate_posted_text(text)
         _require_execution_permission(allow_paid, limits, 1, len(text))
         if limits is None:
             raise PaidExecutionDenied(
@@ -2201,6 +2287,11 @@ def retry_uncertain_operation(
             )
         key = _read_speech_key(reader)
         client = SpeechClient(key, transport=transport)
+
+        def redactor(detail: str, _key: str = key) -> str:
+            """Keep the configured credential out of persisted text."""
+            return _redact_secrets(detail, (_key,))
+
         verdict = _run_operation_attempt(
             job_dir,
             job_dir / OPERATIONS_NAME,
@@ -2213,6 +2304,7 @@ def retry_uncertain_operation(
             client,
             now_fn,
             linked=True,
+            redactor=redactor,
         )
         failed: dict[str, str] = {}
         uncertain: dict[str, str] = {}

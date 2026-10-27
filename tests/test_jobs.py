@@ -52,6 +52,9 @@ from lecture_localizer.storage import (
     atomic_write_json,
     sha256_bytes,
 )
+from lecture_localizer.xai_client import SpeechRequestError
+
+KEY_MATERIAL = 'reflecting-secret-key-value'
 
 
 def make_kit(tmp_path: Path, name: str = 'src') -> dict[str, Path]:
@@ -1263,7 +1266,6 @@ def load_journal(job_dir: Path) -> dict[str, Any]:
 
 
 def test_prepare_and_status_without_journal(tmp_path: Path) -> None:
-    """An existing v1 job without a journal stays usable and visible."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     assert not (kit['job'] / 'operations.json').exists()
@@ -1274,7 +1276,6 @@ def test_prepare_and_status_without_journal(tmp_path: Path) -> None:
 
 
 def test_prepare_blocks_malformed_journal(tmp_path: Path) -> None:
-    """Malformed or unknown journals block prepare actionably."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     (kit['job'] / 'operations.json').write_text(
@@ -1298,7 +1299,6 @@ def test_prepare_blocks_malformed_journal(tmp_path: Path) -> None:
 
 
 def test_prepare_blocks_unknown_journal_fields(tmp_path: Path) -> None:
-    """The strict journal schema rejects arbitrary extra data."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     (kit['job'] / 'operations.json').write_text(
@@ -1317,7 +1317,6 @@ def test_prepare_blocks_unknown_journal_fields(tmp_path: Path) -> None:
 
 
 def test_prepare_never_resets_an_uncertain_journal(tmp_path: Path) -> None:
-    """Changed input preparation preserves recorded uncertainty."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     execute_speech_operations(
@@ -1348,7 +1347,6 @@ def test_prepare_never_resets_an_uncertain_journal(tmp_path: Path) -> None:
 
 
 def test_complete_cache_reuse_makes_zero_requests(tmp_path: Path) -> None:
-    """Intact complete cache reuse never calls transport or reads keys."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     plant_all_synthesis_artifacts(kit['job'])
@@ -1366,7 +1364,6 @@ def test_complete_cache_reuse_makes_zero_requests(tmp_path: Path) -> None:
 
 
 def test_missing_permission_stops_before_key(tmp_path: Path) -> None:
-    """Absent explicit permission denies execution before any key use."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     transport = FakeTransport(AssertionError('transport must never be called'))
@@ -1384,7 +1381,6 @@ def test_missing_permission_stops_before_key(tmp_path: Path) -> None:
 
 
 def test_missing_limits_stop_before_key(tmp_path: Path) -> None:
-    """Absent explicit limits deny execution before any key use."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     with pytest.raises(PaidExecutionDenied) as raised:
@@ -1399,7 +1395,6 @@ def test_missing_limits_stop_before_key(tmp_path: Path) -> None:
 
 
 def test_missing_key_stops_before_http(tmp_path: Path) -> None:
-    """An absent key stops after guards but before any request."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     transport = FakeTransport(AssertionError('transport must never be called'))
@@ -1416,7 +1411,6 @@ def test_missing_key_stops_before_http(tmp_path: Path) -> None:
 
 
 def test_request_count_limit_stops_before_http(tmp_path: Path) -> None:
-    """Planning more requests than allowed stops with zero calls."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     limits = SpendingLimits(
@@ -1440,7 +1434,6 @@ def test_request_count_limit_stops_before_http(tmp_path: Path) -> None:
 
 
 def test_text_volume_limit_stops_before_http(tmp_path: Path) -> None:
-    """Planning more text characters than allowed stops cleanly."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     limits = SpendingLimits(
@@ -1463,7 +1456,6 @@ def test_text_volume_limit_stops_before_http(tmp_path: Path) -> None:
 def test_window_beyond_duration_stops_before_http(
     tmp_path: Path,
 ) -> None:
-    """An infeasible source window stops before key access."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     manifest_path = kit['job'] / 'manifest.json'
@@ -1485,7 +1477,6 @@ def test_window_beyond_duration_stops_before_http(
 def test_reservation_and_start_are_durable_before_http(
     tmp_path: Path,
 ) -> None:
-    """The journal already carries the started operation during HTTP."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     observed: list[dict[str, Any]] = []
@@ -1511,7 +1502,6 @@ def test_reservation_and_start_are_durable_before_http(
 def test_success_records_receipt_manifest_and_journal(
     tmp_path: Path,
 ) -> None:
-    """A complete validated response commits artifact and integrity."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     calls: list[str] = []
@@ -1548,7 +1538,6 @@ def test_success_records_receipt_manifest_and_journal(
 
 
 def test_http_error_is_definitive_with_evidence(tmp_path: Path) -> None:
-    """A complete non success response journals a failed operation."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     transport = FakeTransport(
@@ -1581,7 +1570,6 @@ def test_http_error_is_definitive_with_evidence(tmp_path: Path) -> None:
 def test_uncertain_blocks_new_planning_until_retry(
     tmp_path: Path,
 ) -> None:
-    """Uncertain operations never repeat automatically; retry works."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     first = execute_speech_operations(
@@ -1628,7 +1616,6 @@ def test_uncertain_blocks_new_planning_until_retry(
 
 
 def test_retry_refuses_changed_narration(tmp_path: Path) -> None:
-    """A retry against changed inputs names the signature mismatch."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     execute_speech_operations(
@@ -1665,7 +1652,6 @@ def test_retry_refuses_changed_narration(tmp_path: Path) -> None:
 
 
 def test_retry_refuses_unknown_operation(tmp_path: Path) -> None:
-    """A retry must name an existing journal operation."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     with pytest.raises(ContractError, match='no operation'):
@@ -1682,7 +1668,6 @@ def test_retry_refuses_unknown_operation(tmp_path: Path) -> None:
 def test_retry_without_permission_keeps_uncertainty(
     tmp_path: Path,
 ) -> None:
-    """A denied retry changes nothing in the journal."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     execute_speech_operations(
@@ -1709,7 +1694,6 @@ def test_retry_without_permission_keeps_uncertainty(
 
 
 def test_storage_failure_is_uncertain(tmp_path: Path) -> None:
-    """Sink write failures leave a visible uncertain operation."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     artifacts_dir = kit['job'] / 'artifacts'
@@ -1736,7 +1720,6 @@ def test_storage_failure_is_uncertain(tmp_path: Path) -> None:
 def test_cancellation_journals_uncertainty_before_exit(
     tmp_path: Path,
 ) -> None:
-    """An interrupted attempt is journaled uncertain, then re-raised."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     transport = FakeTransport(
@@ -1762,7 +1745,6 @@ def test_cancellation_journals_uncertainty_before_exit(
 def test_damaged_raw_provenance_stops_execution(
     tmp_path: Path,
 ) -> None:
-    """Corrupt cached provenance stops before any new request."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     plant_all_synthesis_artifacts(kit['job'])
@@ -1786,7 +1768,6 @@ def test_damaged_raw_provenance_stops_execution(
 def test_preview_reports_planned_work_and_volume(
     tmp_path: Path,
 ) -> None:
-    """Preview names the exact planned count and text volume."""
     kit = make_kit(tmp_path)
     run_prepare(kit)
     manifest = json.loads(
@@ -1804,3 +1785,194 @@ def test_preview_reports_planned_work_and_volume(
     assert preview['planned_count'] == 1
     assert preview['planned_text_chars'] == len('Вторая реплика.')
     assert preview['reused'] == ['s001']
+
+
+# --- First correction round controls (R1 R3 R5 R6) ---
+
+
+def test_reflecting_error_message_never_persists_the_key(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport(
+        httpx.ReadTimeout(
+            f'connection dropped while reading for {KEY_MATERIAL}'
+        )
+    )
+    result = execute_speech_operations(
+        _prepare_simple_job(tmp_path),
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=transport,
+        key_reader=lambda name: KEY_MATERIAL,
+    )
+    assert set(result.uncertain) == {'s001', 's002'}
+    journal_text = (tmp_path / 'job' / 'operations.json').read_text(
+        encoding='utf-8'
+    )
+    assert KEY_MATERIAL not in journal_text
+    assert '[redacted]' in journal_text
+
+
+def test_oversized_narration_preflight_refuses_before_key_and_journal(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / 'src'
+    source.mkdir()
+    require_real_media()
+    video = make_media(source / 'lecture.mp4')
+    srt = write_srt(source / 'lecture.srt', DEFAULT_CUES)
+    segments = [
+        {
+            'id': 's001',
+            'source_cues': [1],
+            'translation': 'Первая реплика.',
+            'narration': 'я' * 60001,
+        },
+        {
+            'id': 's002',
+            'source_cues': [2],
+            'translation': 'Вторая реплика.',
+        },
+    ]
+    translation = write_translation(
+        source / 'translation.json', video, srt, segments
+    )
+    job = tmp_path / 'job'
+    prepare_job(
+        video_path=video,
+        srt_path=srt,
+        translation_path=translation,
+        job_dir=job,
+        output_path=tmp_path / 'out.mp4',
+        source_audio=None,
+        settings=Settings(),
+    )
+    transport = FakeTransport(AssertionError('transport must never be called'))
+    with pytest.raises(SpeechRequestError):
+        execute_speech_operations(
+            job,
+            allow_paid=True,
+            limits=TEST_LIMITS,
+            transport=transport,
+            key_reader=trap_reader,
+        )
+    assert transport.requests == []
+    assert not (job / 'operations.json').exists()
+    with pytest.raises(SpeechRequestError):
+        execute_speech_operations(
+            job,
+            allow_paid=True,
+            limits=TEST_LIMITS,
+            transport=transport,
+            key_reader=trap_reader,
+        )
+    assert not (job / 'operations.json').exists()
+
+
+def test_unicode_and_separator_ids_keep_the_job_readable(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / 'src'
+    source.mkdir()
+    require_real_media()
+    video = make_media(source / 'lecture.mp4')
+    srt = write_srt(source / 'lecture.srt', DEFAULT_CUES)
+    segments = [
+        {
+            'id': 'часть1',  # noqa: RUF001
+            'source_cues': [1],
+            'translation': 'Первая реплика.',
+        },
+        {
+            'id': 'part 2/slash',
+            'source_cues': [2],
+            'translation': 'Вторая реплика.',
+        },
+    ]
+    translation = write_translation(
+        source / 'translation.json', video, srt, segments
+    )
+    job = tmp_path / 'job'
+    prepare_job(
+        video_path=video,
+        srt_path=srt,
+        translation_path=translation,
+        job_dir=job,
+        output_path=tmp_path / 'out.mp4',
+        source_audio=None,
+        settings=Settings(),
+    )
+    result = execute_speech_operations(
+        job,
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=success_transport(),
+        key_reader=lambda name: KEY_MATERIAL,
+    )
+    assert result.completed == ('часть1', 'part 2/slash')  # noqa: RUF001
+    status = read_job_status(job)
+    assert status['stages']['synthesis']['state'] == 'complete'
+    assert status['operations']['by_state'].get('completed') == 2
+    assert run_prepare(
+        {
+            'video': video,
+            'srt': srt,
+            'translation': translation,
+            'job': job,
+            'output': tmp_path / 'out.mp4',
+        }
+    ).unchanged
+
+
+def test_retry_refuses_damaged_posted_text_provenance(
+    tmp_path: Path,
+) -> None:
+    job = _prepare_simple_job(tmp_path)
+    first = execute_speech_operations(
+        job,
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=timeout_transport(),
+        key_reader=lambda name: KEY_MATERIAL,
+    )
+    assert len(first.uncertain) == 2
+    journal = load_journal(job)
+    operation_id = journal['operations'][0]['operation_id']
+    journal['operations'][0]['posted_text_sha256'] = '0' * 64
+    atomic_write_json(job / 'operations.json', journal)
+    damaged_bytes = (job / 'operations.json').read_bytes()
+    transport = FakeTransport(AssertionError('transport must never be called'))
+    with pytest.raises(ContractError, match='provenance is damaged'):
+        retry_uncertain_operation(
+            job,
+            operation_id,
+            allow_paid=True,
+            limits=TEST_LIMITS,
+            transport=transport,
+            key_reader=trap_reader,
+        )
+    assert transport.requests == []
+    assert (job / 'operations.json').read_bytes() == damaged_bytes
+
+
+def _prepare_simple_job(tmp_path: Path) -> Path:
+    """Prepare a two segment job from the default synthetic kit."""
+    source = tmp_path / 'src'
+    source.mkdir()
+    require_real_media()
+    video = make_media(source / 'lecture.mp4')
+    srt = write_srt(source / 'lecture.srt', DEFAULT_CUES)
+    translation = write_translation(
+        source / 'translation.json', video, srt, default_segments()
+    )
+    job = tmp_path / 'job'
+    prepare_job(
+        video_path=video,
+        srt_path=srt,
+        translation_path=translation,
+        job_dir=job,
+        output_path=tmp_path / 'out.mp4',
+        source_audio=None,
+        settings=Settings(),
+    )
+    return job

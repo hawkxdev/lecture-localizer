@@ -113,17 +113,22 @@ def create_new_file(path: str | Path, data: bytes) -> None:
 def move_new_file(source: str | Path, target: str | Path) -> None:
     """Move one fully written file to a fresh immutable destination.
 
-    The caller owns durability of the source bytes; the move itself is
-    an atomic rename on the same filesystem and the destination
-    directory entry is flushed so the artifact survives a crash.
+    Publication is a hard link creation, which never clobbers any
+    existing destination name, including dangling symlinks and names
+    created between the check and the link, and the source file is
+    retained untouched when the destination already exists. The
+    destination directory entry is flushed so the artifact survives a
+    crash.
     """
     source_path = Path(source)
     target_path = Path(target)
-    if target_path.exists():
+    try:
+        os.link(source_path, target_path)
+    except FileExistsError as error:
         raise DestinationExistsError(
-            f'refusing to overwrite an existing immutable file: {target_path}'
-        )
-    os.replace(source_path, target_path)
+            f'refusing to overwrite an existing destination: {target_path}'
+        ) from error
+    os.unlink(source_path)
     _fsync_directory(target_path.parent)
 
 

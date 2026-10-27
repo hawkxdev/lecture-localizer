@@ -37,32 +37,22 @@ def build_wav_bytes(
     bits: int = 16,
     extensible: bool = False,
     extensible_body: bytes = b'',
+    block_align: int | None = None,
+    byte_rate: int | None = None,
 ) -> bytes:
     """Build one minimal valid PCM WAV payload for transport fakes."""
     width = bits // 8
     data = b'\x00' * (samples * channels * width)
+    align = block_align if block_align is not None else channels * width
+    speed = byte_rate if byte_rate is not None else rate * align
     if extensible:
         fmt_body = (
-            struct.pack(
-                '<HHIIHH',
-                0xFFFE,
-                channels,
-                rate,
-                rate * channels * width,
-                channels * width,
-                bits,
-            )
+            struct.pack('<HHIIHH', 0xFFFE, channels, rate, speed, align, bits)
             + extensible_body
         )
     else:
         fmt_body = struct.pack(
-            '<HHIIHH',
-            1,
-            channels,
-            rate,
-            rate * channels * width,
-            channels * width,
-            bits,
+            '<HHIIHH', 1, channels, rate, speed, align, bits
         )
     body = (
         b'WAVE'
@@ -165,7 +155,6 @@ def make_client(transport: FakeTransport) -> SpeechClient:
 
 
 def test_payload_matches_approved_mode() -> None:
-    """The exact request payload equals the frozen approved mode."""
     assert build_payload('текст') == {
         'text': 'текст',
         'voice_id': 'eve',
@@ -177,7 +166,6 @@ def test_payload_matches_approved_mode() -> None:
 
 
 def test_request_signature_binds_the_text() -> None:
-    """Distinct texts produce distinct stable signatures."""
     first = request_signature('Первая фраза.')
     second = request_signature('Вторая фраза.')
     assert first != second
@@ -186,7 +174,6 @@ def test_request_signature_binds_the_text() -> None:
 
 
 def test_empty_and_oversized_text_are_rejected() -> None:
-    """Text validation rejects empty and beyond limit payloads."""
     with pytest.raises(SpeechRequestError, match='must not be empty'):
         validate_posted_text('')
     with pytest.raises(SpeechRequestError, match=r'60[0-9]+ characters'):
@@ -195,7 +182,6 @@ def test_empty_and_oversized_text_are_rejected() -> None:
 
 
 def test_transport_receives_the_exact_request(tmp_path: Path) -> None:
-    """The transport sees the approved URL, payload and headers."""
     transport = FakeTransport(FakeResponse(chunks=(build_wav_bytes(),)))
     client = make_client(transport)
     client.synthesize(text='Проверка.', sink=tmp_path / 'sink.tmp')
@@ -213,7 +199,6 @@ def test_transport_receives_the_exact_request(tmp_path: Path) -> None:
 
 
 def test_complete_response_is_streamed_and_hashed(tmp_path: Path) -> None:
-    """A valid response lands in the sink with an exact receipt."""
     wav = build_wav_bytes(samples=16)
     transport = FakeTransport(FakeResponse(chunks=(wav[:10], wav[10:])))
     sink = tmp_path / 'raw.wav'
@@ -231,7 +216,6 @@ def test_complete_response_is_streamed_and_hashed(tmp_path: Path) -> None:
 
 
 def test_non_success_response_is_definitive(tmp_path: Path) -> None:
-    """An HTTP error response becomes a definitive provider refusal."""
     transport = FakeTransport(
         FakeResponse(
             chunks=(b'{"error": "quota"}',),
@@ -249,7 +233,6 @@ def test_non_success_response_is_definitive(tmp_path: Path) -> None:
 
 
 def test_wrong_content_type_is_definitive(tmp_path: Path) -> None:
-    """A 200 body with a non WAV media type is refused definitively."""
     transport = FakeTransport(
         FakeResponse(
             chunks=(build_wav_bytes(),),
@@ -270,18 +253,64 @@ def test_wrong_content_type_is_definitive(tmp_path: Path) -> None:
         b'RIFF\x00\x00\x00\x00',
         build_wav_bytes()[:-4],
         build_wav_bytes(rate=24000),
+        build_wav_bytes(bits=256),
+        build_wav_bytes(samples=0),
+        build_wav_bytes(block_align=1),
+        build_wav_bytes(byte_rate=1),
     ],
-    ids=['garbage', 'short', 'truncated', 'wrong_rate'],
+    ids=[
+        'garbage',
+        'short',
+        'truncated',
+        'wrong_rate',
+        'unsupported_bits',
+        'empty_data',
+        'bad_block_align',
+        'bad_byte_rate',
+    ],
 )
 def test_invalid_audio_bodies_are_refused(
     tmp_path: Path, payload: bytes
 ) -> None:
-    """Wrong, short, truncated or misrated WAV bodies never pass."""
     transport = FakeTransport(FakeResponse(chunks=(payload,)))
     with pytest.raises(InvalidAudioResponse):
         make_client(transport).synthesize(
             text='Проверка.', sink=tmp_path / 'raw.wav'
         )
+
+
+def test_accepted_control_decodes_with_real_ffmpeg(
+    tmp_path: Path,
+) -> None:
+    import shutil
+    import subprocess
+
+    from conftest import require_real_media
+
+    require_real_media()
+    payload = build_wav_bytes(samples=16)
+    sink = tmp_path / 'control.wav'
+    sink.write_bytes(payload)
+    receipt = make_client(
+        FakeTransport(FakeResponse(chunks=(payload,)))
+    ).synthesize(text='Проверка.', sink=tmp_path / 'raw.wav')
+    assert receipt.wav.data_bytes == 32
+    assert receipt.wav.bits_per_sample == 16
+    decode = subprocess.run(
+        [
+            shutil.which('ffmpeg') or 'ffmpeg',
+            '-v',
+            'error',
+            '-i',
+            str(sink),
+            '-f',
+            'null',
+            '-',
+        ],
+        capture_output=True,
+        timeout=60,
+    )
+    assert decode.returncode == 0, decode.stderr
 
 
 @pytest.mark.parametrize(
@@ -306,7 +335,6 @@ def test_invalid_audio_bodies_are_refused(
 def test_malformed_extensible_wav_is_refused(
     tmp_path: Path, extensible_body: bytes
 ) -> None:
-    """An undecodable extensible header never yields a receipt."""
     payload = build_wav_bytes(extensible=True, extensible_body=extensible_body)
     transport = FakeTransport(FakeResponse(chunks=(payload,)))
     sink = tmp_path / 'raw.wav'
@@ -316,7 +344,6 @@ def test_malformed_extensible_wav_is_refused(
 
 
 def test_complete_extensible_pcm_wav_is_accepted(tmp_path: Path) -> None:
-    """A complete extensible PCM header passes with recorded facts."""
     payload = build_wav_bytes(
         extensible=True, extensible_body=extensible_extension()
     )
@@ -330,7 +357,6 @@ def test_complete_extensible_pcm_wav_is_accepted(tmp_path: Path) -> None:
 
 
 def test_read_timeout_is_uncertain(tmp_path: Path) -> None:
-    """An inactivity timeout leaves the provider outcome unknown."""
     transport = FakeTransport(httpx.ReadTimeout('peer went quiet'))
     with pytest.raises(TransportUncertainFailure) as raised:
         make_client(transport).synthesize(
@@ -340,7 +366,6 @@ def test_read_timeout_is_uncertain(tmp_path: Path) -> None:
 
 
 def test_connect_failure_is_definitive(tmp_path: Path) -> None:
-    """A connection that never formed is a definitive failure."""
     transport = FakeTransport(httpx.ConnectError('refused'))
     with pytest.raises(TransportConnectFailure):
         make_client(transport).synthesize(
@@ -349,7 +374,6 @@ def test_connect_failure_is_definitive(tmp_path: Path) -> None:
 
 
 def test_partial_body_is_uncertain(tmp_path: Path) -> None:
-    """A body cut mid stream stays visibly uncertain with evidence."""
     wav = build_wav_bytes(samples=16)
     transport = FakeTransport(
         FakeResponse(
@@ -365,7 +389,6 @@ def test_partial_body_is_uncertain(tmp_path: Path) -> None:
 
 
 def test_write_interruption_is_uncertain(tmp_path: Path) -> None:
-    """A failed request write phase never claims a known outcome."""
     transport = FakeTransport(httpx.WriteTimeout('stalled upload'))
     with pytest.raises(TransportUncertainFailure) as raised:
         make_client(transport).synthesize(
@@ -375,7 +398,6 @@ def test_write_interruption_is_uncertain(tmp_path: Path) -> None:
 
 
 def test_key_never_leaks_into_failure_output(tmp_path: Path) -> None:
-    """No failure path exposes the key in messages or evidence."""
     transport = FakeTransport(
         FakeResponse(
             chunks=(b'service error',),
@@ -394,13 +416,11 @@ def test_key_never_leaks_into_failure_output(tmp_path: Path) -> None:
 
 
 def test_empty_api_key_is_rejected() -> None:
-    """The client refuses to run with an empty key value."""
     with pytest.raises(SpeechRequestError, match='must not be empty'):
         SpeechClient('')
 
 
 def test_phase_timeouts_are_validated() -> None:
-    """Nonpositive or non finite phase values are rejected."""
     with pytest.raises(SpeechRequestError):
         PhaseTimeouts(read_seconds=0)
     with pytest.raises(SpeechRequestError):

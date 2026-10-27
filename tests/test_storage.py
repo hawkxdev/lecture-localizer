@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -19,6 +20,7 @@ from lecture_localizer.storage import (
     create_new_file,
     ensure_distinct_files,
     ensure_outside,
+    move_new_file,
     sha256_bytes,
     sha256_file,
     utc_now_iso,
@@ -233,3 +235,60 @@ def test_release_of_absent_lock_is_idempotent(tmp_path: Path) -> None:
     lock.path.unlink()
     lock.release()
     assert not (tmp_path / 'lock').exists()
+
+
+# --- No clobber immutable publication controls (review round 1 R4) ---
+
+
+def test_move_new_file_publishes_and_removes_source(tmp_path: Path) -> None:
+    source = tmp_path / 'source.bin'
+    source.write_bytes(b'artifact bytes')
+    target = tmp_path / 'target.bin'
+    move_new_file(source, target)
+    assert target.read_bytes() == b'artifact bytes'
+    assert not source.exists()
+
+
+def test_move_new_file_refuses_existing_real_file(tmp_path: Path) -> None:
+    source = tmp_path / 'source.bin'
+    source.write_bytes(b'new bytes')
+    target = tmp_path / 'target.bin'
+    target.write_bytes(b'existing bytes')
+    with pytest.raises(DestinationExistsError):
+        move_new_file(source, target)
+    assert target.read_bytes() == b'existing bytes'
+    assert source.read_bytes() == b'new bytes'
+
+
+def test_move_new_file_refuses_dangling_symlink(tmp_path: Path) -> None:
+    source = tmp_path / 'source.bin'
+    source.write_bytes(b'new bytes')
+    missing = tmp_path / 'missing.bin'
+    target = tmp_path / 'target.bin'
+    target.symlink_to(missing)
+    assert not target.exists()
+    with pytest.raises(DestinationExistsError):
+        move_new_file(source, target)
+    assert target.is_symlink()
+    assert not missing.exists()
+    assert source.read_bytes() == b'new bytes'
+
+
+def test_move_new_file_retains_source_when_destination_appears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / 'source.bin'
+    source.write_bytes(b'new bytes')
+    target = tmp_path / 'target.bin'
+    real_link = os.link
+
+    def racing_link(src: Any, dst: Any, **kwargs: Any) -> None:
+        Path(dst).write_bytes(b'race winner')
+        real_link(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, 'link', racing_link)
+    with pytest.raises(DestinationExistsError):
+        move_new_file(source, target)
+    assert target.read_bytes() == b'race winner'
+    assert source.read_bytes() == b'new bytes'
