@@ -2127,3 +2127,51 @@ def test_retry_blocks_when_recorded_snapshot_is_damaged(
             key_reader=trap_reader,
         )
     assert transport.requests == []
+
+
+# --- Same head R7 monetary ceiling controls ---
+
+
+def test_zero_cost_ceiling_refuses_subepsilon_estimates(
+    tmp_path: Path,
+) -> None:
+    job = _prepare_simple_job(tmp_path)
+    limits = SpendingLimits(
+        max_requests=10,
+        max_text_chars=100000,
+        max_cost_estimate=0.0,
+        price_per_request=1e-12,
+        price_basis='monetary probe basis',
+    )
+    transport = FakeTransport(AssertionError('transport must never be called'))
+    with pytest.raises(PaidExecutionDenied, match='estimated cost'):
+        execute_speech_operations(
+            job,
+            allow_paid=True,
+            limits=limits,
+            transport=transport,
+            key_reader=trap_reader,
+        )
+    assert transport.requests == []
+    assert not (job / 'operations.json').exists()
+
+
+def test_exact_cost_ceiling_permits_planned_requests(
+    tmp_path: Path,
+) -> None:
+    job = _prepare_simple_job(tmp_path)
+    limits = SpendingLimits(
+        max_requests=10,
+        max_text_chars=100000,
+        max_cost_estimate=0.02,
+        price_per_request=0.01,
+        price_basis='monetary probe basis',
+    )
+    result = execute_speech_operations(
+        job,
+        allow_paid=True,
+        limits=limits,
+        transport=success_transport(),
+        key_reader=lambda name: KEY_MATERIAL,
+    )
+    assert result.completed == ('s001', 's002')

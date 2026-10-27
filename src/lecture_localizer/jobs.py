@@ -65,6 +65,7 @@ SUPPORTED_AUDIO_CODECS = frozenset({'aac', 'pcm_s16le', 'mp3', 'opus'})
 HDR_TRANSFERS = frozenset({'smpte2084', 'arib-std-b67'})
 UNRESOLVED_OPERATION_STATES = frozenset({'reserved', 'started', 'uncertain'})
 OPERATIONS_SCHEMA = load_schema('operations-v1.schema.json')
+COST_COMPARISON_TOLERANCE = 1e-12
 SYNTHESIS_SETTINGS: dict[str, Any] = {
     'provider': 'xai',
     'voice': 'eve',
@@ -1596,7 +1597,11 @@ def _require_execution_permission(
             f'planning {text_chars} text characters exceeds the explicit'
             f' limit of {limits.max_text_chars}; no request was sent',
         )
-    if estimated_cost > limits.max_cost_estimate + 1e-9:
+    if (
+        estimated_cost
+        > limits.max_cost_estimate
+        + abs(limits.max_cost_estimate) * COST_COMPARISON_TOLERANCE
+    ):
         raise PaidExecutionDenied(
             'limits_exceeded',
             f'estimated cost {estimated_cost} above the explicit limit'
