@@ -11,6 +11,8 @@ from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from lecture_localizer.media import (
     CREDENTIAL_ENV_PATTERN,
     scrubbed_environment,
@@ -210,6 +212,17 @@ DEFAULT_CUES = [
     (1000, 2000, 'Second spoken line.'),
 ]
 
+_CACHED_MEDIA_DURATIONS = frozenset((2.0, 2.2))
+_MEDIA_SEEDS: dict[tuple[object, ...], bytes] = {}
+
+
+@pytest.fixture(scope='session', autouse=True)
+def media_seed_session() -> Iterator[None]:
+    """Limit synthetic seeds to one test session."""
+    _MEDIA_SEEDS.clear()
+    yield
+    _MEDIA_SEEDS.clear()
+
 
 def make_media(
     destination: Path,
@@ -221,12 +234,43 @@ def make_media(
     extension: str = 'mp4',
     seconds: float = 2.0,
     extra_args: tuple[str, ...] = (),
+    use_cache: bool = True,
 ) -> Path:
     """Render one small synthetic media fixture with the real FFmpeg."""
     ffmpeg = shutil.which('ffmpeg')
     if ffmpeg is None:
         raise RuntimeError('required setup prerequisite: ffmpeg absent')
     destination.parent.mkdir(parents=True, exist_ok=True)
+    cacheable = (
+        use_cache
+        and destination.suffix == '.mp4'
+        and extension == 'mp4'
+        and video_codec == 'libx264'
+        and pix_fmt == 'yuv420p'
+        and audio_args == ('-c:a', 'aac', '-b:a', '96k')
+        and extra_audio_inputs == 0
+        and seconds in _CACHED_MEDIA_DURATIONS
+        and not extra_args
+    )
+    tool = Path(ffmpeg).stat()
+    cache_key = (
+        ffmpeg,
+        tool.st_dev,
+        tool.st_ino,
+        tool.st_size,
+        tool.st_mtime_ns,
+        destination.suffix,
+        extension,
+        video_codec,
+        pix_fmt,
+        audio_args,
+        extra_audio_inputs,
+        seconds,
+        extra_args,
+    )
+    if cacheable and cache_key in _MEDIA_SEEDS:
+        destination.write_bytes(_MEDIA_SEEDS[cache_key])
+        return destination
     command = [
         ffmpeg,
         '-hide_banner',
@@ -275,6 +319,8 @@ def make_media(
     )
     if result.returncode != 0:
         raise RuntimeError(f'ffmpeg failed: {result.stderr}')
+    if cacheable:
+        _MEDIA_SEEDS[cache_key] = destination.read_bytes()
     return destination
 
 

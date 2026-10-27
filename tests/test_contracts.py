@@ -60,8 +60,11 @@ def test_strict_parse_rejects_non_utf8_bytes() -> None:
 def test_packaged_schemas_are_valid_draft_2020_12() -> None:
     from lecture_localizer.contracts import JOB_SCHEMA, TRANSLATION_SCHEMA
 
-    Draft202012Validator.check_schema(TRANSLATION_SCHEMA)
-    Draft202012Validator.check_schema(JOB_SCHEMA)
+    for schema in (TRANSLATION_SCHEMA, JOB_SCHEMA):
+        assert schema['$schema'] == (
+            'https://json-schema.org/draft/2020-12/schema'
+        )
+        Draft202012Validator.check_schema(schema)
 
 
 def test_valid_translation_loads(tmp_path: Path) -> None:
@@ -256,6 +259,11 @@ def test_integral_float_cue_is_normalized(tmp_path: Path) -> None:
     document = load_translation_document(path)
     assert document.segments[0].source_cues == (1,)
     assert document.segments[1].source_cues == (2,)
+    assert all(
+        type(cue) is int
+        for segment in document.segments
+        for cue in segment.source_cues
+    )
 
 
 def test_fractional_cue_is_rejected_by_schema(tmp_path: Path) -> None:

@@ -444,7 +444,7 @@ def test_prepare_media_child_gets_scrubbed_environment(
     monkeypatch.setenv('XAI_API_KEY', 'sk-child-canary')
     kit = tmp_path / 'kit'
     kit.mkdir()
-    video = make_media(kit / 'lecture.mp4')
+    video = make_media(kit / 'lecture.mp4', use_cache=False)
     srt = write_srt(kit / 'lecture.srt', DEFAULT_CUES)
     translation = write_translation(
         kit / 'translation.json', video, srt, default_segments()
