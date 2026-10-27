@@ -2,7 +2,7 @@
 
 A proposed CLI for localizing lecture videos while preserving the original media.
 
-**Status:** Development. An installable package with local tool diagnostics is available; the localization pipeline itself is not implemented yet.
+**Status:** Development. An installable package with local tool diagnostics and validated persistent jobs is available; speech synthesis and output assembly are not implemented yet.
 
 ## Implemented: `lecture-localizer doctor`
 
@@ -34,6 +34,32 @@ Synthetic, rights-safe media fixtures for local experiments and checks are gener
 ```
 
 The script refuses to write into an existing directory and creates a deterministic synthetic MP4 (tone and test pattern) plus a two-cue SRT file. It launches FFmpeg with the same credential-scrubbed environment as the rest of the media tooling and therefore needs the package installed in the environment that runs it.
+
+## Implemented: `lecture-localizer prepare` and `status`
+
+`prepare` validates the complete input set and creates or resumes a persistent job directory. It never contacts a speech provider and never reads provider credentials.
+
+```sh
+.venv/bin/lecture-localizer prepare \
+  --video LECTURE.mp4 \
+  --source-srt LECTURE.srt \
+  --translation translation.json \
+  --job /path/to/job-directory \
+  --output /path/to/new-output.mp4 \
+  [--source-audio INDEX] \
+  [--settings /path/to/settings.json]
+.venv/bin/lecture-localizer status --job /path/to/job-directory [--json]
+```
+
+`prepare` verifies the video and SRT hashes recorded in the translation JSON, parses source cues by ordinal position, derives positive nonoverlapping segment windows, inspects the actual media streams with ffprobe and requires an explicit `--source-audio INDEX` whenever the input carries more than one audio track. The job directory keeps a versioned `manifest.json`, immutable per revision snapshots of the full translation, the resolved narration text and the source cue text and times, and a one writer `lock` file. Repeated preparation with unchanged inputs reports `unchanged` and writes nothing; changed narration or translation text updates the stage signatures recorded in the manifest so later stages can tell preserved work from work that must be redone.
+
+When the video or SRT bytes change, resumption requires a translation whose source hashes match the new inputs. Supplying that refreshed translation is an explicit rebind: `prepare` accepts it, recomputes the affected windows, fitting, subtitle and container identities from the actual changed inputs, and keeps the earlier immutable revisions and artifacts in place. A translation that still carries the old hashes is rejected. Corrupt recorded cache artifacts make `prepare` fail with exit 3; `status` stays readable and reports the damage. The job directory and the output path must stay outside this application source checkout: job data is never product content, and the distribution gate rejects runtime data found under the package root.
+
+`status` is read only. It reports the recorded binding, media facts, stage states and blocked conditions; a readable job with problems exits 0 while explicitly reporting them. Corrupt or missing snapshots and cached artifacts are reported and never silently reconstructed.
+
+Exit codes follow the implementation plan: 0 success, 2 usage error, 3 invalid input or contract (hash or cue mismatch, unsupported media profile, destination collision, unknown job version), 7 tool or filesystem failure including lock contention, 130 interruption. The output path must not exist and must stay outside the job directory; sources must be distinct files outside the job directory.
+
+Settings files keep the documented tool fields and now accept the job policy fields `fitting_max_speedup` (default 1.2) and the startup track defaults `startup_narration_default`, `startup_original_default`, `startup_subtitles_default` and `startup_subtitles_forced`. Unknown fields are still rejected and no credentials belong in settings.
 
 ## Proposed workflow
 

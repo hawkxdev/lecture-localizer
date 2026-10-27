@@ -17,6 +17,7 @@ Use one Git root. Code belongs in `src/`, tests in `tests/`, utilities in `scrip
 - The first commit requires explicit owner approval of the prepared result, including an empty seed. Initialization permission does not replace it.
 - Repository creation, new remotes, publication, deployment and paid provider calls require explicit authorization.
 - Preserve source media and existing outputs. Keep credentials, personal data, restricted course assets and provider responses outside Git and distribution; use original or rights-cleared synthetic fixtures. Review donor source and licensing before importing code.
+- Job directories and localized outputs are user data and stay outside this source checkout; the distribution gate rejects runtime data under the package root. Never delete or migrate user job data automatically.
 
 ## Languages
 

@@ -81,10 +81,15 @@ def test_creates_fixtures_in_directory_with_special_characters(
     srt = destination / 'synthetic-example.srt'
     assert media.is_file() and media.stat().st_size > 0
     assert srt.read_text(encoding='utf-8') == EXPECTED_SRT
-    for line in result.stdout.splitlines():
+    lines = result.stdout.splitlines()
+    assert len(lines) == 2
+    reported = set()
+    for line in lines:
         digest, _, created = line.partition('  ')
         assert Path(created) in (media, srt)
         assert digest == sha256(Path(created))
+        reported.add(Path(created))
+    assert reported == {media, srt}
 
 
 def test_refuses_existing_destination(tmp_path: Path) -> None:
@@ -150,7 +155,8 @@ def test_media_matches_the_approved_profile(tmp_path: Path) -> None:
             '-v',
             'error',
             '-show_entries',
-            'stream=codec_name,codec_type,width,height:stream_disposition',
+            'stream=codec_name,codec_type,width,height,pix_fmt:'
+            'stream_disposition',
             '-of',
             'json',
             str(destination / 'synthetic-example.mp4'),
@@ -165,5 +171,6 @@ def test_media_matches_the_approved_profile(tmp_path: Path) -> None:
     video = next(s for s in streams if s['codec_type'] == 'video')
     audio = next(s for s in streams if s['codec_type'] == 'audio')
     assert video['codec_name'] == 'h264'
+    assert video['pix_fmt'] == 'yuv420p'
     assert video['width'] == 320 and video['height'] == 240
     assert audio['codec_name'] == 'aac'
