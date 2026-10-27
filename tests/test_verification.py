@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import shlex
 import shutil
 import time
 from collections.abc import Generator
@@ -26,6 +25,7 @@ from container_fixtures import (
 )
 
 from conftest import make_media, require_real_media
+from lecture_localizer.media import MediaToolError
 from lecture_localizer.mux import TrackProfile, build_candidate
 from lecture_localizer.settings import Settings
 from lecture_localizer.verification import (
@@ -207,7 +207,9 @@ def test_verify_missing_candidate_is_a_failed_report(
     ('declared_end_ms', 'should_pass'),
     [
         (2000, True),
-        (2005, True),
+        (2005, False),
+        (2001, True),
+        (2002, False),
         (1985, True),
         (2080, False),
         (2500, False),
@@ -528,36 +530,26 @@ def test_verify_preserves_nonzero_input_timeline(tmp_path: Path) -> None:
 def test_packet_fingerprint_streaming_is_bounded(
     tmp_path: Path,
 ) -> None:
-    """The first fingerprint must not require the whole child output."""
-    real_ffprobe = shutil.which('ffprobe')
-    assert real_ffprobe is not None
-    slow_ffprobe = tmp_path / 'tooling' / 'bounded-ffprobe'
-    slow_ffprobe.parent.mkdir(parents=True, exist_ok=True)
-    script = (
-        '#!/bin/sh\n'
-        "printf '%s\\n' \
-"
-        '  \'packets.packet.0.pts_time="0.000000"\' \
-'
-        '  \'packets.packet.0.dts_time="0.000000"\' \
-'
-        '  \'packets.packet.0.duration_time="0.100000"\' \
-'
-        '  \'packets.packet.0.size="256"\' \
-'
-        '  \'packets.packet.0.data="0000"\'\n'
-        "printf '%s\\n' 'packets.packet.1.pts_time=\"1.000000\"'\n"
-        'sleep 3\n'
-        "printf '%s\\n' 'packets.packet.1.dts_time=\"1.000000\"' \
-"
-        '  \'packets.packet.1.duration_time="0.100000"\' \
-'
-        '  \'packets.packet.1.size="256"\' \
-'
-        '  \'packets.packet.1.data="1111"\'\n'
-        f'exec {shlex.quote(real_ffprobe)} "$@"\n'
+    slow_ffprobe = tmp_path / 'bounded-ffprobe'
+    fields = {
+        'pts_time': '0.000000',
+        'dts_time': '0.000000',
+        'duration_time': '0.100000',
+        'size': '256',
+        'data_hash': 'SHA256:' + 'a' * 64,
+    }
+    rows = ''.join(
+        f'packets.packet.0.{name}={json.dumps(value)}\n'
+        for name, value in fields.items()
     )
-    slow_ffprobe.write_text(script, encoding='utf-8')
+    slow_ffprobe.write_text(
+        '#!/usr/bin/env python3\n'
+        'import sys, time\n'
+        f'sys.stdout.write({rows!r})\n'
+        'print(\'packets.packet.1.pts_time="1.000000"\', flush=True)\n'
+        'time.sleep(3)\n',
+        encoding='utf-8',
+    )
     slow_ffprobe.chmod(0o755)
     from lecture_localizer.verification import _stream_packet_fingerprints
 
@@ -575,9 +567,8 @@ def test_packet_fingerprint_streaming_is_bounded(
         '0.000000',
         '0.100000',
         '256',
-        first[4],
+        'a' * 64,
     )
-    assert len(first[4]) == 64
     assert elapsed < 2.0, elapsed
     cast(Generator[tuple[str, ...], None, None], fingerprints).close()
 
@@ -768,3 +759,148 @@ def test_verify_accepts_mkv_and_mov_sources(tmp_path: Path) -> None:
         for name in ('video_packets', 'copied_original_packets'):
             check = _check(report, name)
             assert check.ok, (extension, check.detail)
+
+
+@pytest.mark.parametrize('seconds', [1.99, 1.97])
+def test_verify_rejects_small_missing_narration_extent(
+    tmp_path: Path, seconds: float
+) -> None:
+    require_real_media()
+    tracks = prepared_tracks(tmp_path)
+    encode_narration_aac(tracks['narration'], seconds=seconds)
+    destination = tmp_path / 'candidate.mp4'
+    build_candidate(candidate_request(tracks, destination), Settings())
+    report = verify_candidate(destination, _expectation(tracks), Settings())
+    assert not report.ok
+    assert 'narration_duration' in report.failed_checks
+
+
+@pytest.mark.parametrize('seconds', [1.99, 1.97])
+def test_verify_rejects_small_missing_converted_original_extent(
+    tmp_path: Path, seconds: float
+) -> None:
+    require_real_media()
+    tracks = prepared_tracks(tmp_path)
+    encode_original_aac(tracks['converted'], seconds=seconds)
+    destination = tmp_path / 'candidate.mp4'
+    build_candidate(
+        candidate_request(tracks, destination, copied_stream_index=None),
+        Settings(),
+    )
+    expectation = CandidateExpectation(
+        video_source=tracks['video'],
+        original_packet_source=tracks['converted'],
+        original_packet_stream_index=0,
+        original_is_copied=False,
+        narration_packet_source=tracks['narration'],
+        original_channels=2,
+        original_sample_rate=48000,
+        original_end_ms=2000,
+        narration_end_ms=2000,
+        english_srt_path=tracks['english'],
+        russian_srt_path=tracks['russian'],
+        profile=TrackProfile(),
+    )
+    report = verify_candidate(destination, expectation, Settings())
+    assert not report.ok
+    assert 'original_duration' in report.failed_checks
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        ('pts_time', 'nan'),
+        ('pts_time', 'N/A'),
+        ('duration_time', 'nan'),
+        ('size', '0'),
+        ('payload', ''),
+        ('payload', 'invalid digest'),
+    ],
+)
+def test_verify_rejects_unusable_packet_values(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    require_real_media()
+    tracks, destination = _candidate(tmp_path)
+    real_ffprobe = shutil.which('ffprobe')
+    assert real_ffprobe is not None
+    fields = {
+        'pts_time': '0.0',
+        'dts_time': '0.0',
+        'duration_time': '0.1',
+        'size': '256',
+        'data': 'packet bytes',
+        'data_hash': 'SHA256:' + 'a' * 64,
+    }
+    if field == 'payload':
+        fields['data'] = value
+        fields['data_hash'] = value
+    else:
+        fields[field] = value
+    lines = ''.join(
+        f'packets.packet.0.{name}={json.dumps(content)}\n'
+        for name, content in fields.items()
+    )
+    wrapper = tmp_path / 'unusable-packet-probe'
+    wrapper.write_text(
+        '#!/usr/bin/env python3\n'
+        'import os, sys\n'
+        'if "-show_packets" in sys.argv:\n'
+        f'    sys.stdout.write({lines!r})\n'
+        'else:\n'
+        f'    os.execv({real_ffprobe!r}, '
+        f'[{real_ffprobe!r}] + sys.argv[1:])\n',
+        encoding='utf-8',
+    )
+    wrapper.chmod(0o755)
+    report = verify_candidate(
+        destination,
+        _expectation(tracks),
+        Settings(ffprobe_path=str(wrapper)),
+    )
+    assert not report.ok
+    for name in _PACKET_CHECKS:
+        check = _check(report, name)
+        assert not check.ok
+        assert 'unusable packet output' in check.detail
+
+
+def test_packet_deadline_covers_child_after_stdout_closes(
+    tmp_path: Path,
+) -> None:
+    import os
+
+    from lecture_localizer.verification import _stream_packet_fingerprints
+
+    pid_file = tmp_path / 'child.pid'
+    fields = {
+        'pts_time': '0.0',
+        'dts_time': 'N/A',
+        'duration_time': '0.1',
+        'size': '256',
+        'data_hash': 'SHA256:' + 'a' * 64,
+    }
+    rows = ''.join(
+        f'packets.packet.0.{name}={json.dumps(value)}\n'
+        for name, value in fields.items()
+    )
+    wrapper = tmp_path / 'closed-stdout-probe'
+    wrapper.write_text(
+        '#!/usr/bin/env python3\n'
+        'import os, sys, time\n'
+        'from pathlib import Path\n'
+        f'Path({str(pid_file)!r}).write_text(str(os.getpid()))\n'
+        f'sys.stdout.write({rows!r})\n'
+        'sys.stdout.flush()\n'
+        'os.close(sys.stdout.fileno())\n'
+        'time.sleep(5)\n',
+        encoding='utf-8',
+    )
+    wrapper.chmod(0o755)
+    started = time.monotonic()
+    with pytest.raises(MediaToolError, match='stalled packet'):
+        list(_stream_packet_fingerprints(wrapper, Path('ignored'), '0', 1.0))
+    assert time.monotonic() - started < 3.0
+    assert pid_file.is_file(), 'child startup must be observed by this control'
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)

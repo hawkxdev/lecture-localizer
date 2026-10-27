@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import selectors
 import subprocess
 import tempfile
@@ -32,7 +33,7 @@ AAC_FRAME_SAMPLES = 1024
 PRIMING_TOLERANCE_FRAMES = 2
 ARTIFACT_ROUNDING_MS = 1
 FALLBACK_TICK_S = 0.001
-_PACKET_FIELDS = ('pts_time', 'dts_time', 'duration_time', 'size', 'data')
+_PACKET_FIELDS = ('pts_time', 'dts_time', 'duration_time', 'size', 'data_hash')
 
 
 def _deregister(
@@ -43,7 +44,7 @@ def _deregister(
         selector_object.unregister(descriptor)
 
 
-_ABSENT_TIMING = ('n/a', '', 'none', 'nan', '?')
+_ABSENT_TIMING = ('n/a',)
 
 _EXPECTED_ROLES = (
     ('video', 'h264'),
@@ -214,7 +215,10 @@ def _stream_packet_fingerprints(
         '-select_streams',
         selector,
         '-show_packets',
-        '-show_data',
+        '-show_data_hash',
+        'sha256',
+        '-show_entries',
+        'packet=pts_time,dts_time,duration_time,size,data_hash',
         '-of',
         'flat',
         str(media_path),
@@ -293,7 +297,14 @@ def _stream_packet_fingerprints(
             _deregister(selector_object, descriptor)
             registered = False
             process.stdout.close()
-            return_code = process.wait(timeout=timeout_seconds)
+            try:
+                return_code = process.wait(
+                    timeout=max(0.0, deadline - time.monotonic())
+                )
+            except subprocess.TimeoutExpired:
+                raise fail(
+                    'stalled packet process after output ended'
+                ) from None
             stderr_file.seek(0)
             noise = stderr_file.read().decode('utf-8', 'replace').strip()
             if return_code != 0 or noise:
@@ -307,6 +318,9 @@ def _stream_packet_fingerprints(
             process.kill()
             process.wait()
             raise
+        finally:
+            selector_object.close()
+            process.stdout.close()
 
 
 def _fingerprint(fields: dict[str, str], media_path: Path) -> tuple[str, ...]:
@@ -321,12 +335,38 @@ def _fingerprint(fields: dict[str, str], media_path: Path) -> tuple[str, ...]:
                 f'unusable packet output for {media_path}: packet is'
                 f' missing {field_name}'
             )
+    for field_name in ('pts_time', 'dts_time', 'duration_time'):
+        if (
+            field_name == 'dts_time'
+            and fields[field_name].lower() in _ABSENT_TIMING
+        ):
+            continue
+        try:
+            value = float(fields[field_name])
+        except ValueError:
+            value = math.nan
+        if not math.isfinite(value) or (
+            field_name == 'duration_time' and value <= 0
+        ):
+            raise MediaToolError(
+                f'unusable packet output for {media_path}: invalid'
+                f' {field_name} {fields[field_name]!r}'
+            )
+    if not fields['size'].isdigit() or int(fields['size']) <= 0:
+        raise MediaToolError(
+            f'unusable packet output for {media_path}: invalid packet size'
+        )
+    digest = re.fullmatch(r'SHA256:([0-9a-fA-F]{64})', fields['data_hash'])
+    if digest is None:
+        raise MediaToolError(
+            f'unusable packet output for {media_path}: invalid payload digest'
+        )
     return (
         fields['pts_time'],
         fields['dts_time'],
         fields['duration_time'],
         fields['size'],
-        hashlib.sha256(fields['data'].encode('utf-8')).hexdigest(),
+        digest.group(1).lower(),
     )
 
 
@@ -854,7 +894,10 @@ def _check_narration_duration(
             detail=mismatch,
             measured=measured,
         )
-    if candidate_ms < expectation.narration_end_ms - PRIMING_TOLERANCE_MS:
+    if (
+        min(candidate_ms, artifact_ms)
+        < expectation.narration_end_ms - ARTIFACT_ROUNDING_MS
+    ):
         return CheckResult(
             name='narration_duration',
             ok=False,
@@ -932,7 +975,10 @@ def _check_original_duration(
             detail=mismatch,
             measured=measured,
         )
-    if candidate_ms < expectation.original_end_ms - PRIMING_TOLERANCE_MS:
+    if (
+        min(candidate_ms, artifact_ms)
+        < expectation.original_end_ms - ARTIFACT_ROUNDING_MS
+    ):
         return CheckResult(
             name='original_duration',
             ok=False,
