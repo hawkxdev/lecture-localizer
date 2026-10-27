@@ -88,6 +88,7 @@ Rejected alternatives: Implicit stream selection, forced subtitles, global playe
 
 ## Interfaces and command boundaries
 
+- The [parallel implementation contract](parallel-contract.md) fixes the Stage 3/4/container handoffs, common-state owner and final integration dependencies. It refines the execution sequence without changing the approved scenario or granting implementation authority.
 - CLI -> validated settings/contracts/media facts -> jobs. Jobs owns runtime execution state; storage owns filesystem durability and immutable artifact publication.
 - Jobs -> xai_client only for explicit paid execution. The transport consumes an approved request and sink, not the whole manifest; no hidden provider access from doctor, prepare, assemble or status.
 - Jobs -> audio -> mux -> verification. Media supplies shared tool/probe services, not provider credentials. Subtitles consume full translation independently of narration.
@@ -153,7 +154,7 @@ Exit evidence: Valid inputs create an inspectable job; invalid/mismatched inputs
 
 Requirements: [spec: technical-basis](spec.md#technical-basis), [spec: speech-backend-and-delivery-boundary](spec.md#speech-backend-and-delivery-boundary).
 
-Dependencies: Stage 2. Production/utility module radius: xai_client.py, jobs.py, storage.py, settings.py.
+Dependencies: delivered Stage 2 and the [parallel contract](parallel-contract.md). This lane may run alongside standalone Stage 4 and Stage 5 container work, and alone owns shared job/journal/settings/schema changes during that interval. Production/utility module radius: xai_client.py, jobs.py, storage.py, settings.py.
 
 - **S3.1** Implement the documented direct synchronous xAI mode with verified TLS and explicit finite connect/read/write/pool timeouts. These are phase/inactivity controls, not a guaranteed maximum wall-clock duration for the entire response. No automatic retry/fallback or personal access lookup.
 - **S3.2** Stream and preserve the complete response, validate response status/type and decodable WAV before committing its integrity record. Bind the exact frozen text sent, request signature and response hash; retain failures as distinct private evidence. Never reconstruct past spoken-input text from a mutable external JSON.
@@ -168,7 +169,7 @@ Exit evidence: All transport and job-transition contracts pass offline tests. Ca
 
 Requirements: [spec: speech-timing-policy](spec.md#speech-timing-policy), [spec: technical-basis](spec.md#technical-basis).
 
-Dependencies: Stage 3. Production/utility module radius: audio.py, jobs.py, storage.py, media.py.
+Dependencies: delivered Stage 2 and the [parallel contract](parallel-contract.md); standalone audio work uses retained synthetic WAV and may run alongside Stage 3. The parallel lane owns audio.py; shared jobs/storage/media wiring waits for final integration after Stage 3. Overall production/utility module radius: audio.py, jobs.py, storage.py, media.py.
 
 - **S4.1** Normalize retained full responses to the approved working PCM without altering their original bytes; persist exact format, hash and frame counts.
 - **S4.2** Implement integer-sample windows, configured speedup checks and mandatory actual output-length checks. Preserve ordinary PCM and reject excessive or post-fit overflow without trimming.
@@ -183,7 +184,7 @@ Exit evidence: Complete segment samples fit their windows or produce an actionab
 
 Requirements: [spec: output-profile-and-reference-players](spec.md#output-profile-and-reference-players), [spec: startup-track-defaults](spec.md#startup-track-defaults), [spec: outputs](spec.md#outputs).
 
-Dependencies: Stage 4. Production/utility module radius: mux.py, verification.py, jobs.py, cli.py, media.py.
+Dependencies: S5.1-S5.3 container core may start from delivered Stage 2 and the [parallel contract](parallel-contract.md), using synthetic prepared AAC/SRT. S5.4-S5.5 final publication/CLI integration waits for accepted Stage 3, Stage 4 and that container core. The core owns mux.py, verification.py and necessary subtitles.py work; the lead/final integration owner reconciles common modules and documentation. Overall production/utility module radius: mux.py, verification.py, jobs.py, cli.py, media.py, subtitles.py.
 
 - **S5.1** Build explicit selected-video/original-audio/narration/EN/RU mapping and metadata. No automatic first-audio choice or source removal.
 - **S5.2** Apply approved defaults through actual track IDs and inspect the persisted flags: Russian audio default, English selectable, both subtitle languages off/not forced; never change player preferences.
