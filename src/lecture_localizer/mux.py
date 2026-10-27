@@ -227,6 +227,7 @@ def _ffmpeg_argv(
     video_map: str,
     original_map: str,
     narration_input: int,
+    output_path: Path,
 ) -> tuple[str, ...]:
     """Build the explicit five stream ffmpeg assembly command."""
     inputs = [str(request.video_path)]
@@ -247,8 +248,12 @@ def _ffmpeg_argv(
         argv.extend(['-i', path])
     for map_spec in maps:
         argv.extend(['-map', map_spec])
+    # copyts workaround: without it the mov muxer rebases stream copy
+    # starts to zero, shifting nonzero input timelines like 2.000000 to
+    # 0.023047 and breaking original packet timeline preservation.
     argv.extend(
         [
+            '-copyts',
             '-c:v',
             'copy',
             '-c:a',
@@ -272,7 +277,7 @@ def _ffmpeg_argv(
             '-disposition:s:1',
             '0',
             '-y',
-            str(request.destination),
+            str(output_path),
         ]
     )
     return tuple(argv)
@@ -335,32 +340,67 @@ def _profile_operations(profile: TrackProfile, ids: TrackIds) -> list[str]:
 
 def _apply_track_flags(
     mp4box: Path,
-    request: MuxRequest,
+    source: Path,
+    output: Path,
+    profile: TrackProfile,
     ids: TrackIds,
     timeout_seconds: float,
 ) -> tuple[str, ...]:
-    """Apply profile flags by track id and persist into destination."""
-    fd, temp_name = tempfile.mkstemp(
-        dir=request.destination.parent,
-        prefix=f'.{request.destination.name}.mp4box-',
-        suffix='.partial',
-    )
-    os.close(fd)
-    temp = Path(temp_name)
+    """Apply profile flags by track id into the owned output file."""
     argv = (
         str(mp4box),
-        *_profile_operations(request.profile, ids),
-        str(request.destination),
+        *_profile_operations(profile, ids),
+        str(source),
         '-out',
-        str(temp),
+        str(output),
     )
-    try:
-        checked_run_strict(argv, timeout_seconds)
-        os.replace(temp, request.destination)
-    except BaseException:
-        temp.unlink(missing_ok=True)
-        raise
+    checked_run_strict(argv, timeout_seconds)
     return argv
+
+
+def _owned_temp(destination: Path, marker: str) -> Path:
+    """Create one owned empty mp4 temporary beside the destination.
+
+    The mp4 suffix is required because FFmpeg selects its muxer from
+    the output file extension and the MP4Box writer expects it too.
+    """
+    fd, name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f'.{destination.name}.{marker}-',
+        suffix='.mp4',
+    )
+    os.close(fd)
+    return Path(name)
+
+
+def _remove_owned(path: Path | None) -> None:
+    """Remove one owned temporary file when it still exists."""
+    if path is not None:
+        path.unlink(missing_ok=True)
+
+
+def _deliver_no_clobber(staged: Path, destination: Path) -> None:
+    """Publish the staged candidate without overwriting anything.
+
+    The hard link is the atomic no-clobber handoff: it succeeds only
+    when the destination is still absent, so a file created by a racer
+    or a symlink placed at the destination stays untouched and the
+    build fails instead of replacing foreign bytes.
+    """
+    try:
+        os.link(staged, destination)
+    except FileExistsError as error:
+        raise MuxError(
+            'the staging destination appeared during assembly; it is'
+            f' preserved untouched and the candidate was not delivered:'
+            f' {destination}',
+            kind='destination',
+        ) from error
+    except OSError as error:
+        raise MuxError(
+            f'could not deliver the candidate to {destination}: {error}',
+            kind='destination',
+        ) from error
 
 
 def build_candidate(request: MuxRequest, settings: Settings) -> MuxResult:
@@ -369,11 +409,15 @@ def build_candidate(request: MuxRequest, settings: Settings) -> MuxResult:
     The video stream and original audio stream are copied without
     re-encoding, narration audio is copied as prepared, both subtitle
     files become mov_text tracks, and startup flags are applied through
-    actual MP4Box track identifiers. Inputs and existing files stay
-    untouched; only the destination and owned temporary files change.
+    actual MP4Box track identifiers. The candidate is built in owned
+    temporary files and delivered with an atomic no-clobber link, so
+    inputs, existing destinations and foreign files created during
+    assembly stay untouched; only owned staging files are cleaned.
     """
     _validate_profile(request.profile)
     _validate_paths(request)
+    ffmpeg_temp: Path | None = None
+    mp4box_temp: Path | None = None
     try:
         ffmpeg = discover_tool('ffmpeg', settings.ffmpeg_path)
         ffprobe = discover_tool('ffprobe', settings.ffprobe_path)
@@ -385,16 +429,33 @@ def build_candidate(request: MuxRequest, settings: Settings) -> MuxResult:
         video_map, original_map, narration_input = _input_layout(
             request, streams
         )
+        ffmpeg_temp = _owned_temp(request.destination, 'ffmpeg')
+        mp4box_temp = _owned_temp(request.destination, 'mp4box')
         ffmpeg_argv = _ffmpeg_argv(
-            request, ffmpeg, video_map, original_map, narration_input
+            request,
+            ffmpeg,
+            video_map,
+            original_map,
+            narration_input,
+            ffmpeg_temp,
         )
         checked_run_strict(ffmpeg_argv, timeout_seconds)
-        ids = _resolve_track_ids(mp4box, request.destination, timeout_seconds)
-        mp4box_argv = _apply_track_flags(mp4box, request, ids, timeout_seconds)
+        ids = _resolve_track_ids(mp4box, ffmpeg_temp, timeout_seconds)
+        mp4box_argv = _apply_track_flags(
+            mp4box,
+            ffmpeg_temp,
+            mp4box_temp,
+            request.profile,
+            ids,
+            timeout_seconds,
+        )
+        _deliver_no_clobber(mp4box_temp, request.destination)
     except BaseException:
-        if request.destination.is_file():
-            request.destination.unlink()
+        _remove_owned(ffmpeg_temp)
+        _remove_owned(mp4box_temp)
         raise
+    _remove_owned(ffmpeg_temp)
+    _remove_owned(mp4box_temp)
     return MuxResult(
         destination=request.destination,
         ffmpeg_argv=ffmpeg_argv,

@@ -13,6 +13,7 @@ from container_fixtures import (
     RU_CUES,
     candidate_request,
     encode_narration_aac,
+    make_shifted_source,
     make_two_audio_video,
     packet_fingerprints,
     prepared_tracks,
@@ -177,10 +178,16 @@ def test_build_candidate_maps_explicit_streams(
     assert _mapped_values(ffmpeg, '-disposition:a:1') == ['0']
     assert _mapped_values(ffmpeg, '-disposition:s:0') == ['0']
     assert _mapped_values(ffmpeg, '-disposition:s:1') == ['0']
-    assert ffmpeg[-1] == str(destination)
+    assert ffmpeg[-1].startswith(
+        str(destination.parent / f'.{destination.name}.ffmpeg-')
+    )
+    assert ffmpeg[-1].endswith('.mp4')
     flag_pass = _flag_pass(fake_env['dump'])
     assert _mapped_values(flag_pass, '-enable') == ['5']
     assert _mapped_values(flag_pass, '-disable') == ['3', '9', '2']
+    assert _mapped_values(flag_pass, '-out')[0].startswith(
+        str(destination.parent / f'.{destination.name}.mp4box-')
+    )
     assert result.track_ids == TrackIds(
         video=7,
         original_audio=3,
@@ -295,6 +302,11 @@ def test_build_candidate_rejects_absent_copied_stream(
     assert error.value.kind == 'input'
 
 
+def _assert_no_staging_leftovers(tmp_path: Path, name: str) -> None:
+    leftovers = list(tmp_path.glob(f'.{name}.*'))
+    assert leftovers == []
+
+
 def test_build_candidate_cleans_partial_candidate_on_ffmpeg_failure(
     tmp_path: Path,
     fake_env: dict[str, Any],
@@ -309,6 +321,7 @@ def test_build_candidate_cleans_partial_candidate_on_ffmpeg_failure(
             _fake_settings(fake_env['tools']),
         )
     assert not destination.exists()
+    _assert_no_staging_leftovers(tmp_path, 'candidate.mp4')
 
 
 def test_build_candidate_cleans_partial_candidate_on_mp4box_failure(
@@ -325,6 +338,7 @@ def test_build_candidate_cleans_partial_candidate_on_mp4box_failure(
             _fake_settings(fake_env['tools']),
         )
     assert not destination.exists()
+    _assert_no_staging_leftovers(tmp_path, 'candidate.mp4')
 
 
 def test_build_candidate_cleans_partial_candidate_on_ffprobe_failure(
@@ -341,6 +355,64 @@ def test_build_candidate_cleans_partial_candidate_on_ffprobe_failure(
             _fake_settings(fake_env['tools']),
         )
     assert not destination.exists()
+    _assert_no_staging_leftovers(tmp_path, 'candidate.mp4')
+
+
+def test_build_candidate_preserves_foreign_file_from_failed_probe(
+    tmp_path: Path,
+    fake_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _stub_inputs(tmp_path)
+    destination = tmp_path / 'candidate.mp4'
+    monkeypatch.setenv('FAKE_CREATE_PATH', str(destination))
+    monkeypatch.setenv('FAKE_FFPROBE_EXIT', '1')
+    with pytest.raises(MediaToolError):
+        build_candidate(
+            _stub_request(paths, destination),
+            _fake_settings(fake_env['tools']),
+        )
+    assert destination.read_bytes() == (
+        b'foreign bytes created during assembly'
+    )
+    _assert_no_staging_leftovers(tmp_path, 'candidate.mp4')
+
+
+def test_build_candidate_never_clobbers_raced_destination(
+    tmp_path: Path,
+    fake_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _stub_inputs(tmp_path)
+    destination = tmp_path / 'candidate.mp4'
+    monkeypatch.setenv('FAKE_CREATE_PATH', str(destination))
+    with pytest.raises(MuxError) as error:
+        build_candidate(
+            _stub_request(paths, destination),
+            _fake_settings(fake_env['tools']),
+        )
+    assert error.value.kind == 'destination'
+    assert destination.read_bytes() == (
+        b'foreign bytes created during assembly'
+    )
+    _assert_no_staging_leftovers(tmp_path, 'candidate.mp4')
+
+
+def test_build_candidate_refuses_broken_symlink_destination(
+    tmp_path: Path,
+    fake_env: dict[str, Any],
+) -> None:
+    paths = _stub_inputs(tmp_path)
+    destination = tmp_path / 'candidate.mp4'
+    destination.symlink_to('missing-target-file')
+    with pytest.raises(MuxError) as error:
+        build_candidate(
+            _stub_request(paths, destination),
+            _fake_settings(fake_env['tools']),
+        )
+    assert error.value.kind == 'destination'
+    assert destination.is_symlink()
+    _assert_no_staging_leftovers(tmp_path, 'candidate.mp4')
 
 
 def test_build_candidate_rejects_unexpected_track_layout(
@@ -482,3 +554,33 @@ def test_build_candidate_real_preserves_inputs_and_special_paths(
     for name, path in tracks.items():
         if isinstance(path, Path):
             assert path.read_bytes() == input_hashes[name], name
+
+
+def test_build_candidate_real_preserves_nonzero_start_timeline(
+    tmp_path: Path,
+) -> None:
+    require_real_media()
+    tracks = prepared_tracks(tmp_path)
+    shifted_video = make_shifted_source(
+        tracks['video'], tmp_path / 'prepared' / 'shifted.mp4'
+    )
+    shifted_tracks = {**tracks, 'video': shifted_video}
+    destination = tmp_path / 'staging' / 'shifted-candidate.mp4'
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    build_candidate(
+        candidate_request(shifted_tracks, destination),
+        Settings(),
+    )
+    source_video = packet_fingerprints(shifted_video, '0')
+    candidate_video = packet_fingerprints(destination, '0')
+    assert candidate_video == source_video
+    assert candidate_video[0][0] == '2.000000'
+    source_audio = packet_fingerprints(shifted_video, '1')
+    candidate_audio = packet_fingerprints(destination, '1')
+    assert len(candidate_audio) == len(source_audio)
+    for source_row, candidate_row in zip(
+        source_audio, candidate_audio, strict=True
+    ):
+        assert source_row[3] == candidate_row[3]
+        assert source_row[2] == candidate_row[2]
+        assert abs(float(source_row[0]) - float(candidate_row[0])) <= 0.002

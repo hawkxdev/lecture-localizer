@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import subprocess
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -13,6 +16,7 @@ from lecture_localizer.media import (
     MediaToolError,
     checked_run_strict,
     discover_tool,
+    scrubbed_environment,
 )
 from lecture_localizer.mux import TrackProfile
 from lecture_localizer.settings import Settings
@@ -22,7 +26,13 @@ NARRATION_SAMPLE_RATE = 48000
 NARRATION_CHANNELS = 1
 AAC_FRAME_SAMPLES = 1024
 PRIMING_TOLERANCE_FRAMES = 2
-NEGATIVE_TOLERANCE_FRAMES = 1
+ARTIFACT_ROUNDING_MS = 1
+# Container timescale conversion and edit list reconstruction move
+# copied audio presentation timestamps by well under one millisecond
+# on this toolchain (observed 0.771 ms for a 44.1 kHz source); the
+# smallest representable AAC frame is 1024 samples, about 21.3 ms, so
+# this bound cannot hide a real placement shift.
+AUDIO_TIMESTAMP_TOLERANCE_S = 0.002
 
 _EXPECTED_ROLES = (
     ('video', 'h264'),
@@ -40,7 +50,6 @@ def _padding_tolerance_ms(frames: int) -> int:
 
 
 PRIMING_TOLERANCE_MS = _padding_tolerance_ms(PRIMING_TOLERANCE_FRAMES)
-NEGATIVE_TOLERANCE_MS = _padding_tolerance_ms(NEGATIVE_TOLERANCE_FRAMES)
 
 
 class VerificationError(RuntimeError):
@@ -49,12 +58,20 @@ class VerificationError(RuntimeError):
 
 @dataclass(frozen=True)
 class CandidateExpectation:
-    """Declared source facts the saved candidate must persist."""
+    """Declared source facts the saved candidate must persist.
+
+    Every copied stream is bound to its exact prepared artifact: the
+    video to video_source, the selected original audio to
+    original_packet_source, and the narration to
+    narration_packet_source, so substituted or shortened prepared
+    inputs cannot produce a successful report.
+    """
 
     video_source: Path
     original_packet_source: Path
     original_packet_stream_index: int
     original_is_copied: bool
+    narration_packet_source: Path
     original_channels: int
     original_sample_rate: int
     original_end_ms: int
@@ -116,55 +133,25 @@ def _not_evaluated(name: str, reason: str) -> CheckResult:
 
 
 def _probe_streams(
-    ffprobe: Path, candidate: Path, timeout_seconds: float
+    ffprobe: Path, media_path: Path, timeout_seconds: float
 ) -> dict[str, Any]:
-    """Return the full ffprobe stream and format payload."""
+    """Return the ffprobe stream and format payload of one file.
+
+    Stream data is limited to the small extradata configuration dump;
+    media payloads never enter this call.
+    """
     result = checked_run_strict(
         [
             str(ffprobe),
             '-v',
             'error',
+            '-show_streams',
+            '-show_data',
             '-show_entries',
             'stream=index,codec_name,codec_type,profile,channels,'
-            'sample_rate,duration:stream_tags=language:stream_disposition:'
+            'sample_rate,duration,width,height,extradata',
+            '-show_entries',
             'format=duration',
-            '-of',
-            'json',
-            str(candidate),
-        ],
-        timeout_seconds,
-    )
-    try:
-        payload = json.loads(result.stdout)
-        if not isinstance(payload, dict):
-            raise TypeError('payload is not an object')
-        return payload
-    except json.JSONDecodeError as error:
-        raise MediaToolError(
-            f'unusable ffprobe stream output for {candidate}: {error}'
-        ) from error
-    except TypeError as error:
-        raise MediaToolError(
-            f'unusable ffprobe stream output for {candidate}: {error}'
-        ) from error
-
-
-def _probe_packets(
-    ffprobe: Path,
-    media_path: Path,
-    selector: str,
-    timeout_seconds: float,
-) -> list[dict[str, Any]]:
-    """Return packet rows with data for one selected stream."""
-    result = checked_run_strict(
-        [
-            str(ffprobe),
-            '-v',
-            'error',
-            '-select_streams',
-            selector,
-            '-show_packets',
-            '-show_data',
             '-of',
             'json',
             str(media_path),
@@ -173,73 +160,197 @@ def _probe_packets(
     )
     try:
         payload = json.loads(result.stdout)
-        packets = payload['packets']
-        if not isinstance(packets, list):
-            raise TypeError('packets is not a list')
-        return [dict(packet) for packet in packets]
-    except (json.JSONDecodeError, KeyError, TypeError) as error:
+        if not isinstance(payload, dict):
+            raise TypeError('payload is not an object')
+        return payload
+    except (json.JSONDecodeError, TypeError) as error:
         raise MediaToolError(
-            f'unusable ffprobe packet output for {media_path}: {error}'
+            f'unusable ffprobe stream output for {media_path}: {error}'
         ) from error
 
 
-def _packet_fingerprint(packet: dict[str, Any]) -> tuple[str, ...]:
-    """Return the compared identity fields of one packet."""
+def _extradata_digest(hexdump: str) -> str:
+    """Hash the decoded bytes of one ffprobe extradata dump."""
+    cleaned = hexdump.replace('\\n', '\n')
+    chunks: list[bytes] = []
+    for line in cleaned.splitlines():
+        body = line.split('  ', 1)[0]
+        parts = body.split(':')[1:] if ':' in body else [body]
+        chunks.append(''.join(parts).encode('ascii'))
+    return hashlib.sha256(b''.join(chunks)).hexdigest()
+
+
+def _stream_packet_fingerprints(
+    ffprobe: Path,
+    media_path: Path,
+    selector: str,
+    timeout_seconds: float,
+) -> Iterator[tuple[str, ...]]:
+    """Yield bounded packet identity rows one packet at a time.
+
+    Each row carries presentation timestamps, duration, size and the
+    digest of the packet payload, so whole media data is never retained
+    in memory. The returned iterator must be consumed for the child
+    exit status to be observed.
+    """
+    argv = [
+        str(ffprobe),
+        '-v',
+        'error',
+        '-select_streams',
+        selector,
+        '-show_packets',
+        '-show_data',
+        '-of',
+        'flat',
+        str(media_path),
+    ]
+    with tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+            text=True,
+            env=scrubbed_environment(),
+        )
+        assert process.stdout is not None
+        fields: dict[str, str] = {}
+        current_index: str | None = None
+        try:
+            for raw_line in process.stdout:
+                line = raw_line.strip()
+                if not line or '=' not in line:
+                    continue
+                key, _, value = line.partition('=')
+                parts = key.split('.')
+                if len(parts) < 4 or parts[:2] != ['packets', 'packet']:
+                    continue
+                field_name = parts[3]
+                if current_index is None:
+                    current_index = parts[2]
+                elif parts[2] != current_index:
+                    yield _fingerprint(fields)
+                    fields = {}
+                    current_index = parts[2]
+                fields[field_name] = value.strip('"')
+            if fields:
+                yield _fingerprint(fields)
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+        process.stdout.close()
+        return_code = process.wait(timeout=timeout_seconds)
+        stderr_file.seek(0)
+        noise = stderr_file.read().decode('utf-8', 'replace').strip()
+        if return_code != 0 or noise:
+            raise MediaToolError(
+                f'unusable ffprobe packet output for {media_path}:'
+                f' exit {return_code} {noise.splitlines()[-1:]}'
+            )
+
+
+def _fingerprint(fields: dict[str, str]) -> tuple[str, ...]:
+    """Return one compared packet row with a bounded payload digest."""
     return (
-        str(packet.get('pts_time')),
-        str(packet.get('dts_time')),
-        str(packet.get('duration_time')),
-        str(packet.get('size')),
-        str(packet.get('data')),
+        fields.get('pts_time', ''),
+        fields.get('dts_time', ''),
+        fields.get('duration_time', ''),
+        fields.get('size', ''),
+        hashlib.sha256(fields.get('data', '').encode('utf-8')).hexdigest(),
     )
 
 
-def _compare_packets(
-    actual: list[dict[str, Any]], expected: list[dict[str, Any]]
+def _compare_streamed_packets(
+    check_name: str,
+    candidate_packets: Iterator[tuple[str, ...]],
+    source_packets: Iterator[tuple[str, ...]],
+    timestamp_tolerance_s: float,
 ) -> CheckResult:
-    """Require exact packet identity between two selected streams."""
-    measured = {'actual_packets': len(actual), 'source_packets': len(expected)}
-    if len(actual) != len(expected):
-        return CheckResult(
-            name='packets',
-            ok=False,
-            detail=(
-                f'packet count differs: candidate has {len(actual)},'
-                f' source has {len(expected)}'
-            ),
-            measured=measured,
-        )
-    for index, (candidate_packet, source_packet) in enumerate(
-        zip(actual, expected, strict=True)
-    ):
-        candidate_fields = _packet_fingerprint(candidate_packet)
-        source_fields = _packet_fingerprint(source_packet)
-        if candidate_fields != source_fields:
-            differing = [
-                field_name
-                for field_name, left, right in zip(
-                    ('pts_time', 'dts_time', 'duration_time', 'size', 'data'),
-                    candidate_fields,
-                    source_fields,
-                    strict=True,
-                )
-                if left != right
-            ]
+    """Compare two packet streams one row at a time.
+
+    Payload, size and duration must match exactly. Presentation
+    timestamps must match within the documented container rounding
+    bound: zero for the video copy, one small audio bound derived from
+    timescale and edit list reconstruction for copied audio.
+    """
+    index = 0
+    while True:
+        candidate = next(candidate_packets, None)
+        source = next(source_packets, None)
+        if candidate is None and source is None:
             return CheckResult(
-                name='packets',
+                name=check_name,
+                ok=True,
+                detail='copied packets match the source stream',
+                measured={'packets': index},
+            )
+        if candidate is None or source is None:
+            return CheckResult(
+                name=check_name,
                 ok=False,
                 detail=(
-                    f'packet {index} differs in {differing}; copied streams'
-                    ' must keep identical packets'
+                    f'packet count differs at packet {index}: candidate has'
+                    f' {"at least" if candidate is not None else "only"}'
+                    f' {index} packets, source has'
+                    f' {"at least" if source is not None else "only"} {index}'
                 ),
-                measured=measured,
+                measured={'packets': index},
             )
-    return CheckResult(
-        name='packets',
-        ok=True,
-        detail='copied packets are identical to the source',
-        measured=measured,
-    )
+        if candidate[3] != source[3] or candidate[4] != source[4]:
+            return CheckResult(
+                name=check_name,
+                ok=False,
+                detail=(
+                    f'packet {index} payload or size differs from the'
+                    ' copied source; copied streams must keep identical'
+                    ' packets'
+                ),
+                measured={'packets': index},
+            )
+        for position, field_name in ((0, 'pts_time'), (1, 'dts_time')):
+            candidate_value, source_value = (
+                candidate[position],
+                source[position],
+            )
+            try:
+                difference = abs(float(candidate_value) - float(source_value))
+            except ValueError:
+                if candidate_value != source_value:
+                    return CheckResult(
+                        name=check_name,
+                        ok=False,
+                        detail=(
+                            f'packet {index} has unusable {field_name}'
+                            f' values {candidate_value!r} versus'
+                            f' {source_value!r}'
+                        ),
+                        measured={'packets': index},
+                    )
+                continue
+            if difference > timestamp_tolerance_s:
+                return CheckResult(
+                    name=check_name,
+                    ok=False,
+                    detail=(
+                        f'packet {index} {field_name} moved from'
+                        f' {source_value} to {candidate_value}, above the'
+                        f' {timestamp_tolerance_s} s container rounding'
+                        ' bound'
+                    ),
+                    measured={'packets': index},
+                )
+        if candidate[2] != source[2]:
+            return CheckResult(
+                name=check_name,
+                ok=False,
+                detail=(
+                    f'packet {index} duration differs: candidate'
+                    f' {candidate[2]}, source {source[2]}'
+                ),
+                measured={'packets': index},
+            )
+        index += 1
 
 
 def _stream_row(stream: dict[str, Any]) -> dict[str, Any]:
@@ -478,6 +589,61 @@ def _check_flags(
     )
 
 
+def _check_video_profile(
+    candidate_stream: dict[str, Any], source_stream: dict[str, Any]
+) -> CheckResult:
+    """Require unchanged video decoder configuration and dimensions.
+
+    Packet equality alone cannot see bitstream configuration edits
+    such as an h264_metadata crop, which preserves every packet while
+    changing width, height and the avcC extradata.
+    """
+    measured: dict[str, Any] = {}
+    problems: list[str] = []
+    for field_name in ('width', 'height'):
+        candidate_value = candidate_stream.get(field_name)
+        source_value = source_stream.get(field_name)
+        measured[field_name] = {
+            'candidate': candidate_value,
+            'source': source_value,
+        }
+        if candidate_value != source_value:
+            problems.append(
+                f'video {field_name} changed from {source_value!r} to'
+                f' {candidate_value!r}'
+            )
+    candidate_extradata = str(candidate_stream.get('extradata') or '')
+    source_extradata = str(source_stream.get('extradata') or '')
+    candidate_digest = _extradata_digest(candidate_extradata)
+    source_digest = _extradata_digest(source_extradata)
+    measured['extradata_digest'] = {
+        'candidate': candidate_digest,
+        'source': source_digest,
+    }
+    measured['extradata_size'] = {
+        'candidate': candidate_stream.get('extradata_size'),
+        'source': source_stream.get('extradata_size'),
+    }
+    if candidate_digest != source_digest:
+        problems.append(
+            'video decoder configuration extradata differs from the'
+            ' copied source while packets may still match'
+        )
+    if problems:
+        return CheckResult(
+            name='video_profile',
+            ok=False,
+            detail='; '.join(problems),
+            measured=measured,
+        )
+    return CheckResult(
+        name='video_profile',
+        ok=True,
+        detail='video dimensions and decoder configuration are unchanged',
+        measured=measured,
+    )
+
+
 def _stream_duration_ms(stream: dict[str, Any]) -> float | None:
     """Return one stream duration in milliseconds when reported."""
     duration = stream.get('duration')
@@ -489,51 +655,76 @@ def _stream_duration_ms(stream: dict[str, Any]) -> float | None:
         return None
 
 
-def _check_narration_duration(
-    stream: dict[str, Any], expectation: CandidateExpectation
-) -> CheckResult:
-    """Check narration duration and report the codec padding explicitly.
+def _duration_mismatch(candidate_ms: float, artifact_ms: float) -> str | None:
+    """Compare a copied stream against its prepared artifact duration."""
+    if abs(candidate_ms - artifact_ms) > ARTIFACT_ROUNDING_MS:
+        return (
+            f'copied stream duration {round(candidate_ms, 3)} ms differs'
+            f' from its prepared artifact duration'
+            f' {round(artifact_ms, 3)} ms'
+        )
+    return None
 
-    AAC encoding adds priming samples that are not speech content. The
-    persisted stream may exceed the declared narration end by at most
-    PRIMING_TOLERANCE_MS (two AAC frames) and must not fall below it by
-    more than NEGATIVE_TOLERANCE_MS (one frame of edit list rounding).
-    The measured padding is always reported rather than hidden.
+
+def _check_narration_duration(
+    candidate_stream: dict[str, Any],
+    artifact_stream: dict[str, Any],
+    expectation: CandidateExpectation,
+) -> CheckResult:
+    """Check narration duration against its prepared artifact.
+
+    The prepared artifact carries its own measured codec delay, so it
+    is the ground truth for the copied track: the candidate must match
+    it within edit list rounding. Missing content can never pass as
+    negative padding. The padding against the declared narration end is
+    always reported, and the declared end plus the documented two frame
+    AAC priming tolerance bounds the upper side.
     """
-    duration_ms = _stream_duration_ms(stream)
-    measured = {
-        'narration_stream_duration_ms': duration_ms,
+    candidate_ms = _stream_duration_ms(candidate_stream)
+    artifact_ms = _stream_duration_ms(artifact_stream)
+    measured: dict[str, Any] = {
+        'narration_stream_duration_ms': candidate_ms,
+        'artifact_stream_duration_ms': artifact_ms,
         'declared_narration_end_ms': expectation.narration_end_ms,
         'priming_tolerance_ms': PRIMING_TOLERANCE_MS,
-        'negative_tolerance_ms': NEGATIVE_TOLERANCE_MS,
+        'artifact_rounding_ms': ARTIFACT_ROUNDING_MS,
     }
-    if duration_ms is None:
+    if candidate_ms is None:
         return CheckResult(
             name='narration_duration',
             ok=False,
             detail='ffprobe reported no duration for the narration stream',
             measured=measured,
         )
-    padding_ms = round(duration_ms - expectation.narration_end_ms, 3)
-    measured['narration_padding_ms'] = padding_ms
-    if padding_ms < -NEGATIVE_TOLERANCE_MS:
+    if artifact_ms is None:
         return CheckResult(
             name='narration_duration',
             ok=False,
             detail=(
-                f'narration stream is {abs(padding_ms)} ms shorter than the'
-                ' declared narration end; audio appears truncated'
+                'ffprobe reported no duration for the prepared narration'
+                ' artifact'
             ),
             measured=measured,
         )
-    if padding_ms > PRIMING_TOLERANCE_MS:
+    measured['narration_padding_ms'] = round(
+        candidate_ms - expectation.narration_end_ms, 3
+    )
+    mismatch = _duration_mismatch(candidate_ms, artifact_ms)
+    if mismatch is not None:
+        return CheckResult(
+            name='narration_duration',
+            ok=False,
+            detail=mismatch,
+            measured=measured,
+        )
+    if candidate_ms > expectation.narration_end_ms + PRIMING_TOLERANCE_MS:
         return CheckResult(
             name='narration_duration',
             ok=False,
             detail=(
-                f'narration stream carries {padding_ms} ms of padding, above'
-                f' the documented AAC priming tolerance of'
-                f' {PRIMING_TOLERANCE_MS} ms'
+                f'narration stream carries {measured["narration_padding_ms"]}'
+                f' ms of padding, above the documented AAC priming'
+                f' tolerance of {PRIMING_TOLERANCE_MS} ms'
             ),
             measured=measured,
         )
@@ -541,57 +732,76 @@ def _check_narration_duration(
         name='narration_duration',
         ok=True,
         detail=(
-            f'narration duration fits with {padding_ms} ms reported padding'
+            f'narration matches its artifact with'
+            f' {measured["narration_padding_ms"]} ms padding versus the'
+            ' declared end'
         ),
         measured=measured,
     )
 
 
 def _check_original_duration(
-    stream: dict[str, Any], expectation: CandidateExpectation
+    candidate_stream: dict[str, Any],
+    artifact_stream: dict[str, Any],
+    expectation: CandidateExpectation,
 ) -> CheckResult:
-    """Check a converted original track against its declared end."""
-    duration_ms = _stream_duration_ms(stream)
-    measured = {
-        'original_stream_duration_ms': duration_ms,
+    """Check a converted original track against its prepared artifact."""
+    candidate_ms = _stream_duration_ms(candidate_stream)
+    artifact_ms = _stream_duration_ms(artifact_stream)
+    measured: dict[str, Any] = {
+        'original_stream_duration_ms': candidate_ms,
+        'artifact_stream_duration_ms': artifact_ms,
         'declared_original_end_ms': expectation.original_end_ms,
         'priming_tolerance_ms': PRIMING_TOLERANCE_MS,
-        'negative_tolerance_ms': NEGATIVE_TOLERANCE_MS,
+        'artifact_rounding_ms': ARTIFACT_ROUNDING_MS,
     }
-    if duration_ms is None:
+    if candidate_ms is None:
         return CheckResult(
             name='original_duration',
             ok=False,
             detail='ffprobe reported no duration for the original stream',
             measured=measured,
         )
-    padding_ms = round(duration_ms - expectation.original_end_ms, 3)
-    measured['original_padding_ms'] = padding_ms
-    if padding_ms < -NEGATIVE_TOLERANCE_MS:
+    if artifact_ms is None:
         return CheckResult(
             name='original_duration',
             ok=False,
             detail=(
-                f'original stream is {abs(padding_ms)} ms shorter than the'
-                ' declared original end; audio appears truncated'
+                'ffprobe reported no duration for the prepared original'
+                ' artifact'
             ),
             measured=measured,
         )
-    if padding_ms > PRIMING_TOLERANCE_MS:
+    measured['original_padding_ms'] = round(
+        candidate_ms - expectation.original_end_ms, 3
+    )
+    mismatch = _duration_mismatch(candidate_ms, artifact_ms)
+    if mismatch is not None:
+        return CheckResult(
+            name='original_duration',
+            ok=False,
+            detail=mismatch,
+            measured=measured,
+        )
+    if candidate_ms > expectation.original_end_ms + PRIMING_TOLERANCE_MS:
         return CheckResult(
             name='original_duration',
             ok=False,
             detail=(
-                f'original stream carries {padding_ms} ms of padding, above'
-                f' the documented AAC priming tolerance of'
-                f' {PRIMING_TOLERANCE_MS} ms'
+                f'original stream carries {measured["original_padding_ms"]}'
+                f' ms of padding, above the documented AAC priming'
+                f' tolerance of {PRIMING_TOLERANCE_MS} ms'
             ),
             measured=measured,
         )
     return CheckResult(
         name='original_duration',
         ok=True,
-        detail=f'original duration fits with {padding_ms} ms reported padding',
+        detail=(
+            f'original matches its artifact with'
+            f' {measured["original_padding_ms"]} ms padding versus the'
+            ' declared end'
+        ),
         measured=measured,
     )
 
@@ -619,7 +829,7 @@ def _check_container_duration(
             measured=measured,
         )
     measured['format_duration_ms'] = round(duration_ms, 3)
-    if duration_ms + NEGATIVE_TOLERANCE_MS < expectation.narration_end_ms:
+    if duration_ms + ARTIFACT_ROUNDING_MS < expectation.narration_end_ms:
         return CheckResult(
             name='container_duration',
             ok=False,
@@ -762,6 +972,48 @@ def _check_full_decode(
     )
 
 
+def _audio_stream_row(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the first audio stream row of one payload."""
+    for stream in payload.get('streams', []):
+        if stream.get('codec_type') == 'audio':
+            return dict(stream)
+    return {}
+
+
+def _video_stream_row(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the first video stream row of one payload."""
+    for stream in payload.get('streams', []):
+        if stream.get('codec_type') == 'video':
+            return dict(stream)
+    return {}
+
+
+def _run_packet_check(
+    check_name: str,
+    ffprobe: Path,
+    timeout_seconds: float,
+    candidate_path: Path,
+    candidate_selector: str,
+    source_path: Path,
+    source_selector: str,
+    timestamp_tolerance_s: float,
+) -> CheckResult:
+    """Stream and compare one copied candidate stream with its source."""
+    try:
+        return _compare_streamed_packets(
+            check_name,
+            _stream_packet_fingerprints(
+                ffprobe, candidate_path, candidate_selector, timeout_seconds
+            ),
+            _stream_packet_fingerprints(
+                ffprobe, source_path, source_selector, timeout_seconds
+            ),
+            timestamp_tolerance_s,
+        )
+    except MediaToolError as error:
+        return _not_evaluated(check_name, str(error))
+
+
 def _verify_with_tools(
     candidate: Path,
     expectation: CandidateExpectation,
@@ -773,11 +1025,21 @@ def _verify_with_tools(
     checks: list[CheckResult] = []
     measured: dict[str, Any] = {
         'priming_tolerance_ms': PRIMING_TOLERANCE_MS,
-        'negative_tolerance_ms': NEGATIVE_TOLERANCE_MS,
+        'audio_timestamp_tolerance_s': AUDIO_TIMESTAMP_TOLERANCE_S,
+        'artifact_rounding_ms': ARTIFACT_ROUNDING_MS,
     }
     checks.append(_check_candidate_file(candidate))
     try:
         payload = _probe_streams(ffprobe, candidate, timeout_seconds)
+        source_payload = _probe_streams(
+            ffprobe, expectation.video_source, timeout_seconds
+        )
+        artifact_payload = _probe_streams(
+            ffprobe, expectation.narration_packet_source, timeout_seconds
+        )
+        original_artifact_payload = _probe_streams(
+            ffprobe, expectation.original_packet_source, timeout_seconds
+        )
         streams = [dict(stream) for stream in payload.get('streams', [])]
         stream_error: str | None = None
     except MediaToolError as error:
@@ -786,17 +1048,19 @@ def _verify_with_tools(
     if stream_error is not None:
         names = [
             'stream_roles',
+            'video_profile',
             'narration_format',
             'original_format',
             'track_flags',
             'narration_duration',
             'container_duration',
             'video_packets',
+            'narration_packets',
         ]
         names.append(
             'copied_original_packets'
             if expectation.original_is_copied
-            else 'original_duration'
+            else 'converted_original_packets'
         )
         names.extend(['english_text', 'russian_text', 'full_decode'])
         for name in names:
@@ -806,63 +1070,82 @@ def _verify_with_tools(
             checks=tuple(checks),
             measured={**measured, 'probe_error': stream_error},
         )
-    roles = _check_roles(streams)
-    checks.append(roles)
+    checks.append(_check_roles(streams))
     if len(streams) == len(_EXPECTED_ROLES):
         checks.append(_check_narration_format(streams[2]))
         checks.append(_check_original_format(streams[1], expectation))
         checks.append(_check_flags(streams, expectation.profile))
-        checks.append(_check_narration_duration(streams[2], expectation))
+        checks.append(
+            _check_video_profile(streams[0], _video_stream_row(source_payload))
+        )
+        checks.append(
+            _check_narration_duration(
+                streams[2],
+                _audio_stream_row(artifact_payload),
+                expectation,
+            )
+        )
         if not expectation.original_is_copied:
-            checks.append(_check_original_duration(streams[1], expectation))
+            checks.append(
+                _check_original_duration(
+                    streams[1],
+                    _audio_stream_row(original_artifact_payload),
+                    expectation,
+                )
+            )
         checks.append(
             _check_container_duration(payload.get('format') or {}, expectation)
         )
-    try:
-        video_packets = _probe_packets(
-            ffprobe, candidate, 'v:0', timeout_seconds
-        )
-        source_packets = _probe_packets(
+    checks.append(
+        _run_packet_check(
+            'video_packets',
             ffprobe,
-            expectation.video_source,
-            'v:0',
             timeout_seconds,
+            candidate,
+            '0',
+            expectation.video_source,
+            str(_video_stream_index_of(source_payload)),
+            0.0,
         )
-        comparison = _compare_packets(video_packets, source_packets)
-        checks.append(
-            CheckResult(
-                name='video_packets',
-                ok=comparison.ok,
-                detail=comparison.detail,
-                measured=comparison.measured,
-            )
+    )
+    checks.append(
+        _run_packet_check(
+            'narration_packets',
+            ffprobe,
+            timeout_seconds,
+            candidate,
+            '2',
+            expectation.narration_packet_source,
+            str(_audio_stream_index_of(artifact_payload)),
+            AUDIO_TIMESTAMP_TOLERANCE_S,
         )
-    except MediaToolError as error:
-        checks.append(_not_evaluated('video_packets', str(error)))
+    )
     if expectation.original_is_copied:
-        try:
-            candidate_packets = _probe_packets(
-                ffprobe, candidate, 'a:0', timeout_seconds
-            )
-            source_packets = _probe_packets(
+        checks.append(
+            _run_packet_check(
+                'copied_original_packets',
                 ffprobe,
+                timeout_seconds,
+                candidate,
+                '1',
                 expectation.original_packet_source,
                 str(expectation.original_packet_stream_index),
+                AUDIO_TIMESTAMP_TOLERANCE_S,
+            )
+        )
+    else:
+        checks.append(
+            _run_packet_check(
+                'converted_original_packets',
+                ffprobe,
                 timeout_seconds,
+                candidate,
+                '1',
+                expectation.original_packet_source,
+                str(_audio_stream_index_of(original_artifact_payload)),
+                AUDIO_TIMESTAMP_TOLERANCE_S,
             )
-            comparison = _compare_packets(candidate_packets, source_packets)
-            checks.append(
-                CheckResult(
-                    name='copied_original_packets',
-                    ok=comparison.ok,
-                    detail=comparison.detail,
-                    measured=comparison.measured,
-                )
-            )
-        except MediaToolError as error:
-            checks.append(
-                _not_evaluated('copied_original_packets', str(error))
-            )
+        )
     with tempfile.TemporaryDirectory(
         prefix='lecture-localizer-verify-'
     ) as temp_dir:
@@ -897,6 +1180,22 @@ def _verify_with_tools(
         checks=tuple(checks),
         measured=measured,
     )
+
+
+def _video_stream_index_of(payload: dict[str, Any]) -> int:
+    """Return the first video stream index of one probe payload."""
+    for stream in payload.get('streams', []):
+        if stream.get('codec_type') == 'video':
+            return int(stream.get('index', 0))
+    raise MediaToolError('source payload carries no video stream')
+
+
+def _audio_stream_index_of(payload: dict[str, Any]) -> int:
+    """Return the first audio stream index of one probe payload."""
+    for stream in payload.get('streams', []):
+        if stream.get('codec_type') == 'audio':
+            return int(stream.get('index', 0))
+    raise MediaToolError('source payload carries no audio stream')
 
 
 def verify_candidate(

@@ -63,6 +63,9 @@ FAKE_MUX_FFPROBE = """#!/bin/sh
 if [ -n "$FAKE_ARGV_DUMP" ]; then
   printf '%s\\n' "$0" "$@" >> "$FAKE_ARGV_DUMP"
 fi
+if [ -n "$FAKE_CREATE_PATH" ]; then
+  printf 'foreign bytes created during assembly' > "$FAKE_CREATE_PATH"
+fi
 mode="streams"
 for arg in "$@"; do
   if [ "$arg" = "-show_packets" ]; then mode="packets"; fi
@@ -199,17 +202,22 @@ def _encode_aac(
     return destination
 
 
-def encode_narration_aac(destination: Path, seconds: float = 2.0) -> Path:
+def encode_narration_aac(
+    destination: Path, seconds: float = 2.0, frequency: int = 440
+) -> Path:
     """Encode one synthetic mono AAC LC 48 kHz narration file."""
-    return _encode_aac(destination, 440, seconds, '1')
+    return _encode_aac(destination, frequency, seconds, '1')
 
 
 def encode_original_aac(
-    destination: Path, seconds: float = 2.0, stereo: bool = True
+    destination: Path,
+    seconds: float = 2.0,
+    stereo: bool = True,
+    frequency: int = 330,
 ) -> Path:
     """Encode one prepared original audio AAC file with given layout."""
     channels = '2' if stereo else '1'
-    return _encode_aac(destination, 330, seconds, channels)
+    return _encode_aac(destination, frequency, seconds, channels)
 
 
 def prepared_tracks(tmp_path: Path) -> dict[str, Any]:
@@ -386,6 +394,135 @@ def make_two_audio_video(destination: Path) -> Path:
             'aac',
             '-b:a',
             '96k',
+            '-y',
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+        env=scrubbed_environment(),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f'ffmpeg failed: {result.stderr}')
+    return destination
+
+
+def make_shifted_source(source: Path, destination: Path) -> Path:
+    """Stream copy one media file onto a nonzero timestamp start."""
+    ffmpeg = shutil.which('ffmpeg')
+    if ffmpeg is None:
+        raise RuntimeError('required setup prerequisite: ffmpeg absent')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [
+            ffmpeg,
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-i',
+            str(source),
+            '-c',
+            'copy',
+            '-output_ts_offset',
+            '2',
+            '-y',
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+        env=scrubbed_environment(),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f'ffmpeg failed: {result.stderr}')
+    return destination
+
+
+def make_shifted_audio(source: Path, destination: Path) -> Path:
+    """Stream copy one audio file onto a small nonzero start."""
+    ffmpeg = shutil.which('ffmpeg')
+    if ffmpeg is None:
+        raise RuntimeError('required setup prerequisite: ffmpeg absent')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [
+            ffmpeg,
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-i',
+            str(source),
+            '-c',
+            'copy',
+            '-output_ts_offset',
+            '0.05',
+            '-y',
+            str(destination),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+        env=scrubbed_environment(),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f'ffmpeg failed: {result.stderr}')
+    return destination
+
+
+def build_cropped_candidate(tracks: dict[str, Any], destination: Path) -> Path:
+    """Assemble a five stream candidate with a crop bitstream fault.
+
+    The h264_metadata crop preserves every compared packet payload but
+    changes width and the avcC extradata, which is exactly the fault
+    the video profile check must detect.
+    """
+    ffmpeg = shutil.which('ffmpeg')
+    if ffmpeg is None:
+        raise RuntimeError('required setup prerequisite: ffmpeg absent')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [
+            ffmpeg,
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-i',
+            str(tracks['video']),
+            '-i',
+            str(tracks['narration']),
+            '-i',
+            str(tracks['english']),
+            '-i',
+            str(tracks['russian']),
+            '-map',
+            '0:0',
+            '-map',
+            '0:1',
+            '-map',
+            '1:0',
+            '-map',
+            '2:0',
+            '-map',
+            '3:0',
+            '-c:v',
+            'copy',
+            '-bsf:v',
+            'h264_metadata=crop_left=2',
+            '-c:a',
+            'copy',
+            '-c:s',
+            'mov_text',
+            '-metadata:s:a:0',
+            'language=eng',
+            '-metadata:s:a:1',
+            'language=rus',
+            '-metadata:s:s:0',
+            'language=eng',
+            '-metadata:s:s:1',
+            'language=rus',
             '-y',
             str(destination),
         ],
