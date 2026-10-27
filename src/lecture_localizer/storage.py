@@ -110,6 +110,23 @@ def create_new_file(path: str | Path, data: bytes) -> None:
     _fsync_directory(target.parent)
 
 
+def move_new_file(source: str | Path, target: str | Path) -> None:
+    """Move one fully written file to a fresh immutable destination.
+
+    The caller owns durability of the source bytes; the move itself is
+    an atomic rename on the same filesystem and the destination
+    directory entry is flushed so the artifact survives a crash.
+    """
+    source_path = Path(source)
+    target_path = Path(target)
+    if target_path.exists():
+        raise DestinationExistsError(
+            f'refusing to overwrite an existing immutable file: {target_path}'
+        )
+    os.replace(source_path, target_path)
+    _fsync_directory(target_path.parent)
+
+
 @dataclass(frozen=True)
 class IntegrityRecord:
     """One expected file with its recorded digest."""

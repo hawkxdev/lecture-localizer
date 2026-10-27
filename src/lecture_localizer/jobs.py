@@ -3,18 +3,25 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from lecture_localizer import media
+from lecture_localizer import media, xai_client
 from lecture_localizer.contracts import (
     ContractError,
     TranslationDocument,
     TranslationSegment,
     load_job_manifest,
+    load_schema,
+    load_strict_json_file,
     load_translation_document,
+    validate_instance,
     verify_binding,
 )
 from lecture_localizer.media import MediaToolError
@@ -27,6 +34,7 @@ from lecture_localizer.storage import (
     create_new_file,
     ensure_distinct_files,
     ensure_outside,
+    move_new_file,
     sha256_bytes,
     sha256_file,
     utc_now_iso,
@@ -38,14 +46,25 @@ from lecture_localizer.subtitles import (
     derive_windows,
     parse_srt,
 )
+from lecture_localizer.xai_client import (
+    DefinitiveSpeechFailure,
+    SpeechClient,
+    UncertainSpeechFailure,
+    request_signature,
+    validate_posted_text,
+)
 
 MANIFEST_NAME = 'manifest.json'
 SNAPSHOT_DIR = 'snapshots'
 LOCK_NAME = 'lock'
+OPERATIONS_NAME = 'operations.json'
+EVIDENCE_DIR = 'evidence'
 STAGE_NAMES = ('synthesis', 'fitting', 'subtitle', 'container')
 SUPPORTED_CONTAINERS = frozenset({'mp4', 'mov', 'matroska'})
 SUPPORTED_AUDIO_CODECS = frozenset({'aac', 'pcm_s16le', 'mp3', 'opus'})
 HDR_TRANSFERS = frozenset({'smpte2084', 'arib-std-b67'})
+UNRESOLVED_OPERATION_STATES = frozenset({'reserved', 'started', 'uncertain'})
+OPERATIONS_SCHEMA = load_schema('operations-v1.schema.json')
 SYNTHESIS_SETTINGS: dict[str, Any] = {
     'provider': 'xai',
     'voice': 'eve',
@@ -754,6 +773,7 @@ def prepare_job(
     selected, mode, disposition = _select_audio(facts, source_audio)
     manifest_path = job_dir / MANIFEST_NAME
     with JobLock.acquire(job_dir):
+        _check_operations_journal(job_dir)
         stored: dict[str, Any] | None = None
         if manifest_path.exists():
             stored = load_job_manifest(manifest_path)
@@ -842,7 +862,13 @@ def _ensure_create_ready(job_dir: Path) -> None:
     directories from an interrupted first prepare, stay visible and do
     not block recovery.
     """
-    managed = {LOCK_NAME, SNAPSHOT_DIR, 'artifacts'}
+    managed = {
+        LOCK_NAME,
+        SNAPSHOT_DIR,
+        'artifacts',
+        OPERATIONS_NAME,
+        EVIDENCE_DIR,
+    }
     foreign = sorted(
         entry.name for entry in job_dir.iterdir() if entry.name not in managed
     )
@@ -1272,6 +1298,8 @@ def read_job_status(job_dir: Path) -> dict[str, Any]:
         )
     cache = _cache_view(manifest, artifacts, failed_labels)
     blocked.extend(cache['blocked'])
+    operations, journal_blocked = _status_operations_view(job_dir)
+    blocked.extend(journal_blocked)
     return {
         'command': 'status',
         'job_dir': str(job_dir),
@@ -1285,5 +1313,926 @@ def read_job_status(job_dir: Path) -> dict[str, Any]:
         'segment_count': len(manifest['segments']),
         'stages': cache['stages'],
         'reuse': _reuse_view(manifest, failed_labels),
+        'operations': operations,
         'blocked': blocked,
     }
+
+
+SUPPORTED_OPERATIONS_VERSION = 1
+
+
+class PaidExecutionDenied(RuntimeError):
+    """A paid speech request was refused before any HTTP attempt."""
+
+    def __init__(self, kind: str, detail: str) -> None:
+        """Record the stable refusal kind and its explanation."""
+        super().__init__(detail)
+        self.kind = kind
+        self.detail = detail
+
+
+@dataclass(frozen=True)
+class SpendingLimits:
+    """Explicit numeric spending limits with their price basis."""
+
+    max_requests: int
+    max_text_chars: int
+    max_cost_estimate: float
+    price_per_request: float
+    price_basis: str
+
+    def __post_init__(self) -> None:
+        """Reject malformed or non numeric limit values."""
+        for name in ('max_requests', 'max_text_chars'):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f'{name} must be an integer')
+            if value < 1:
+                raise ValueError(f'{name} must be at least 1')
+        for name in ('max_cost_estimate', 'price_per_request'):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f'{name} must be a number')
+            if value < 0 or value != value or value == float('inf'):
+                raise ValueError(f'{name} must be finite and nonnegative')
+        if not isinstance(self.price_basis, str) or not self.price_basis:
+            raise ValueError('price_basis must be a nonempty string')
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON serializable view."""
+        return {
+            'max_requests': self.max_requests,
+            'max_text_chars': self.max_text_chars,
+            'max_cost_estimate': self.max_cost_estimate,
+            'price_per_request': self.price_per_request,
+            'price_basis': self.price_basis,
+        }
+
+
+@dataclass(frozen=True)
+class SpeechExecutionResult:
+    """Outcome of one guarded speech execution pass."""
+
+    planned: tuple[str, ...]
+    reused: tuple[str, ...]
+    completed: tuple[str, ...]
+    failed: dict[str, str]
+    uncertain: dict[str, str]
+    blocked_unresolved: tuple[dict[str, str], ...]
+    request_count: int
+
+
+def load_operations_journal(job_dir: Path) -> dict[str, Any] | None:
+    """Load the operations journal or return None when it is absent."""
+    path = Path(job_dir) / OPERATIONS_NAME
+    if not path.is_file():
+        return None
+    data = load_strict_json_file(path)
+    if not isinstance(data, dict):
+        raise ContractError('operations journal root must be a JSON object')
+    if data.get('schema_version') != SUPPORTED_OPERATIONS_VERSION:
+        version = data.get('schema_version')
+        raise ContractError(
+            f'unsupported operations journal schema_version {version!r};'
+            f' this version understands only {SUPPORTED_OPERATIONS_VERSION}'
+        )
+    validate_instance(data, OPERATIONS_SCHEMA, 'operations journal')
+    seen: set[str] = set()
+    for operation in data['operations']:
+        operation_id = operation['operation_id']
+        if operation_id in seen:
+            raise ContractError(
+                f'duplicate operation id in the journal:'
+                f' {operation_id}; inspect operations.json manually'
+            )
+        seen.add(operation_id)
+    return data
+
+
+def _check_operations_journal(job_dir: Path) -> None:
+    """Refuse preparation while the journal is malformed or unknown."""
+    try:
+        load_operations_journal(job_dir)
+    except ContractError as error:
+        raise ContractError(
+            f'operations journal check failed: {error};'
+            f' {OPERATIONS_NAME} is preserved untouched and paid work'
+            ' stays blocked until the journal is inspected manually'
+        ) from error
+
+
+def _operations_summary(journal: dict[str, Any] | None) -> dict[str, Any]:
+    """Summarize the journal for the read only status report."""
+    if journal is None:
+        return {
+            'state': 'absent',
+            'operations': 0,
+            'by_state': {},
+            'unresolved': [],
+        }
+    by_state: dict[str, int] = {}
+    unresolved: list[str] = []
+    for operation in journal['operations']:
+        state = operation['state']
+        by_state[state] = by_state.get(state, 0) + 1
+        if state in UNRESOLVED_OPERATION_STATES:
+            unresolved.append(operation['operation_id'])
+    return {
+        'state': 'ok',
+        'operations': len(journal['operations']),
+        'by_state': by_state,
+        'unresolved': unresolved,
+    }
+
+
+def _status_operations_view(job_dir: Path) -> tuple[dict[str, Any], list[str]]:
+    """Build the journal view and its blocked messages for status."""
+    try:
+        journal = load_operations_journal(job_dir)
+    except ContractError as error:
+        return (
+            {
+                'state': 'malformed',
+                'operations': 0,
+                'by_state': {},
+                'unresolved': [],
+            },
+            [
+                'operations journal is malformed or of an unknown version'
+                f' and blocks paid execution: {error}'
+            ],
+        )
+    blocked: list[str] = []
+    if journal is not None:
+        for operation in journal['operations']:
+            state = operation['state']
+            if state in UNRESOLVED_OPERATION_STATES:
+                blocked.append(
+                    f'operation {operation["operation_id"]} for segment'
+                    f' {operation["segment_id"]} is {state} and requires'
+                    ' an explicit retry decision before any new paid'
+                    ' request'
+                )
+    return _operations_summary(journal), blocked
+
+
+def _verify_job_integrity(job_dir: Path, manifest: dict[str, Any]) -> None:
+    """Refuse execution when any retained provenance bytes are damaged."""
+    snapshot_failures = verify_integrity(
+        job_dir, _snapshot_integrity_records(manifest)
+    )
+    if snapshot_failures:
+        names = ', '.join(r.label for r in snapshot_failures)
+        raise ContractError(
+            'job snapshot integrity check failed for:'
+            f' {names}; damaged provenance stops paid execution before'
+            ' any request'
+        )
+    artifact_failures = verify_integrity(
+        job_dir, _artifact_integrity_records(manifest['artifacts'])
+    )
+    if artifact_failures:
+        names = ', '.join(r.label for r in artifact_failures)
+        raise ContractError(
+            'job artifact integrity check failed for:'
+            f' {names}; damaged cached provenance stops paid execution'
+            ' before any request'
+        )
+
+
+def _verify_window_feasibility(manifest: dict[str, Any]) -> None:
+    """Refuse execution when a source window leaves the video."""
+    duration = manifest['media']['duration_seconds']
+    if duration is None:
+        raise ContractError(
+            'the recorded media carries no duration, so window'
+            ' feasibility inside the video cannot be established before'
+            ' paid requests'
+        )
+    limit_ms = float(duration) * 1000.0
+    for segment in manifest['segments']:
+        end_ms = segment['window']['end_ms']
+        if end_ms > limit_ms:
+            raise ContractError(
+                f'window of segment {segment["id"]} ends at {end_ms} ms,'
+                f' beyond the recorded video duration {limit_ms} ms'
+            )
+
+
+def _planned_segments(
+    manifest: dict[str, Any],
+    artifacts: list[dict[str, Any]],
+    failed_labels: frozenset[str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Split manifest segments into planned and fully cached sets."""
+    model = _unit_classifications(manifest, artifacts, failed_labels)
+    raw = model['units']['raw_response']
+    planned = [
+        segment
+        for segment in manifest['segments']
+        if raw.get(segment['id']) != 'ok'
+    ]
+    planned_ids = {segment['id'] for segment in planned}
+    reused = [
+        segment['id']
+        for segment in manifest['segments']
+        if segment['id'] not in planned_ids
+    ]
+    return planned, reused
+
+
+def _posted_text(
+    job_dir: Path, manifest: dict[str, Any], segment_id: str
+) -> str:
+    """Read the frozen posted text of one segment from its snapshot."""
+    record = manifest['snapshots']['narration']
+    path = job_dir / record['path']
+    actual = sha256_file(path)
+    if actual != record['sha256']:
+        raise ContractError(
+            f'narration snapshot {record["path"]} no longer matches its'
+            ' recorded digest; provenance is damaged and no paid request'
+            ' may start'
+        )
+    payload = load_strict_json_file(path)
+    for entry in payload['segments']:
+        if entry['id'] == segment_id:
+            return str(entry['text'])
+    raise ContractError(
+        f'narration snapshot {record["path"]} carries no text for'
+        f' segment {segment_id}'
+    )
+
+
+def _require_execution_permission(
+    allow_paid: bool,
+    limits: SpendingLimits | None,
+    planned_count: int,
+    text_chars: int,
+) -> float:
+    """Apply the paid execution guards before any key or HTTP use."""
+    if not allow_paid:
+        raise PaidExecutionDenied(
+            'permission',
+            'paid speech execution requires an explicit permission flag;'
+            ' no request was sent and no key was read',
+        )
+    if limits is None:
+        raise PaidExecutionDenied(
+            'limits',
+            'explicit numeric spending limits are required before paid'
+            ' execution; no request was sent and no key was read',
+        )
+    estimated_cost = limits.price_per_request * planned_count
+    if planned_count > limits.max_requests:
+        raise PaidExecutionDenied(
+            'limits_exceeded',
+            f'planning {planned_count} requests exceeds the explicit'
+            f' limit of {limits.max_requests}; no request was sent',
+        )
+    if text_chars > limits.max_text_chars:
+        raise PaidExecutionDenied(
+            'limits_exceeded',
+            f'planning {text_chars} text characters exceeds the explicit'
+            f' limit of {limits.max_text_chars}; no request was sent',
+        )
+    if estimated_cost > limits.max_cost_estimate + 1e-9:
+        raise PaidExecutionDenied(
+            'limits_exceeded',
+            f'estimated cost {estimated_cost} above the explicit limit'
+            f' {limits.max_cost_estimate} on basis'
+            f' {limits.price_basis!r}; no request was sent',
+        )
+    return estimated_cost
+
+
+def _read_speech_key(reader: Callable[[str], str | None]) -> str:
+    """Read the provider key only after every earlier guard passed."""
+    key = reader(xai_client.KEY_ENV_VAR)
+    if not key:
+        raise PaidExecutionDenied(
+            'key',
+            f'no provider key was found in {xai_client.KEY_ENV_VAR};'
+            ' no request was sent',
+        )
+    return key
+
+
+def _unresolved_by_segment(
+    journal: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    """Map segment ids to their unresolved journal operations."""
+    result: dict[str, dict[str, Any]] = {}
+    for operation in (journal or {}).get('operations', []):
+        if operation['state'] in UNRESOLVED_OPERATION_STATES:
+            result[operation['segment_id']] = operation
+    return result
+
+
+def _new_journal(journal: dict[str, Any] | None, now: str) -> dict[str, Any]:
+    """Return a writable journal payload, creating a fresh one."""
+    if journal is None:
+        return {
+            'schema_version': SUPPORTED_OPERATIONS_VERSION,
+            'operations': [],
+            'updated_at': now,
+        }
+    return journal
+
+
+def _write_journal(path: Path, journal: dict[str, Any], now: str) -> None:
+    """Durably persist the journal payload."""
+    journal['updated_at'] = now
+    atomic_write_json(path, journal)
+
+
+def _operation_for_segment(
+    segment: dict[str, Any],
+    manifest: dict[str, Any],
+    limits: SpendingLimits,
+    text: str,
+    now: str,
+) -> dict[str, Any]:
+    """Build one reserved operation record for one segment."""
+    return {
+        'operation_id': uuid.uuid4().hex,
+        'segment_id': segment['id'],
+        'synthesis_signature': segment['synthesis_signature'],
+        'request_signature': request_signature(text),
+        'posted_text_sha256': _segment_text_hash(text),
+        'posted_text_chars': len(text),
+        'posted_text_snapshot': {
+            'path': manifest['snapshots']['narration']['path'],
+            'sha256': manifest['snapshots']['narration']['sha256'],
+        },
+        'reserved_at': now,
+        'state': 'reserved',
+        'limits': limits.to_dict(),
+        'estimated_cost': limits.price_per_request,
+        'attempts': [],
+    }
+
+
+def _fresh_attempt(
+    operation: dict[str, Any],
+    limits: SpendingLimits,
+    linked: bool,
+    now: str,
+) -> dict[str, Any]:
+    """Append one in flight attempt record to the operation."""
+    attempt = {
+        'attempt': len(operation['attempts']) + 1,
+        'linked_retry': linked,
+        'limits': limits.to_dict(),
+        'started_at': now,
+        'finished_at': None,
+        'verdict': None,
+        'request_signature': operation['request_signature'],
+        'failure': None,
+        'evidence': None,
+        'response': None,
+        'artifact': None,
+    }
+    operation['attempts'].append(attempt)
+    return attempt
+
+
+def _finish_attempt(
+    attempt: dict[str, Any],
+    verdict: str,
+    now: str,
+    *,
+    failure: dict[str, Any] | None = None,
+    evidence: dict[str, Any] | None = None,
+    response: dict[str, Any] | None = None,
+    artifact: dict[str, Any] | None = None,
+) -> None:
+    """Record the final verdict fields on one attempt."""
+    attempt['finished_at'] = now
+    attempt['verdict'] = verdict
+    attempt['failure'] = failure
+    attempt['evidence'] = evidence
+    attempt['response'] = response
+    attempt['artifact'] = artifact
+
+
+def _retain_evidence(
+    job_dir: Path,
+    sink: Path,
+    operation_id: str,
+    attempt_number: int,
+) -> dict[str, Any] | None:
+    """Move received bytes into the evidence directory when possible."""
+    if not sink.is_file():
+        return None
+    relative = f'{EVIDENCE_DIR}/{operation_id}-a{attempt_number}.bin'
+    target = job_dir / relative
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        move_new_file(sink, target)
+    except (DestinationExistsError, OSError):
+        return None
+    return {
+        'path': relative,
+        'sha256': sha256_file(target),
+        'bytes': target.stat().st_size,
+    }
+
+
+def _publish_raw_artifact(
+    job_dir: Path,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    segment: dict[str, Any],
+    sink: Path,
+    receipt: Any,
+    now: str,
+) -> dict[str, Any]:
+    """Publish the validated response as an immutable raw artifact."""
+    ordinal = len(manifest['artifacts'])
+    relative = f'artifacts/{ordinal:03d}-raw_response-{segment["id"]}.wav'
+    move_new_file(sink, job_dir / relative)
+    artifact = {
+        'kind': 'raw_response',
+        'segment': segment['id'],
+        'signature': segment['synthesis_signature'],
+        'path': relative,
+        'sha256': sha256_file(job_dir / relative),
+        'created_at': now,
+    }
+    manifest['artifacts'].append(artifact)
+    view = _cache_view(
+        {
+            'segments': manifest['segments'],
+            'subtitle_signature': manifest['subtitle_signature'],
+            'container_signature': manifest['container_signature'],
+        },
+        manifest['artifacts'],
+        frozenset(),
+    )
+    manifest['stages'] = view['stages']
+    manifest['blocked'] = view['blocked']
+    manifest['updated_at'] = now
+    atomic_write_json(manifest_path, manifest)
+    return artifact
+
+
+def _run_operation_attempt(
+    job_dir: Path,
+    journal_path: Path,
+    journal: dict[str, Any],
+    operation: dict[str, Any],
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    segment: dict[str, Any],
+    limits: SpendingLimits,
+    client: SpeechClient,
+    now_fn: Callable[[], str],
+    linked: bool,
+) -> str:
+    """Reserve the attempt durably, perform HTTP once and record it.
+
+    Returns the operation verdict: completed, failed or uncertain.
+    """
+    text = _posted_text(job_dir, manifest, segment['id'])
+    validate_posted_text(text)
+    operation_id = operation['operation_id']
+    attempt = _fresh_attempt(operation, limits, linked, now_fn())
+    attempt_number = attempt['attempt']
+    operation['state'] = 'started'
+    _write_journal(journal_path, journal, now_fn())
+    sink = (
+        job_dir
+        / 'artifacts'
+        / (f'.partial-{operation_id}-a{attempt_number}.tmp')
+    )
+    started = time.monotonic()
+    retained = False
+    try:
+        try:
+            receipt = client.synthesize(text=text, sink=sink)
+            elapsed = time.monotonic() - started
+        except DefinitiveSpeechFailure as failure:
+            elapsed = time.monotonic() - started
+            evidence = _retain_evidence(
+                job_dir, sink, operation_id, attempt_number
+            )
+            retained = evidence is not None
+            response_record: dict[str, Any] | None = None
+            if failure.evidence.status_code is not None:
+                response_record = {
+                    'status': failure.evidence.status_code,
+                    'content_type': failure.evidence.content_type or 'unknown',
+                    'bytes': failure.evidence.byte_count,
+                    'sha256': failure.evidence.sha256,
+                    'wav': None,
+                    'elapsed_seconds': elapsed,
+                }
+            _finish_attempt(
+                attempt,
+                'failed',
+                now_fn(),
+                failure={'kind': failure.kind, 'detail': failure.detail},
+                evidence=evidence,
+                response=response_record,
+            )
+            operation['state'] = 'failed'
+            _write_journal(journal_path, journal, now_fn())
+            return 'failed'
+        except (UncertainSpeechFailure, OSError) as failure:
+            elapsed = time.monotonic() - started
+            kind = (
+                failure.kind
+                if isinstance(failure, UncertainSpeechFailure)
+                else 'storage_error'
+            )
+            detail = str(failure)
+            evidence = _retain_evidence(
+                job_dir, sink, operation_id, attempt_number
+            )
+            retained = evidence is not None
+            _finish_attempt(
+                attempt,
+                'uncertain',
+                now_fn(),
+                failure={'kind': kind, 'detail': detail},
+                evidence=evidence,
+            )
+            operation['state'] = 'uncertain'
+            _write_journal(journal_path, journal, now_fn())
+            return 'uncertain'
+        except BaseException:
+            try:
+                evidence = _retain_evidence(
+                    job_dir, sink, operation_id, attempt_number
+                )
+                retained = evidence is not None
+                _finish_attempt(
+                    attempt,
+                    'uncertain',
+                    now_fn(),
+                    failure={
+                        'kind': 'cancelled',
+                        'detail': 'the attempt was interrupted before a'
+                        ' verified complete response',
+                    },
+                    evidence=evidence,
+                )
+                operation['state'] = 'uncertain'
+                _write_journal(journal_path, journal, now_fn())
+            except Exception:
+                pass
+            raise
+    finally:
+        if sink.exists() and (retained or sink.stat().st_size == 0):
+            sink.unlink(missing_ok=True)
+    artifact = _publish_raw_artifact(
+        job_dir,
+        manifest,
+        manifest_path,
+        segment,
+        sink,
+        receipt,
+        now_fn(),
+    )
+    _finish_attempt(
+        attempt,
+        'completed',
+        now_fn(),
+        response={
+            'status': receipt.status_code,
+            'content_type': receipt.content_type,
+            'bytes': receipt.byte_count,
+            'sha256': receipt.sha256,
+            'wav': receipt.wav.to_dict(),
+            'elapsed_seconds': elapsed,
+        },
+        artifact={
+            'path': artifact['path'],
+            'sha256': artifact['sha256'],
+        },
+    )
+    operation['state'] = 'completed'
+    _write_journal(journal_path, journal, now_fn())
+    return 'completed'
+
+
+def _execute_one_segment(
+    job_dir: Path,
+    journal_path: Path,
+    journal: dict[str, Any],
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    segment: dict[str, Any],
+    limits: SpendingLimits,
+    client: SpeechClient,
+    now_fn: Callable[[], str],
+) -> str:
+    """Reserve one new operation and run its first attempt."""
+    text = _posted_text(job_dir, manifest, segment['id'])
+    operation = _operation_for_segment(
+        segment, manifest, limits, text, now_fn()
+    )
+    journal['operations'].append(operation)
+    _write_journal(journal_path, journal, now_fn())
+    return _run_operation_attempt(
+        job_dir,
+        journal_path,
+        journal,
+        operation,
+        manifest,
+        manifest_path,
+        segment,
+        limits,
+        client,
+        now_fn,
+        linked=False,
+    )
+
+
+def _run_guarded_planning(
+    job_dir: Path,
+    *,
+    allow_paid: bool,
+    limits: SpendingLimits | None,
+    require_permission: bool = True,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any] | None,
+    list[dict[str, Any]],
+    list[str],
+    int,
+]:
+    """Verify provenance, plan segments and apply the spending guards."""
+    manifest = load_job_manifest(job_dir / MANIFEST_NAME)
+    journal = load_operations_journal(job_dir)
+    _verify_job_integrity(job_dir, manifest)
+    _verify_window_feasibility(manifest)
+    planned, reused = _planned_segments(
+        manifest, manifest['artifacts'], frozenset()
+    )
+    total_chars = 0
+    for segment in planned:
+        text = _posted_text(job_dir, manifest, segment['id'])
+        total_chars += len(text)
+    if planned and require_permission:
+        _require_execution_permission(
+            allow_paid, limits, len(planned), total_chars
+        )
+    return manifest, journal, planned, reused, total_chars
+
+
+def preview_speech_operations(job_dir: Path) -> dict[str, Any]:
+    """Report the exact planned count and text volume without requests."""
+    job_dir = Path(job_dir).expanduser().resolve()
+    manifest = load_job_manifest(job_dir / MANIFEST_NAME)
+    journal = load_operations_journal(job_dir)
+    _verify_job_integrity(job_dir, manifest)
+    planned, reused = _planned_segments(
+        manifest, manifest['artifacts'], frozenset()
+    )
+    unresolved = _unresolved_by_segment(journal)
+    blocked = [
+        {
+            'segment': segment_id,
+            'operation_id': operation['operation_id'],
+            'state': operation['state'],
+        }
+        for segment_id, operation in unresolved.items()
+        if any(s['id'] == segment_id for s in planned)
+    ]
+    total_chars = sum(
+        len(_posted_text(job_dir, manifest, segment['id']))
+        for segment in planned
+    )
+    return {
+        'planned': [segment['id'] for segment in planned],
+        'planned_count': len(planned),
+        'planned_text_chars': total_chars,
+        'reused': reused,
+        'blocked_unresolved': blocked,
+    }
+
+
+def execute_speech_operations(
+    job_dir: Path,
+    *,
+    allow_paid: bool,
+    limits: SpendingLimits | None = None,
+    transport: xai_client.Transport | None = None,
+    key_reader: Callable[[str], str | None] | None = None,
+    now: Callable[[], str] | None = None,
+) -> SpeechExecutionResult:
+    """Run guarded speech synthesis for every uncached segment.
+
+    Complete cache reuse makes zero requests and never reads the key.
+    Guards run in order before any key access or HTTP: job validity,
+    journal validity, provenance integrity, window feasibility,
+    explicit permission, explicit numeric limits and the key itself.
+    """
+    job_dir = Path(job_dir).expanduser().resolve()
+    now_fn = now or utc_now_iso
+    reader = key_reader or os.environ.get
+    with JobLock.acquire(job_dir):
+        manifest, journal, planned, reused, _total = _run_guarded_planning(
+            job_dir, allow_paid=allow_paid, limits=limits
+        )
+        if not planned:
+            return SpeechExecutionResult(
+                planned=(),
+                reused=tuple(reused),
+                completed=(),
+                failed={},
+                uncertain={},
+                blocked_unresolved=(),
+                request_count=0,
+            )
+        if limits is None:
+            raise PaidExecutionDenied(
+                'limits',
+                'explicit numeric spending limits are required before'
+                ' paid execution; no request was sent and no key was read',
+            )
+        key = _read_speech_key(reader)
+        client = SpeechClient(key, transport=transport)
+        manifest_path = job_dir / MANIFEST_NAME
+        journal_path = job_dir / OPERATIONS_NAME
+        writable_journal = _new_journal(journal, now_fn())
+        unresolved = _unresolved_by_segment(writable_journal)
+        completed: list[str] = []
+        failed: dict[str, str] = {}
+        uncertain: dict[str, str] = {}
+        blocked: list[dict[str, str]] = []
+        executed = 0
+        for segment in planned:
+            segment_id = segment['id']
+            pending = unresolved.get(segment_id)
+            if pending is not None:
+                blocked.append(
+                    {
+                        'segment': segment_id,
+                        'operation_id': pending['operation_id'],
+                        'state': pending['state'],
+                    }
+                )
+                continue
+            verdict = _execute_one_segment(
+                job_dir,
+                journal_path,
+                writable_journal,
+                manifest,
+                manifest_path,
+                segment,
+                limits,
+                client,
+                now_fn,
+            )
+            executed += 1
+            if verdict == 'completed':
+                completed.append(segment_id)
+            elif verdict == 'failed':
+                failed[segment_id] = _latest_failure_kind(
+                    writable_journal, segment_id
+                )
+            else:
+                uncertain[segment_id] = _latest_failure_kind(
+                    writable_journal, segment_id
+                )
+        return SpeechExecutionResult(
+            planned=tuple(s['id'] for s in planned),
+            reused=tuple(reused),
+            completed=tuple(completed),
+            failed=failed,
+            uncertain=uncertain,
+            blocked_unresolved=tuple(blocked),
+            request_count=executed,
+        )
+
+
+def _latest_failure_kind(journal: dict[str, Any], segment_id: str) -> str:
+    """Return the failure kind of the newest attempt for a segment."""
+    for operation in reversed(journal['operations']):
+        if operation['segment_id'] != segment_id:
+            continue
+        for attempt in reversed(operation['attempts']):
+            failure = attempt['failure']
+            if failure is not None:
+                return str(failure['kind'])
+            if attempt['verdict'] == 'completed':
+                return 'completed'
+    return 'unknown'
+
+
+def retry_uncertain_operation(
+    job_dir: Path,
+    operation_id: str,
+    *,
+    allow_paid: bool,
+    limits: SpendingLimits | None = None,
+    transport: xai_client.Transport | None = None,
+    key_reader: Callable[[str], str | None] | None = None,
+    now: Callable[[], str] | None = None,
+) -> SpeechExecutionResult:
+    """Retry one named unresolved operation after explicit permission.
+
+    The retry requires the current request signature to match the
+    recorded one, appends a linked attempt and preserves the original
+    receipt unchanged.
+    """
+    job_dir = Path(job_dir).expanduser().resolve()
+    now_fn = now or utc_now_iso
+    reader = key_reader or os.environ.get
+    with JobLock.acquire(job_dir):
+        manifest, journal, _planned, reused, _total = _run_guarded_planning(
+            job_dir,
+            allow_paid=allow_paid,
+            limits=limits,
+            require_permission=False,
+        )
+        writable_journal = _new_journal(journal, now_fn())
+        operation = None
+        for candidate in writable_journal.get('operations', []):
+            if candidate['operation_id'] == operation_id:
+                operation = candidate
+                break
+        if operation is None:
+            raise ContractError(
+                f'no operation {operation_id} exists in the journal of'
+                f' {job_dir}; name the exact uncertain operation'
+            )
+        if operation['state'] not in UNRESOLVED_OPERATION_STATES:
+            raise ContractError(
+                f'operation {operation_id} is {operation["state"]}, not'
+                ' unresolved; only unresolved operations accept an'
+                ' explicit retry'
+            )
+        segment = None
+        for candidate in manifest['segments']:
+            if candidate['id'] == operation['segment_id']:
+                segment = candidate
+                break
+        if segment is None:
+            raise ContractError(
+                f'segment {operation["segment_id"]} of operation'
+                f' {operation_id} no longer exists in the manifest'
+            )
+        if segment['synthesis_signature'] != operation['synthesis_signature']:
+            raise ContractError(
+                f'operation {operation_id} was reserved for synthesis'
+                f' signature {operation["synthesis_signature"]} but the'
+                f' current signature is'
+                f' {segment["synthesis_signature"]}; the changed inputs'
+                ' require fresh planning instead of a retry'
+            )
+        text = _posted_text(job_dir, manifest, segment['id'])
+        if request_signature(text) != operation['request_signature']:
+            raise ContractError(
+                f'operation {operation_id} recorded request signature'
+                f' {operation["request_signature"]} but the current text'
+                ' hashes differently; changed narration requires fresh'
+                ' planning instead of a retry'
+            )
+        _require_execution_permission(allow_paid, limits, 1, len(text))
+        if limits is None:
+            raise PaidExecutionDenied(
+                'limits',
+                'explicit numeric spending limits are required before'
+                ' a retry; no request was sent and no key was read',
+            )
+        key = _read_speech_key(reader)
+        client = SpeechClient(key, transport=transport)
+        verdict = _run_operation_attempt(
+            job_dir,
+            job_dir / OPERATIONS_NAME,
+            writable_journal,
+            operation,
+            manifest,
+            job_dir / MANIFEST_NAME,
+            segment,
+            limits,
+            client,
+            now_fn,
+            linked=True,
+        )
+        failed: dict[str, str] = {}
+        uncertain: dict[str, str] = {}
+        completed: tuple[str, ...] = ()
+        if verdict == 'completed':
+            completed = (segment['id'],)
+        elif verdict == 'failed':
+            failed[segment['id']] = _latest_failure_kind(
+                writable_journal, segment['id']
+            )
+        else:
+            uncertain[segment['id']] = _latest_failure_kind(
+                writable_journal, segment['id']
+            )
+        return SpeechExecutionResult(
+            planned=(segment['id'],),
+            reused=tuple(reused),
+            completed=completed,
+            failed=failed,
+            uncertain=uncertain,
+            blocked_unresolved=(),
+            request_count=1,
+        )
