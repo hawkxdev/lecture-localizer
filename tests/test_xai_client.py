@@ -79,14 +79,6 @@ def extensible_extension(
     )
 
 
-TRUNCATED_EXTENSIBLE_BODY = b''
-
-
-def truncate_wav(payload: bytes) -> bytes:
-    """Cut a WAV payload so its declared data size overruns the file."""
-    return payload[:-4]
-
-
 class FakeResponse:
     """Canned streamed response for the fake transport."""
 
@@ -429,3 +421,41 @@ def test_phase_timeouts_are_validated() -> None:
     httpx_timeout = timeouts.to_httpx()
     assert httpx_timeout.connect == 5.0
     assert httpx_timeout.read == 120.0
+
+
+def test_direct_client_failure_chain_is_sanitized(tmp_path: Path) -> None:
+    import traceback
+
+    transport = FakeTransport(
+        httpx.ReadTimeout(f'peer dropped for {SECRET_KEY}')
+    )
+    with pytest.raises(TransportUncertainFailure) as raised:
+        make_client(transport).synthesize(
+            text='Проверка.', sink=tmp_path / 'raw.bin'
+        )
+    rendered = ''.join(
+        traceback.format_exception(
+            type(raised.value), raised.value, raised.value.__traceback__
+        )
+    )
+    assert SECRET_KEY not in str(raised.value)
+    assert SECRET_KEY not in rendered
+    assert '[redacted]' in str(raised.value)
+
+
+def test_reflected_content_type_header_is_sanitized(tmp_path: Path) -> None:
+    transport = FakeTransport(
+        FakeResponse(
+            chunks=(b'error body',),
+            status_code=500,
+            headers={'content-type': f'text/plain; note={SECRET_KEY}'},
+        )
+    )
+    with pytest.raises(ProviderRejectedRequest) as raised:
+        make_client(transport).synthesize(
+            text='Проверка.', sink=tmp_path / 'raw.bin'
+        )
+    assert SECRET_KEY not in str(raised.value.evidence.to_dict())
+    sanitized_type = raised.value.evidence.content_type
+    assert sanitized_type is not None
+    assert '[redacted]' in sanitized_type

@@ -1840,7 +1840,9 @@ def _run_operation_attempt(
             if failure.evidence.status_code is not None:
                 response_record = {
                     'status': failure.evidence.status_code,
-                    'content_type': failure.evidence.content_type or 'unknown',
+                    'content_type': redactor(
+                        failure.evidence.content_type or 'unknown'
+                    ),
                     'bytes': failure.evidence.byte_count,
                     'sha256': failure.evidence.sha256,
                     'wav': None,
@@ -2161,35 +2163,26 @@ def _latest_failure_kind(journal: dict[str, Any], segment_id: str) -> str:
 def _validate_operation_provenance(
     job_dir: Path,
     operation: dict[str, Any],
-    manifest: dict[str, Any],
     text: str,
 ) -> None:
-    """Verify the journal's recorded posted text provenance.
+    """Verify the recorded posted text provenance of one operation.
 
-    The recorded snapshot record, text hash and character count must
-    match the current manifest snapshot and the actual frozen text;
-    any mismatch is damaged provenance that blocks the retry while
-    keeping the journal preserved.
+    The recorded immutable snapshot file must still exist with its
+    recorded digest, the recorded posted text hash and character count
+    must match the actual current frozen text, and the request
+    signature binding the segment to that text is checked by the
+    caller. Any mismatch is damaged provenance that blocks the retry
+    while keeping the journal and all receipts preserved.
     """
     operation_id = operation['operation_id']
-    snapshot = manifest['snapshots']['narration']
     recorded = operation['posted_text_snapshot']
-    if (
-        recorded['path'] != snapshot['path']
-        or recorded['sha256'] != snapshot['sha256']
-    ):
+    snapshot_path = job_dir / recorded['path']
+    if sha256_file(snapshot_path) != recorded['sha256']:
         raise ContractError(
-            f'operation {operation_id} recorded text snapshot'
-            f' {recorded["path"]} which does not match the current'
-            f' narration snapshot {snapshot["path"]}; the journal'
-            ' provenance is damaged and the operation stays unresolved'
-        )
-    actual_snapshot = job_dir / snapshot['path']
-    if sha256_file(actual_snapshot) != snapshot['sha256']:
-        raise ContractError(
-            f'narration snapshot {snapshot["path"]} no longer matches'
-            f' its recorded digest; operation {operation_id} stays'
-            ' unresolved until the job is inspected'
+            f'the recorded narration snapshot {recorded["path"]} of'
+            f' operation {operation_id} is missing or no longer matches'
+            ' its recorded digest; the journal provenance is damaged'
+            ' and the operation stays unresolved'
         )
     if operation['posted_text_sha256'] != _segment_text_hash(text):
         raise ContractError(
@@ -2276,7 +2269,7 @@ def retry_uncertain_operation(
                 ' hashes differently; changed narration requires fresh'
                 ' planning instead of a retry'
             )
-        _validate_operation_provenance(job_dir, operation, manifest, text)
+        _validate_operation_provenance(job_dir, operation, text)
         validate_posted_text(text)
         _require_execution_permission(allow_paid, limits, 1, len(text))
         if limits is None:

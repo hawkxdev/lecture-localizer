@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import struct
-import time
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -312,7 +311,9 @@ def httpx_transport(
     return _HttpxStreamedResponse(response, client)
 
 
-def _map_transport_error(error: httpx.HTTPError) -> RuntimeError:
+def _map_transport_error(
+    error: httpx.HTTPError,
+) -> DefinitiveSpeechFailure | UncertainSpeechFailure:
     """Classify one httpx failure as definitive or uncertain."""
     if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)):
         return TransportConnectFailure(
@@ -368,6 +369,12 @@ class SpeechClient:
         self._transport: Transport = transport or httpx_transport
         self._timeouts = timeouts or PhaseTimeouts()
 
+    def _sanitize(self, text: str | None) -> str:
+        """Remove the configured credential from rendered diagnostics."""
+        if not text:
+            return ''
+        return text.replace(self._api_key, '[redacted]')
+
     def synthesize(self, *, text: str, sink: Path) -> SynthesisReceipt:
         """Post one request, stream the body to sink and validate it.
 
@@ -376,6 +383,8 @@ class SpeechClient:
         a decodable WAV at the approved sample rate returns a receipt.
         Any other outcome raises a definitive or uncertain typed
         failure while the received bytes remain available in the sink.
+        Reflected provider metadata and transport messages are
+        sanitized so no rendered diagnostic carries the credential.
         """
         validate_posted_text(text)
         payload = build_payload(text)
@@ -411,10 +420,14 @@ class SpeechClient:
                     if response is not None:
                         response.close()
         except httpx.HTTPError as error:
-            raise _map_transport_error(error) from error
+            error.args = (self._sanitize(str(error)),)
+            failure = _map_transport_error(error)
+            failure.detail = self._sanitize(failure.detail)
+            failure.args = (failure.detail,)
+            raise failure from error
         evidence = FailureEvidence(
             status_code=status,
-            content_type=content_type,
+            content_type=self._sanitize(content_type),
             byte_count=received,
             sha256=digest.hexdigest(),
             excerpt='',
@@ -423,10 +436,10 @@ class SpeechClient:
             _, _, excerpt = _excerpt_from(sink)
             failed = FailureEvidence(
                 status_code=status,
-                content_type=content_type,
+                content_type=self._sanitize(content_type),
                 byte_count=received,
                 sha256=evidence.sha256,
-                excerpt=excerpt,
+                excerpt=self._sanitize(excerpt),
             )
             raise ProviderRejectedRequest(
                 f'the provider answered HTTP {status} instead of 200',
@@ -437,13 +450,13 @@ class SpeechClient:
             _, _, excerpt = _excerpt_from(sink)
             raise UnexpectedContentType(
                 'a 200 response arrived with content type'
-                f' {content_type!r} instead of audio/wav',
+                f' {self._sanitize(content_type)!r} instead of audio/wav',
                 FailureEvidence(
                     status_code=status,
-                    content_type=content_type,
+                    content_type=self._sanitize(content_type),
                     byte_count=received,
                     sha256=evidence.sha256,
-                    excerpt=excerpt,
+                    excerpt=self._sanitize(excerpt),
                 ),
             )
         try:
@@ -454,10 +467,10 @@ class SpeechClient:
                 error.detail,
                 FailureEvidence(
                     status_code=status,
-                    content_type=content_type,
+                    content_type=self._sanitize(content_type),
                     byte_count=received,
                     sha256=evidence.sha256,
-                    excerpt=excerpt,
+                    excerpt=self._sanitize(excerpt),
                 ),
             ) from error
         return SynthesisReceipt(
@@ -617,8 +630,3 @@ def _invalid(detail: str) -> InvalidAudioResponse:
         detail,
         FailureEvidence(None, None, 0, sha256_bytes(b''), ''),
     )
-
-
-def monotonic_now() -> float:
-    """Return a monotonic timestamp for observed elapsed measurement."""
-    return time.monotonic()

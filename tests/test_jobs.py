@@ -1976,3 +1976,154 @@ def _prepare_simple_job(tmp_path: Path) -> Path:
         settings=Settings(),
     )
     return job
+
+
+# --- Second review residual controls (R1 R6) ---
+
+
+def test_reflected_content_type_never_persists_the_key(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport(
+        FakeResponse(
+            chunks=(b'service error',),
+            status_code=500,
+            headers={'content-type': f'text/plain; note={KEY_MATERIAL}'},
+        )
+    )
+    job = _prepare_simple_job(tmp_path)
+    result = execute_speech_operations(
+        job,
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=transport,
+        key_reader=lambda name: KEY_MATERIAL,
+    )
+    assert set(result.failed) == {'s001', 's002'}
+    journal_text = (job / 'operations.json').read_text(encoding='utf-8')
+    assert KEY_MATERIAL not in journal_text
+    assert '[redacted]' in journal_text
+
+
+def test_retry_after_sibling_narration_change_completes(
+    tmp_path: Path,
+) -> None:
+    job = _prepare_simple_job(tmp_path)
+    first = execute_speech_operations(
+        job,
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=timeout_transport(),
+        key_reader=lambda name: KEY_MATERIAL,
+    )
+    assert len(first.uncertain) == 2
+    journal = load_journal(job)
+    operation_id = journal['operations'][0]['operation_id']
+    segments = [
+        {
+            'id': 's001',
+            'source_cues': [1],
+            'translation': 'Первая реплика.',
+            'narration': 'Первая реплика для речи.',
+        },
+        {
+            'id': 's002',
+            'source_cues': [2],
+            'translation': 'Вторая реплика.',
+            'narration': 'Совершенно новая вторая озвучка.',
+        },
+    ]
+    changed = write_translation(
+        tmp_path / 'changed.json',
+        tmp_path / 'src' / 'lecture.mp4',
+        tmp_path / 'src' / 'lecture.srt',
+        segments,
+    )
+    prepare_job(
+        video_path=tmp_path / 'src' / 'lecture.mp4',
+        srt_path=tmp_path / 'src' / 'lecture.srt',
+        translation_path=changed,
+        job_dir=job,
+        output_path=tmp_path / 'out.mp4',
+        source_audio=None,
+        settings=Settings(),
+    )
+    transport = success_transport()
+    result = retry_uncertain_operation(
+        job,
+        operation_id,
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=transport,
+        key_reader=lambda name: KEY_MATERIAL,
+    )
+    assert result.completed == ('s001',)
+    assert len(transport.requests) == 1
+    journal = load_journal(job)
+    retried = next(
+        op
+        for op in journal['operations']
+        if op['operation_id'] == operation_id
+    )
+    assert retried['state'] == 'completed'
+    assert retried['attempts'][0]['verdict'] == 'uncertain'
+    assert retried['attempts'][1]['verdict'] == 'completed'
+
+
+def test_retry_blocks_when_recorded_snapshot_is_damaged(
+    tmp_path: Path,
+) -> None:
+    job = _prepare_simple_job(tmp_path)
+    first = execute_speech_operations(
+        job,
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=timeout_transport(),
+        key_reader=lambda name: KEY_MATERIAL,
+    )
+    assert len(first.uncertain) == 2
+    journal = load_journal(job)
+    operation = journal['operations'][0]
+    operation_id = operation['operation_id']
+    segments = [
+        {
+            'id': 's001',
+            'source_cues': [1],
+            'translation': 'Первая реплика.',
+            'narration': 'Первая реплика для речи.',
+        },
+        {
+            'id': 's002',
+            'source_cues': [2],
+            'translation': 'Вторая реплика.',
+            'narration': 'Совершенно новая вторая озвучка.',
+        },
+    ]
+    changed = write_translation(
+        tmp_path / 'changed.json',
+        tmp_path / 'src' / 'lecture.mp4',
+        tmp_path / 'src' / 'lecture.srt',
+        segments,
+    )
+    prepare_job(
+        video_path=tmp_path / 'src' / 'lecture.mp4',
+        srt_path=tmp_path / 'src' / 'lecture.srt',
+        translation_path=changed,
+        job_dir=job,
+        output_path=tmp_path / 'out.mp4',
+        source_audio=None,
+        settings=Settings(),
+    )
+    snapshot_path = job / operation['posted_text_snapshot']['path']
+    snapshot_path.write_bytes(b'damaged snapshot bytes')
+    transport = FakeTransport(AssertionError('transport must never be called'))
+    with pytest.raises(ContractError, match='provenance is damaged'):
+        retry_uncertain_operation(
+            job,
+            operation_id,
+            allow_paid=True,
+            limits=TEST_LIMITS,
+            transport=transport,
+            key_reader=trap_reader,
+        )
+    assert transport.requests == []
