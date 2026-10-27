@@ -1,0 +1,386 @@
+{
+  "inputs": [
+    {
+      "path": ".agents/skills/project-guide/SKILL.md",
+      "sha256": "e0bfcc2226fdca5bc8cde19ff80886d5c22470e1db8c1cf534b323b45721bb41",
+      "size_bytes": 5034,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": ".agents/skills/project-guide/references/kb-index.md",
+      "sha256": "902a4d199de7d505a0c8bcba1ed9b8b7d746f40c8c298c40fe594717a2a17f05",
+      "size_bytes": 680,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/documentation.yml",
+      "sha256": "02e470cd34c63c6f77acf64e5d586a1cd6bfc2be4d90d6bbeb492dc2de1c0a14",
+      "size_bytes": 691,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/proposal.yml",
+      "sha256": "0c9f50f4e1215edf3399f14dc00a0eddda8a961425209a8125e4e7433e2da97d",
+      "size_bytes": 953,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": ".github/PULL_REQUEST_TEMPLATE.md",
+      "sha256": "bf5041f89eb928b1d6c0d72a9b1c978627ead5a60fbdde76afcbf4fdaa051ded",
+      "size_bytes": 292,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": ".gitignore",
+      "sha256": "a3cb030c440dda93c781b64068c077661521a92cb29736946638bb7450ec137b",
+      "size_bytes": 178,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": ".gitleaks.toml",
+      "sha256": "27630a96d6c55755cc37620f3933d5cab94b1eb78a726a32e11212972525d76e",
+      "size_bytes": 27,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "AGENTS.md",
+      "sha256": "757f6f6e03153aff4eab99e817d5dae736dfbacd6093967ba547e07398bcdbe0",
+      "size_bytes": 2456,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "CONTRIBUTING.md",
+      "sha256": "bd6042f9cc75a4b713b77a80d0d8ba53b839cf1ced1cbdf4517e539708e85636",
+      "size_bytes": 3078,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "LICENSE",
+      "sha256": "a1613cad30806aead2fc5cdd1510227e33eec7ac88243a6a7e106e872dff6d39",
+      "size_bytes": 1065,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "README.md",
+      "sha256": "712b879bcae04dfdeabb0848d79c7e5ce0cf814e826416f20c92e8390a5402a2",
+      "size_bytes": 6092,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "SECURITY.md",
+      "sha256": "74c2f660a748fcb5bd0395ea5e53166454a638974d8c639eadbcf04adc605786",
+      "size_bytes": 798,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "docs/specs/001-lecture-localization/parallel-contract.md",
+      "sha256": "506fa13f7f79a0db677d370dbaa0ed5e2bc0d394ac76473406f8474124689769",
+      "size_bytes": 11916,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "docs/specs/001-lecture-localization/plan.md",
+      "sha256": "af1afcd99863f8c092fa785c587f8875b26be504c00093f9fbe4e39b9902955c",
+      "size_bytes": 27855,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "docs/specs/001-lecture-localization/spec.md",
+      "sha256": "a7ddac50f812d42901595eab18bcc5367ec171126de87ecfe28e56c1dbd04261",
+      "size_bytes": 19230,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "pyproject.toml",
+      "sha256": "bbeddd86821905bb3f690b7fc3119d48bff096f745addfcdbe0fd8d67c278f45",
+      "size_bytes": 2138,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "scripts/make-synthetic-example.py",
+      "sha256": "930e3dd7981ce348c6e586ae72b99114e27209edcf242b52a6a202c6454e017f",
+      "size_bytes": 2750,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "scripts/qc-python-cli.sh",
+      "sha256": "480722e4892711a5cefac106bca971dba8de14589fa3c4c588fd5b5f6fe5fc41",
+      "size_bytes": 8842,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "src/lecture_localizer/__init__.py",
+      "sha256": "7dac6c73ec531713185ecae4e1129f7a4231b518cbc561a8eeb60ee2c511a63d",
+      "size_bytes": 86,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "src/lecture_localizer/cli.py",
+      "sha256": "1c2288e04423b4bb236b9a2126b4cb6294decef484532a9a47563c729be99754",
+      "size_bytes": 11047,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "src/lecture_localizer/contracts.py",
+      "sha256": "c54d1964c54dd950b0e0a3dff408a0d5f99b3b41f62ac3a77a7126dcddd18aa4",
+      "size_bytes": 7353,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "src/lecture_localizer/jobs.py",
+      "sha256": "fb3b008c42c7f89d9784ace2c150fd50cf04e11f0c4419f1be59c9e9f2acd640",
+      "size_bytes": 43999,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "src/lecture_localizer/media.py",
+      "sha256": "a0be947951c58c9678562ad6c936bf4bdf11a1272a3cf2a53e9d6b139000646f",
+      "size_bytes": 11748,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "src/lecture_localizer/schemas/job-v1.schema.json",
+      "sha256": "68eab2ad5fd14b907dca2805c5af16cfca44fea2eb6ebb5862baf0a24b7a87f8",
+      "size_bytes": 11074,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "src/lecture_localizer/schemas/translation-v1.schema.json",
+      "sha256": "bf1e5993b01f8f58aa4af73f5c4f5a98ceca1caff068f0c5ddc4de9b007838a3",
+      "size_bytes": 1782,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "src/lecture_localizer/settings.py",
+      "sha256": "5b27dc3aa28ef4dd3321e52b0d823cbc3dd64629edb45ed44e1992a02519d715",
+      "size_bytes": 5561,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "src/lecture_localizer/storage.py",
+      "sha256": "7240d20995007e3fa827de12168443df615779f60385f7014a4b0e57f807c020",
+      "size_bytes": 9681,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "src/lecture_localizer/subtitles.py",
+      "sha256": "37a5f55e506b2408ac7eaae02a7baee43c68b335430d8336bf946f1559733687",
+      "size_bytes": 7439,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "tests/conftest.py",
+      "sha256": "40304172627c790c05347ed143ea8c951f96500e1c7700724dc2645dd10cd7c2",
+      "size_bytes": 15146,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "tests/test_cli.py",
+      "sha256": "305a0f08c1124345adde85192df073e80129ebf89ca4bf91023d73a1bee328a9",
+      "size_bytes": 26154,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "tests/test_contracts.py",
+      "sha256": "08092e9715292990bf2af669609b9815a4d04026eff50d7598a8370d4418485c",
+      "size_bytes": 10421,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "tests/test_jobs.py",
+      "sha256": "38bdd6e196c12def36210320fcd72ae02c9e33a58843c73e3ca0e4b26eff3d4c",
+      "size_bytes": 42206,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "tests/test_media.py",
+      "sha256": "b65a459e494cd9e6b279c8b8c2465cfdd5c997371062e97ce5578af29089d49f",
+      "size_bytes": 7876,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "tests/test_media_fixtures.py",
+      "sha256": "12d4e9232ffbfa78b65aaa29a5c02c1db1fa25e0920c4674e65a14cb5a846260",
+      "size_bytes": 3791,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "tests/test_settings.py",
+      "sha256": "d831467c1a3fd52db64566086cf31a64eb99cca7febaab94a08c6dfaca579a6c",
+      "size_bytes": 3662,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "tests/test_storage.py",
+      "sha256": "5c5832d64d406612d013fcc36044707e2e9a0af56deb4dfd86b8429ad97bc27c",
+      "size_bytes": 7622,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "tests/test_subtitles.py",
+      "sha256": "c80914cd5ed7219211bd2ec39df66babbbbfdbbef5b35871b1dd35bc82db32e8",
+      "size_bytes": 6437,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    },
+    {
+      "path": "tests/test_synthetic_example.py",
+      "sha256": "1914f63dc0ac132c086c05a37ac57e93df69294cb4937e0f94f931130f2a3788",
+      "size_bytes": 5170,
+      "source": {
+        "kind": "git",
+        "repository": "github.com/hawkxdev/lecture-localizer",
+        "revision": "0969376ee639358e83170c28ecd476debb38e336"
+      }
+    }
+  ],
+  "schema": 1,
+  "task_key": "lecture-001-parallel-pipeline"
+}
