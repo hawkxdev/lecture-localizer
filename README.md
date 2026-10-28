@@ -2,6 +2,8 @@
 
 A local CLI for localizing lecture videos while preserving the original media.
 
+Provide a local video, matching English SRT subtitles and a reviewed Russian translation. The current version produces an MP4 with selectable original/Russian audio and subtitle tracks. Automated transcription and translation are planned extensions.
+
 **Status:** Development. An installable package with local tool diagnostics, validated persistent jobs, guarded speech synthesis, fitted narration, verified MP4 assembly and the complete guarded run/offline assemble commands is available. The first scenario is accepted on a short macOS reference sample, including reviewed translation, listening, QuickTime/IINA behavior and a 1.20 speed comparison. Long-lecture use, other voices and other platforms remain unverified; review each new output.
 
 ## Implemented: `lecture-localizer doctor`
