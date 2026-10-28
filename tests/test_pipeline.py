@@ -141,6 +141,7 @@ def run_full(
     **kwargs: Any,
 ) -> Any:
     """Run the full pipeline over the kit job with counting fakes."""
+
     return run_job_pipeline(
         kit['job'],
         allow_paid=kwargs.get('allow_paid', True),
@@ -291,6 +292,8 @@ def test_uncertain_http_blocks_then_named_retry_completes(
     prepare(kit)
 
     class UncertainTransport(CountingTransport):
+        """Provider transport that ends every request uncertainly."""
+
         def __call__(self, **kwargs: Any) -> FakeResponse:
             raise TransportUncertainFailure(
                 'partial_response',
@@ -328,6 +331,8 @@ def test_definitive_http_failure_is_non_success(tmp_path: Path) -> None:
     prepare(kit)
 
     class FailingTransport(CountingTransport):
+        """Provider transport returning a definitive HTTP 500."""
+
         def __call__(self, **kwargs: Any) -> FakeResponse:
             self.requests.append({})
             return FakeResponse(
@@ -372,6 +377,7 @@ def test_corrupt_staging_fails_verification_before_publication(
     original_build = mux_module.build_candidate
 
     def corrupting_build(request: Any, settings: Settings) -> Any:
+        """Truncate the freshly built staging candidate."""
         result = original_build(request, settings)
         data = request.destination.read_bytes()
         request.destination.write_bytes(data[: int(len(data) * 0.8)])
@@ -442,6 +448,7 @@ def test_foreign_identical_file_during_interrupted_link_is_collision(
     real_receipt = jobs_module._write_publication_receipt
 
     def crashing_receipt(job_dir: Path, payload: dict[str, Any]) -> None:
+        """Persist the receipt, then interrupt before the link."""
         real_receipt(job_dir, payload)
         if payload.get('state') == 'linking':
             raise RuntimeError('simulated crash before linking output')
@@ -479,6 +486,7 @@ def test_interrupted_own_publication_republishes_from_provenance(
     real_receipt = jobs_module._write_publication_receipt
 
     def crashing_receipt(job_dir: Path, payload: dict[str, Any]) -> None:
+        """Persist the receipt, then interrupt before the link."""
         real_receipt(job_dir, payload)
         if payload.get('state') == 'linking':
             raise RuntimeError('simulated crash after registration')
@@ -823,10 +831,6 @@ def test_cli_cancellation_maps_to_130(
     prepare(kit)
     limits_path = write_limits_file(tmp_path / 'limits.json')
 
-    class InterruptingTransport(CountingTransport):
-        def __call__(self, **kwargs: Any) -> FakeResponse:
-            raise KeyboardInterrupt
-
     monkeypatch.setattr(
         'lecture_localizer.cli.run_job_pipeline',
         lambda *a, **kw: _run_with_interrupt(kit, kw),
@@ -850,6 +854,7 @@ def test_cli_cancellation_maps_to_130(
 
 def _run_with_interrupt(kit: dict[str, Path], kwargs: dict[str, Any]) -> Any:
     """Run the real pipeline with an interrupting transport."""
+
     run_job_pipeline(
         kit['job'],
         allow_paid=True,
@@ -861,6 +866,8 @@ def _run_with_interrupt(kit: dict[str, Path], kwargs: dict[str, Any]) -> Any:
 
 
 class InterruptingTransportStatic(CountingTransport):
+    """Provider transport that raises KeyboardInterrupt once called."""
+
     def __call__(self, **kwargs: Any) -> FakeResponse:
         raise KeyboardInterrupt
 
@@ -1305,6 +1312,8 @@ def test_reconciliation_requires_current_signature(tmp_path: Path) -> None:
     )
 
     class UncertainTransport(CountingTransport):
+        """Provider transport that ends every request uncertainly."""
+
         def __call__(self, **kwargs: Any) -> FakeResponse:
             raise TransportUncertainFailure(
                 'partial_response',
@@ -1380,6 +1389,8 @@ def test_reconciliation_never_falsifies_known_uncertain_attempt(
     operation_id = payload['operations'][0]['operation_id']
 
     class UncertainTransport(CountingTransport):
+        """Provider transport that ends every request uncertainly."""
+
         def __call__(self, **kwargs: Any) -> FakeResponse:
             raise TransportUncertainFailure(
                 'inactivity_timeout',

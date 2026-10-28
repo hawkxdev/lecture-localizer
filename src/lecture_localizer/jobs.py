@@ -3577,7 +3577,7 @@ def _owned_publication_matches(
     output_path: Path,
     candidate_record: dict[str, Any],
 ) -> bool:
-    """Recognize one output as this job's own published result.
+    """Recognize the published result of this job.
 
     Recognition needs the full durable provenance chain: the receipt
     must name this exact destination, the actual file must still carry
