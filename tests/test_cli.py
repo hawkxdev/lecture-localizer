@@ -25,7 +25,7 @@ def test_help_advertises_implemented_commands(
         main(['--help'])
     assert excinfo.value.code == 0
     out = capsys.readouterr().out
-    assert '{doctor,prepare,status}' in out
+    assert '{doctor,prepare,status,run,assemble}' in out
 
 
 def test_unimplemented_pipeline_commands_are_rejected() -> None:

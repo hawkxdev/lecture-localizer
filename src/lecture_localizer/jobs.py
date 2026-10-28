@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import shutil
+import tempfile
 import time
 import uuid
 from collections.abc import Callable
@@ -13,7 +16,8 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-from lecture_localizer import media, xai_client
+from lecture_localizer import audio, media, mux, verification, xai_client
+from lecture_localizer.audio import NormalizedSpeech, SegmentPlacement
 from lecture_localizer.contracts import (
     ContractError,
     TranslationDocument,
@@ -26,15 +30,25 @@ from lecture_localizer.contracts import (
     verify_binding,
 )
 from lecture_localizer.media import MediaToolError
-from lecture_localizer.settings import Settings
+from lecture_localizer.mux import (
+    ConvertedAudioTrack,
+    CopiedAudioStream,
+    MuxRequest,
+    TrackProfile,
+)
+from lecture_localizer.settings import Settings, load_settings
 from lecture_localizer.storage import (
     DestinationExistsError,
     IntegrityRecord,
     JobLock,
+    LockUnavailableError,
+    StorageError,
     atomic_write_json,
+    copy_new_file,
     create_new_file,
     ensure_distinct_files,
     ensure_outside,
+    fsync_directory,
     move_new_file,
     sha256_bytes,
     sha256_file,
@@ -44,12 +58,18 @@ from lecture_localizer.storage import (
 from lecture_localizer.subtitles import (
     SegmentWindow,
     SourceCue,
+    SubtitlesError,
     derive_windows,
     parse_srt,
+    russian_srt,
+)
+from lecture_localizer.verification import (
+    CandidateExpectation,
 )
 from lecture_localizer.xai_client import (
     DefinitiveSpeechFailure,
     SpeechClient,
+    SpeechRequestError,
     UncertainSpeechFailure,
     request_signature,
     validate_posted_text,
@@ -60,12 +80,22 @@ SNAPSHOT_DIR = 'snapshots'
 LOCK_NAME = 'lock'
 OPERATIONS_NAME = 'operations.json'
 EVIDENCE_DIR = 'evidence'
+PUBLICATION_RECEIPT = 'evidence/publication.json'
 STAGE_NAMES = ('synthesis', 'fitting', 'subtitle', 'container')
 SUPPORTED_CONTAINERS = frozenset({'mp4', 'mov', 'matroska'})
 SUPPORTED_AUDIO_CODECS = frozenset({'aac', 'pcm_s16le', 'mp3', 'opus'})
 HDR_TRANSFERS = frozenset({'smpte2084', 'arib-std-b67'})
 UNRESOLVED_OPERATION_STATES = frozenset({'reserved', 'started', 'uncertain'})
 OPERATIONS_SCHEMA = load_schema('operations-v1.schema.json')
+TIMELINE_SAMPLE_RATE = audio.SAMPLE_RATE
+TIMELINE_SAMPLES_PER_MS = audio.SAMPLES_PER_MS
+TIMELINE_BYTES_PER_SAMPLE = audio.BYTES_PER_SAMPLE
+COPY_CHUNK_BYTES = 1 << 20
+ORIGINAL_AUDIO_SETTINGS: dict[str, Any] = {
+    'codec': 'aac_lc',
+    'sample_rate_hz': 48000,
+    'bitrate_kbps': 192,
+}
 SYNTHESIS_SETTINGS: dict[str, Any] = {
     'provider': 'xai',
     'voice': 'eve',
@@ -1024,60 +1054,73 @@ def _build_job_state(
     return manifest, invalidated, stored is None, False
 
 
+def _classify_records(
+    kind: str,
+    expected: dict[str | None, str],
+    artifacts: list[dict[str, Any]],
+    failed_labels: frozenset[str],
+) -> dict[str | None, str]:
+    """Classify one artifact kind against expected unit signatures.
+
+    A unit is ok when any retained record for it carries the current
+    signature and verifies: history is scanned, not just the last row.
+    Records for other signatures stay as valid history and never decide
+    current eligibility.
+    """
+    result: dict[str | None, str] = {}
+    for unit, signature in expected.items():
+        records = [
+            record
+            for record in artifacts
+            if record['kind'] == kind and record['segment'] == unit
+        ]
+        if not records:
+            result[unit] = 'missing'
+        elif any(
+            _artifact_label(record) not in failed_labels
+            and record['signature'] == signature
+            for record in records
+        ):
+            result[unit] = 'ok'
+        elif any(
+            _artifact_label(record) in failed_labels for record in records
+        ):
+            result[unit] = 'corrupt'
+        else:
+            result[unit] = 'stale'
+    return result
+
+
 def _unit_classifications(
     manifest: dict[str, Any],
     artifacts: list[dict[str, Any]],
     failed_labels: frozenset[str],
 ) -> dict[str, Any]:
-    """Classify every required cache unit against the current inputs.
-
-    A unit is ok when any retained record for it carries the current
-    signature and verifies: history is scanned, not just the last row,
-    so returning to an earlier signature reuses its intact response.
-    Records for other signatures stay as valid history and never decide
-    current eligibility.
-    """
+    """Classify every required cache unit against the current inputs."""
     segment_ids = [s['id'] for s in manifest['segments']]
-
-    def classify(
-        kind: str, expected: dict[str | None, str]
-    ) -> dict[str | None, str]:
-        result: dict[str | None, str] = {}
-        for unit, signature in expected.items():
-            records = [
-                record
-                for record in artifacts
-                if record['kind'] == kind and record['segment'] == unit
-            ]
-            if not records:
-                result[unit] = 'missing'
-            elif any(
-                _artifact_label(record) not in failed_labels
-                and record['signature'] == signature
-                for record in records
-            ):
-                result[unit] = 'ok'
-            elif any(
-                _artifact_label(record) in failed_labels for record in records
-            ):
-                result[unit] = 'corrupt'
-            else:
-                result[unit] = 'stale'
-        return result
-
-    raw = classify(
+    raw = _classify_records(
         'raw_response',
         {s['id']: s['synthesis_signature'] for s in manifest['segments']},
+        artifacts,
+        failed_labels,
     )
-    fitted = classify(
+    fitted = _classify_records(
         'fitted_audio',
         {s['id']: s['fitting_signature'] for s in manifest['segments']},
+        artifacts,
+        failed_labels,
     )
-    subtitle = classify('subtitles', {None: manifest['subtitle_signature']})[
-        None
-    ]
-    container = classify(
-        'container_track', {None: manifest['container_signature']}
+    subtitle = _classify_records(
+        'subtitles',
+        {None: manifest['subtitle_signature']},
+        artifacts,
+        failed_labels,
+    )[None]
+    container = _classify_records(
+        'container_track',
+        {None: manifest['container_signature']},
+        artifacts,
+        failed_labels,
     )[None]
     return {
         'units': {
@@ -1087,6 +1130,192 @@ def _unit_classifications(
             'container_track': container,
         },
         'segment_ids': segment_ids,
+    }
+
+
+def _timeline_total_frames(manifest: dict[str, Any]) -> int:
+    """Derive the timeline frame count from the measured duration.
+
+    The measured video duration is converted with explicit nearest
+    sample, half up rounding; the quantization is reported by the
+    pipeline report instead of being silently absorbed.
+    """
+    duration = manifest['media']['duration_seconds']
+    if duration is None:
+        raise ContractError(
+            'the recorded media carries no duration, so the assembly'
+            ' timeline length cannot be derived'
+        )
+    frames = Fraction(str(duration)) * TIMELINE_SAMPLE_RATE
+    return int(frames + Fraction(1, 2))
+
+
+def _timeline_duration_ms(total_frames: int) -> int:
+    """Convert an exact timeline frame count to half up milliseconds."""
+    return (
+        total_frames + TIMELINE_SAMPLES_PER_MS // 2
+    ) // TIMELINE_SAMPLES_PER_MS
+
+
+def _duration_to_ms(duration: float) -> int:
+    """Round one measured duration to half up integer milliseconds."""
+    return int(Fraction(str(duration)) * 1000 + Fraction(1, 2))
+
+
+def _timeline_signature(manifest: dict[str, Any]) -> str:
+    """Signature of the complete assembled PCM timeline."""
+    return _signature(
+        {
+            'kind': 'timeline-v1',
+            'fitting': [s['fitting_signature'] for s in manifest['segments']],
+            'total_frames': _timeline_total_frames(manifest),
+        }
+    )
+
+
+def _narration_track_signature(timeline_signature: str) -> str:
+    """Signature of the encoded narration track."""
+    return _signature(
+        {
+            'kind': 'narration-track-v1',
+            'timeline': timeline_signature,
+            'settings': NARRATION_AUDIO_SETTINGS,
+        }
+    )
+
+
+def _original_track_signature(manifest: dict[str, Any]) -> str:
+    """Signature of the converted original audio track."""
+    return _signature(
+        {
+            'kind': 'original-track-v1',
+            'video_sha256': manifest['binding']['video_sha256'],
+            'audio_stream': manifest['media']['audio_stream'],
+            'settings': ORIGINAL_AUDIO_SETTINGS,
+        }
+    )
+
+
+def _assembly_model(
+    manifest: dict[str, Any],
+    artifacts: list[dict[str, Any]],
+    failed_labels: frozenset[str],
+) -> dict[str, Any]:
+    """Classify every prepared assembly unit of the current inputs."""
+    synthesis = {
+        s['id']: s['synthesis_signature'] for s in manifest['segments']
+    }
+    fitting = {s['id']: s['fitting_signature'] for s in manifest['segments']}
+    timeline_signature = _timeline_signature(manifest)
+    narration_signature = _narration_track_signature(timeline_signature)
+    original_signature: str | None = None
+    units: dict[str, Any] = {
+        'normalized_audio': _classify_records(
+            'normalized_audio', synthesis, artifacts, failed_labels
+        ),
+        'fitted_audio': _classify_records(
+            'fitted_audio', fitting, artifacts, failed_labels
+        ),
+        'timeline_audio': _classify_records(
+            'timeline_audio',
+            {None: timeline_signature},
+            artifacts,
+            failed_labels,
+        )[None],
+        'narration_audio': _classify_records(
+            'narration_audio',
+            {None: narration_signature},
+            artifacts,
+            failed_labels,
+        )[None],
+    }
+    if manifest['media']['audio_disposition'] == 'convert':
+        original_signature = _original_track_signature(manifest)
+        units['original_audio'] = _classify_records(
+            'original_audio',
+            {None: original_signature},
+            artifacts,
+            failed_labels,
+        )[None]
+    return {
+        'units': units,
+        'signatures': {
+            'timeline': timeline_signature,
+            'narration': narration_signature,
+            'original': original_signature,
+        },
+    }
+
+
+def _assembly_view(
+    manifest: dict[str, Any],
+    artifacts: list[dict[str, Any]],
+    failed_labels: frozenset[str],
+) -> dict[str, Any]:
+    """Summarize downstream assembly readiness with actionable blockers."""
+    model = _assembly_model(manifest, artifacts, failed_labels)
+    units = model['units']
+    normalized = units['normalized_audio']
+    fitted = units['fitted_audio']
+    blocked: list[str] = []
+    for segment in manifest['segments']:
+        segment_id = segment['id']
+        if (
+            fitted.get(segment_id) == 'ok'
+            and normalized.get(segment_id) != 'ok'
+        ):
+            blocked.append(
+                f'fitted audio for {segment_id} is present while its'
+                ' normalized source is missing; inspect the job'
+                ' directory before any recovery'
+            )
+        if (
+            normalized.get(segment_id) not in (None, 'ok', 'missing')
+            and fitted.get(segment_id) == 'missing'
+        ):
+            blocked.append(
+                f'normalized audio for {segment_id} is damaged while no'
+                ' fitted work exists; the damaged unit blocks assembly'
+            )
+    timeline = units['timeline_audio']
+    narration = units['narration_audio']
+    if narration == 'ok' and timeline != 'ok':
+        blocked.append(
+            'the encoded narration track is present while its PCM'
+            ' timeline is missing or not current; inspect the job'
+            ' directory before any recovery'
+        )
+    if timeline == 'ok' and (
+        any(status != 'ok' for status in fitted.values())
+        or any(status != 'ok' for status in normalized.values())
+    ):
+        blocked.append(
+            'the PCM timeline is present while required per segment'
+            ' audio units are missing or damaged; processed audio'
+            ' cannot replace the missing units'
+        )
+    if manifest['media']['audio_disposition'] == 'convert':
+        original = units['original_audio']
+        if narration == 'ok' and original != 'ok':
+            blocked.append(
+                'the converted original audio track is missing or not'
+                ' current while downstream container work exists'
+            )
+    complete = (
+        all(status == 'ok' for status in normalized.values())
+        and all(status == 'ok' for status in fitted.values())
+        and timeline == 'ok'
+        and narration == 'ok'
+        and (
+            manifest['media']['audio_disposition'] != 'convert'
+            or units['original_audio'] == 'ok'
+        )
+    )
+    return {
+        'complete': complete,
+        'blocked': blocked,
+        'units': units,
+        'signatures': model['signatures'],
     }
 
 
@@ -1299,8 +1528,12 @@ def read_job_status(job_dir: Path) -> dict[str, Any]:
         )
     cache = _cache_view(manifest, artifacts, failed_labels)
     blocked.extend(cache['blocked'])
+    assembly = _assembly_view(manifest, artifacts, failed_labels)
+    blocked.extend(assembly['blocked'])
     operations, journal_blocked = _status_operations_view(job_dir)
     blocked.extend(journal_blocked)
+    publication = _publication_status_view(job_dir, manifest, artifacts)
+    blocked.extend(publication.get('blocked', []))
     return {
         'command': 'status',
         'job_dir': str(job_dir),
@@ -1313,10 +1546,74 @@ def read_job_status(job_dir: Path) -> dict[str, Any]:
         'media': manifest['media'],
         'segment_count': len(manifest['segments']),
         'stages': cache['stages'],
+        'assembly': {
+            'complete': assembly['complete'],
+            'units': assembly['units'],
+        },
         'reuse': _reuse_view(manifest, failed_labels),
         'operations': operations,
+        'publication': {
+            key: value
+            for key, value in publication.items()
+            if key != 'blocked'
+        },
+        'latest_report': _latest_report_name(job_dir),
         'blocked': blocked,
     }
+
+
+def _publication_status_view(
+    job_dir: Path,
+    manifest: dict[str, Any],
+    artifacts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Derive the read only publication state of one job."""
+    container = _classify_records(
+        'container_track',
+        {None: manifest['container_signature']},
+        artifacts,
+        frozenset(),
+    )[None]
+    output_path = Path(manifest['output_path'])
+    view: dict[str, Any] = {
+        'candidate': container,
+        'output_path': str(output_path),
+        'state': 'pending',
+        'recognized': False,
+        'blocked': [],
+    }
+    receipt: dict[str, Any] | None = None
+    try:
+        receipt = _load_publication_receipt(job_dir)
+    except ContractError as error:
+        view['state'] = 'blocked'
+        view['blocked'].append(
+            f'publication receipt is malformed and blocks recovery: {error}'
+        )
+        return view
+    if container == 'corrupt':
+        view['state'] = 'blocked'
+        view['blocked'].append(
+            'the registered container candidate is missing or corrupt;'
+            ' publication state cannot be trusted until inspected'
+        )
+        return view
+    if not output_path.exists():
+        view['state'] = 'pending'
+        return view
+    if _identity_matches(receipt, output_path):
+        view['state'] = 'published'
+        view['recognized'] = True
+        if receipt is not None:
+            view['sha256'] = receipt.get('sha256')
+        return view
+    view['state'] = 'collision'
+    view['blocked'].append(
+        'the output path holds a file without owned publication'
+        f' provenance: {output_path}; it is preserved untouched and'
+        ' never accepted by byte equality alone'
+    )
+    return view
 
 
 SUPPORTED_OPERATIONS_VERSION = 1
@@ -2066,85 +2363,105 @@ def execute_speech_operations(
     now_fn = now or utc_now_iso
     reader = key_reader or os.environ.get
     with JobLock.acquire(job_dir):
-        manifest, journal, planned, reused, _total = _run_guarded_planning(
-            job_dir, allow_paid=allow_paid, limits=limits
+        return _execute_speech_operations_locked(
+            job_dir,
+            allow_paid=allow_paid,
+            limits=limits,
+            transport=transport,
+            key_reader=reader,
+            now_fn=now_fn,
         )
-        if not planned:
-            return SpeechExecutionResult(
-                planned=(),
-                reused=tuple(reused),
-                completed=(),
-                failed={},
-                uncertain={},
-                blocked_unresolved=(),
-                request_count=0,
-            )
-        if limits is None:
-            raise PaidExecutionDenied(
-                'limits',
-                'explicit numeric spending limits are required before'
-                ' paid execution; no request was sent and no key was read',
-            )
-        key = _read_speech_key(reader)
-        client = SpeechClient(key, transport=transport)
 
-        def redactor(detail: str, _key: str = key) -> str:
-            """Keep the configured credential out of persisted text."""
-            return _redact_secrets(detail, (_key,))
 
-        manifest_path = job_dir / MANIFEST_NAME
-        journal_path = job_dir / OPERATIONS_NAME
-        writable_journal = _new_journal(journal, now_fn())
-        unresolved = _unresolved_by_segment(writable_journal)
-        completed: list[str] = []
-        failed: dict[str, str] = {}
-        uncertain: dict[str, str] = {}
-        blocked: list[dict[str, str]] = []
-        executed = 0
-        for segment in planned:
-            segment_id = segment['id']
-            pending = unresolved.get(segment_id)
-            if pending is not None:
-                blocked.append(
-                    {
-                        'segment': segment_id,
-                        'operation_id': pending['operation_id'],
-                        'state': pending['state'],
-                    }
-                )
-                continue
-            verdict = _execute_one_segment(
-                job_dir,
-                journal_path,
-                writable_journal,
-                manifest,
-                manifest_path,
-                segment,
-                limits,
-                client,
-                now_fn,
-                redactor,
-            )
-            executed += 1
-            if verdict == 'completed':
-                completed.append(segment_id)
-            elif verdict == 'failed':
-                failed[segment_id] = _latest_failure_kind(
-                    writable_journal, segment_id
-                )
-            else:
-                uncertain[segment_id] = _latest_failure_kind(
-                    writable_journal, segment_id
-                )
+def _execute_speech_operations_locked(
+    job_dir: Path,
+    *,
+    allow_paid: bool,
+    limits: SpendingLimits | None,
+    transport: xai_client.Transport | None,
+    key_reader: Callable[[str], str | None],
+    now_fn: Callable[[], str],
+) -> SpeechExecutionResult:
+    """Speech execution body that requires the held job lock."""
+    manifest, journal, planned, reused, _total = _run_guarded_planning(
+        job_dir, allow_paid=allow_paid, limits=limits
+    )
+    if not planned:
         return SpeechExecutionResult(
-            planned=tuple(s['id'] for s in planned),
+            planned=(),
             reused=tuple(reused),
-            completed=tuple(completed),
-            failed=failed,
-            uncertain=uncertain,
-            blocked_unresolved=tuple(blocked),
-            request_count=executed,
+            completed=(),
+            failed={},
+            uncertain={},
+            blocked_unresolved=(),
+            request_count=0,
         )
+    if limits is None:
+        raise PaidExecutionDenied(
+            'limits',
+            'explicit numeric spending limits are required before'
+            ' paid execution; no request was sent and no key was read',
+        )
+    key = _read_speech_key(key_reader)
+    client = SpeechClient(key, transport=transport)
+
+    def redactor(detail: str, _key: str = key) -> str:
+        """Keep the configured credential out of persisted text."""
+        return _redact_secrets(detail, (_key,))
+
+    manifest_path = job_dir / MANIFEST_NAME
+    journal_path = job_dir / OPERATIONS_NAME
+    writable_journal = _new_journal(journal, now_fn())
+    unresolved = _unresolved_by_segment(writable_journal)
+    completed: list[str] = []
+    failed: dict[str, str] = {}
+    uncertain: dict[str, str] = {}
+    blocked: list[dict[str, str]] = []
+    executed = 0
+    for segment in planned:
+        segment_id = segment['id']
+        pending = unresolved.get(segment_id)
+        if pending is not None:
+            blocked.append(
+                {
+                    'segment': segment_id,
+                    'operation_id': pending['operation_id'],
+                    'state': pending['state'],
+                }
+            )
+            continue
+        verdict = _execute_one_segment(
+            job_dir,
+            journal_path,
+            writable_journal,
+            manifest,
+            manifest_path,
+            segment,
+            limits,
+            client,
+            now_fn,
+            redactor,
+        )
+        executed += 1
+        if verdict == 'completed':
+            completed.append(segment_id)
+        elif verdict == 'failed':
+            failed[segment_id] = _latest_failure_kind(
+                writable_journal, segment_id
+            )
+        else:
+            uncertain[segment_id] = _latest_failure_kind(
+                writable_journal, segment_id
+            )
+    return SpeechExecutionResult(
+        planned=tuple(s['id'] for s in planned),
+        reused=tuple(reused),
+        completed=tuple(completed),
+        failed=failed,
+        uncertain=uncertain,
+        blocked_unresolved=tuple(blocked),
+        request_count=executed,
+    )
 
 
 def _latest_failure_kind(journal: dict[str, Any], segment_id: str) -> str:
@@ -2221,104 +2538,1409 @@ def retry_uncertain_operation(
     now_fn = now or utc_now_iso
     reader = key_reader or os.environ.get
     with JobLock.acquire(job_dir):
-        manifest, journal, _planned, reused, _total = _run_guarded_planning(
+        return _retry_uncertain_operation_locked(
             job_dir,
+            operation_id,
             allow_paid=allow_paid,
             limits=limits,
-            require_permission=False,
+            transport=transport,
+            key_reader=reader,
+            now_fn=now_fn,
         )
-        writable_journal = _new_journal(journal, now_fn())
-        operation = None
-        for candidate in writable_journal.get('operations', []):
-            if candidate['operation_id'] == operation_id:
-                operation = candidate
-                break
-        if operation is None:
-            raise ContractError(
-                f'no operation {operation_id} exists in the journal of'
-                f' {job_dir}; name the exact uncertain operation'
-            )
-        if operation['state'] not in UNRESOLVED_OPERATION_STATES:
-            raise ContractError(
-                f'operation {operation_id} is {operation["state"]}, not'
-                ' unresolved; only unresolved operations accept an'
-                ' explicit retry'
-            )
-        segment = None
-        for candidate in manifest['segments']:
-            if candidate['id'] == operation['segment_id']:
-                segment = candidate
-                break
-        if segment is None:
-            raise ContractError(
-                f'segment {operation["segment_id"]} of operation'
-                f' {operation_id} no longer exists in the manifest'
-            )
-        if segment['synthesis_signature'] != operation['synthesis_signature']:
-            raise ContractError(
-                f'operation {operation_id} was reserved for synthesis'
-                f' signature {operation["synthesis_signature"]} but the'
-                f' current signature is'
-                f' {segment["synthesis_signature"]}; the changed inputs'
-                ' require fresh planning instead of a retry'
-            )
-        text = _posted_text(job_dir, manifest, segment['id'])
-        if request_signature(text) != operation['request_signature']:
-            raise ContractError(
-                f'operation {operation_id} recorded request signature'
-                f' {operation["request_signature"]} but the current text'
-                ' hashes differently; changed narration requires fresh'
-                ' planning instead of a retry'
-            )
-        _validate_operation_provenance(job_dir, operation, text)
-        validate_posted_text(text)
-        _require_execution_permission(allow_paid, limits, 1, len(text))
-        if limits is None:
-            raise PaidExecutionDenied(
-                'limits',
-                'explicit numeric spending limits are required before'
-                ' a retry; no request was sent and no key was read',
-            )
-        key = _read_speech_key(reader)
-        client = SpeechClient(key, transport=transport)
 
-        def redactor(detail: str, _key: str = key) -> str:
-            """Keep the configured credential out of persisted text."""
-            return _redact_secrets(detail, (_key,))
 
-        verdict = _run_operation_attempt(
+def _retry_uncertain_operation_locked(
+    job_dir: Path,
+    operation_id: str,
+    *,
+    allow_paid: bool,
+    limits: SpendingLimits | None,
+    transport: xai_client.Transport | None,
+    key_reader: Callable[[str], str | None],
+    now_fn: Callable[[], str],
+) -> SpeechExecutionResult:
+    """Retry body that requires the held job lock."""
+    manifest, journal, _planned, reused, _total = _run_guarded_planning(
+        job_dir,
+        allow_paid=allow_paid,
+        limits=limits,
+        require_permission=False,
+    )
+    writable_journal = _new_journal(journal, now_fn())
+    operation = None
+    for candidate in writable_journal.get('operations', []):
+        if candidate['operation_id'] == operation_id:
+            operation = candidate
+            break
+    if operation is None:
+        raise ContractError(
+            f'no operation {operation_id} exists in the journal of'
+            f' {job_dir}; name the exact uncertain operation'
+        )
+    if operation['state'] not in UNRESOLVED_OPERATION_STATES:
+        raise ContractError(
+            f'operation {operation_id} is {operation["state"]}, not'
+            ' unresolved; only unresolved operations accept an'
+            ' explicit retry'
+        )
+    segment = None
+    for candidate in manifest['segments']:
+        if candidate['id'] == operation['segment_id']:
+            segment = candidate
+            break
+    if segment is None:
+        raise ContractError(
+            f'segment {operation["segment_id"]} of operation'
+            f' {operation_id} no longer exists in the manifest'
+        )
+    if segment['synthesis_signature'] != operation['synthesis_signature']:
+        raise ContractError(
+            f'operation {operation_id} was reserved for synthesis'
+            f' signature {operation["synthesis_signature"]} but the'
+            f' current signature is'
+            f' {segment["synthesis_signature"]}; the changed inputs'
+            ' require fresh planning instead of a retry'
+        )
+    text = _posted_text(job_dir, manifest, segment['id'])
+    if request_signature(text) != operation['request_signature']:
+        raise ContractError(
+            f'operation {operation_id} recorded request signature'
+            f' {operation["request_signature"]} but the current text'
+            ' hashes differently; changed narration requires fresh'
+            ' planning instead of a retry'
+        )
+    _validate_operation_provenance(job_dir, operation, text)
+    validate_posted_text(text)
+    _require_execution_permission(allow_paid, limits, 1, len(text))
+    if limits is None:
+        raise PaidExecutionDenied(
+            'limits',
+            'explicit numeric spending limits are required before'
+            ' a retry; no request was sent and no key was read',
+        )
+    key = _read_speech_key(key_reader)
+    client = SpeechClient(key, transport=transport)
+
+    def redactor(detail: str, _key: str = key) -> str:
+        """Keep the configured credential out of persisted text."""
+        return _redact_secrets(detail, (_key,))
+
+    verdict = _run_operation_attempt(
+        job_dir,
+        job_dir / OPERATIONS_NAME,
+        writable_journal,
+        operation,
+        manifest,
+        job_dir / MANIFEST_NAME,
+        segment,
+        limits,
+        client,
+        now_fn,
+        linked=True,
+        redactor=redactor,
+    )
+    failed: dict[str, str] = {}
+    uncertain: dict[str, str] = {}
+    completed: tuple[str, ...] = ()
+    if verdict == 'completed':
+        completed = (segment['id'],)
+    elif verdict == 'failed':
+        failed[segment['id']] = _latest_failure_kind(
+            writable_journal, segment['id']
+        )
+    else:
+        uncertain[segment['id']] = _latest_failure_kind(
+            writable_journal, segment['id']
+        )
+    return SpeechExecutionResult(
+        planned=(segment['id'],),
+        reused=tuple(reused),
+        completed=completed,
+        failed=failed,
+        uncertain=uncertain,
+        blocked_unresolved=(),
+        request_count=1,
+    )
+
+
+class PipelineFailure(RuntimeError):
+    """A pipeline stage failed with its stable kind and exit code."""
+
+    def __init__(
+        self,
+        kind: str,
+        detail: str,
+        exit_code: int,
+        report: dict[str, Any] | None = None,
+    ) -> None:
+        """Record the kind, explanation, exit code and named report."""
+        super().__init__(detail)
+        self.kind = kind
+        self.detail = detail
+        self.exit_code = exit_code
+        self.report = report
+
+
+def describe_pipeline_failure(
+    error: BaseException,
+) -> tuple[int, str, str]:
+    """Map one pipeline error to its approved exit code and kind."""
+    if isinstance(error, PipelineFailure):
+        return error.exit_code, error.kind, error.detail
+    if isinstance(error, PaidExecutionDenied):
+        return 4, 'paid_denied', error.detail
+    if isinstance(error, DestinationExistsError):
+        return 3, 'destination', str(error)
+    if isinstance(error, (ContractError, SpeechRequestError)):
+        return 3, 'contract', str(error)
+    if isinstance(error, SubtitlesError):
+        return 3, 'contract', str(error)
+    if isinstance(error, LockUnavailableError):
+        return 7, 'tooling', str(error)
+    if isinstance(error, MediaToolError):
+        return 7, 'tooling', str(error)
+    if isinstance(error, audio.AudioError):
+        if error.kind in ('window', 'fit'):
+            return 6, 'timing', str(error)
+        if error.kind == 'speech':
+            return 3, 'contract', str(error)
+        return 7, 'tooling', str(error)
+    if isinstance(error, mux.MuxError):
+        if error.kind == 'destination':
+            return 3, 'destination', str(error)
+        if error.kind in ('profile', 'input'):
+            return 3, 'contract', str(error)
+        return 7, 'tooling', str(error)
+    if isinstance(error, verification.VerificationError):
+        return 6, 'verification', str(error)
+    if isinstance(error, KeyboardInterrupt):
+        return (
+            130,
+            'cancelled',
+            'interrupted; job state stays at its last checkpoint',
+        )
+    if isinstance(error, (StorageError, OSError)):
+        return 7, 'tooling', str(error)
+    return 7, 'tooling', str(error)
+
+
+@dataclass(frozen=True)
+class RunResult:
+    """Outcome of one complete run or assemble pipeline pass."""
+
+    command: str
+    revision: int
+    speech: SpeechExecutionResult | None
+    built: tuple[str, ...]
+    reused: tuple[str, ...]
+    verification: dict[str, Any] | None
+    publication: dict[str, Any]
+    report_path: str
+
+
+def _pcm_frames_of(path: Path) -> int:
+    """Return the mono s16 frame count of one retained PCM file."""
+    size = path.stat().st_size
+    if size % TIMELINE_BYTES_PER_SAMPLE:
+        raise PipelineFailure(
+            'contract',
+            f'PCM artifact {path} is not a whole number of frames',
+            3,
+        )
+    return size // TIMELINE_BYTES_PER_SAMPLE
+
+
+def _placed_speech(record: dict[str, Any], job_dir: Path) -> NormalizedSpeech:
+    """Build a verified placement speech view from one PCM record."""
+    path = job_dir / record['path']
+    return NormalizedSpeech(
+        raw_path=path,
+        raw_sha256=record['sha256'],
+        path=path,
+        sha256=record['sha256'],
+        frames=_pcm_frames_of(path),
+    )
+
+
+def _current_record(
+    manifest: dict[str, Any],
+    kind: str,
+    unit: str | None,
+    signature: str,
+) -> dict[str, Any] | None:
+    """Return the newest current signature record of one kind."""
+    for record in reversed(manifest['artifacts']):
+        if (
+            record['kind'] == kind
+            and record['segment'] == unit
+            and record['signature'] == signature
+        ):
+            found: dict[str, Any] = record
+            return found
+    return None
+
+
+def _speech_tools(settings: Settings) -> dict[str, Any]:
+    """Resolve the media tools and timeout for one pipeline pass."""
+    return {
+        'ffmpeg': str(media.discover_tool('ffmpeg', settings.ffmpeg_path)),
+        'ffprobe': str(media.discover_tool('ffprobe', settings.ffprobe_path)),
+        'timeout_seconds': settings.subprocess_timeout_seconds,
+    }
+
+
+def _rebuild_manifest_view(manifest: dict[str, Any]) -> None:
+    """Refresh the derived stage and blocker views of the manifest."""
+    view = _cache_view(
+        {
+            'segments': manifest['segments'],
+            'subtitle_signature': manifest['subtitle_signature'],
+            'container_signature': manifest['container_signature'],
+        },
+        manifest['artifacts'],
+        frozenset(),
+    )
+    manifest['stages'] = view['stages']
+    manifest['blocked'] = view['blocked']
+
+
+def _register_pipeline_artifact(
+    job_dir: Path,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    *,
+    kind: str,
+    segment: str | None,
+    signature: str,
+    source: Path,
+    suffix: str,
+    now: str,
+) -> dict[str, Any]:
+    """Register one produced artifact immutably and checkpoint it."""
+    ordinal = len(manifest['artifacts'])
+    token = sha256_bytes(f'{kind}|{segment or ""}'.encode())[:16]
+    relative = f'artifacts/{ordinal:03d}-{kind}-{token}.{suffix}'
+    copy_new_file(source, job_dir / relative)
+    record = {
+        'kind': kind,
+        'segment': segment,
+        'signature': signature,
+        'path': relative,
+        'sha256': sha256_file(job_dir / relative),
+        'created_at': now,
+    }
+    manifest['artifacts'].append(record)
+    _rebuild_manifest_view(manifest)
+    manifest['updated_at'] = now
+    atomic_write_json(manifest_path, manifest)
+    return record
+
+
+def _unit_label(kind: str, segment: str | None) -> str:
+    """Return one report label for a built or reused unit."""
+    return f'{kind}:{segment or "job"}'
+
+
+def _build_normalized_unit(
+    job_dir: Path,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    segment: dict[str, Any],
+    tools: dict[str, Any],
+    now: str,
+) -> dict[str, Any]:
+    """Normalize one retained raw response into canonical PCM."""
+    raw_record = _current_record(
+        manifest,
+        'raw_response',
+        segment['id'],
+        segment['synthesis_signature'],
+    )
+    if raw_record is None:
+        raise PipelineFailure(
+            'contract',
+            f'retained raw response for {segment["id"]} is missing;'
+            ' processed audio cannot replace raw provenance',
+            3,
+        )
+    temp = job_dir / 'artifacts' / f'.normalized-{uuid.uuid4().hex[:12]}.pcm'
+    try:
+        audio.normalize_wav(
+            job_dir / raw_record['path'],
+            temp,
+            ffmpeg_path=tools['ffmpeg'],
+            timeout_seconds=tools['timeout_seconds'],
+        )
+        record = _register_pipeline_artifact(
             job_dir,
-            job_dir / OPERATIONS_NAME,
-            writable_journal,
-            operation,
             manifest,
-            job_dir / MANIFEST_NAME,
-            segment,
-            limits,
-            client,
-            now_fn,
-            linked=True,
-            redactor=redactor,
+            manifest_path,
+            kind='normalized_audio',
+            segment=segment['id'],
+            signature=segment['synthesis_signature'],
+            source=temp,
+            suffix='pcm',
+            now=now,
         )
-        failed: dict[str, str] = {}
-        uncertain: dict[str, str] = {}
-        completed: tuple[str, ...] = ()
-        if verdict == 'completed':
-            completed = (segment['id'],)
-        elif verdict == 'failed':
-            failed[segment['id']] = _latest_failure_kind(
-                writable_journal, segment['id']
+    finally:
+        temp.unlink(missing_ok=True)
+    return record
+
+
+def _refusal_failure(segment: dict[str, Any], fit: Any) -> PipelineFailure:
+    """Build the timing refusal failure for one segment fit."""
+    detail = (
+        f'segment {segment["id"]} refused fitting in its'
+        f' {fit.window_frames} frame window:'
+        f' {fit.refusal}'
+    )
+    return PipelineFailure('timing', detail, 6)
+
+
+def _build_fitted_unit(
+    job_dir: Path,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    segment: dict[str, Any],
+    normalized: dict[str, Any],
+    tools: dict[str, Any],
+    now: str,
+) -> dict[str, Any]:
+    """Fit one normalized speech into its window without trimming."""
+    normalized_path = job_dir / normalized['path']
+    speech = NormalizedSpeech(
+        raw_path=normalized_path,
+        raw_sha256=normalized['sha256'],
+        path=normalized_path,
+        sha256=normalized['sha256'],
+        frames=_pcm_frames_of(normalized_path),
+    )
+    placement = SegmentPlacement(
+        segment_id=segment['id'],
+        start_ms=segment['window']['start_ms'],
+        end_ms=segment['window']['end_ms'],
+        speech=speech,
+    )
+    with tempfile.TemporaryDirectory(
+        dir=job_dir, prefix='.fitting-'
+    ) as work_dir:
+        fit = audio.fit_segment(
+            placement,
+            max_speedup=manifest['policy']['fitting_max_speedup'],
+            work_dir=Path(work_dir),
+            ffmpeg_path=tools['ffmpeg'],
+            timeout_seconds=tools['timeout_seconds'],
+        )
+        if fit.disposition == 'refused':
+            raise _refusal_failure(segment, fit)
+        assert fit.pcm_path is not None
+        record = _register_pipeline_artifact(
+            job_dir,
+            manifest,
+            manifest_path,
+            kind='fitted_audio',
+            segment=segment['id'],
+            signature=segment['fitting_signature'],
+            source=fit.pcm_path,
+            suffix='pcm',
+            now=now,
+        )
+        if fit.disposition == 'fitted':
+            fit.pcm_path.unlink(missing_ok=True)
+    return record
+
+
+def _build_timeline_unit(
+    job_dir: Path,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    model: dict[str, Any],
+    tools: dict[str, Any],
+    now: str,
+) -> dict[str, Any]:
+    """Stream the complete timeline from retained placed speech."""
+    placements = []
+    for segment in manifest['segments']:
+        record = _current_record(
+            manifest,
+            'fitted_audio',
+            segment['id'],
+            segment['fitting_signature'],
+        )
+        if record is None:
+            raise PipelineFailure(
+                'contract',
+                f'placed audio for {segment["id"]} is missing before'
+                ' timeline assembly',
+                3,
             )
+        placements.append(
+            SegmentPlacement(
+                segment_id=segment['id'],
+                start_ms=segment['window']['start_ms'],
+                end_ms=segment['window']['end_ms'],
+                speech=_placed_speech(record, job_dir),
+            )
+        )
+    total_frames = _timeline_total_frames(manifest)
+    temp = job_dir / 'artifacts' / f'.timeline-{uuid.uuid4().hex[:12]}.pcm'
+    try:
+        audio.stream_timeline(
+            placements,
+            total_frames=total_frames,
+            destination=temp,
+            max_speedup=manifest['policy']['fitting_max_speedup'],
+            work_dir=job_dir / 'artifacts',
+            ffmpeg_path=tools['ffmpeg'],
+            timeout_seconds=tools['timeout_seconds'],
+        )
+        record = _register_pipeline_artifact(
+            job_dir,
+            manifest,
+            manifest_path,
+            kind='timeline_audio',
+            segment=None,
+            signature=model['signatures']['timeline'],
+            source=temp,
+            suffix='pcm',
+            now=now,
+        )
+    finally:
+        temp.unlink(missing_ok=True)
+    return record
+
+
+def _build_narration_unit(
+    job_dir: Path,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    timeline_record: dict[str, Any],
+    model: dict[str, Any],
+    tools: dict[str, Any],
+    now: str,
+) -> dict[str, Any]:
+    """Encode the timeline as the approved narration AAC track."""
+    temp = job_dir / 'artifacts' / f'.narration-{uuid.uuid4().hex[:12]}.m4a'
+    try:
+        audio.encode_narration_aac(
+            job_dir / timeline_record['path'],
+            temp,
+            ffmpeg_path=tools['ffmpeg'],
+            ffprobe_path=tools['ffprobe'],
+            timeout_seconds=tools['timeout_seconds'],
+        )
+        record = _register_pipeline_artifact(
+            job_dir,
+            manifest,
+            manifest_path,
+            kind='narration_audio',
+            segment=None,
+            signature=model['signatures']['narration'],
+            source=temp,
+            suffix='m4a',
+            now=now,
+        )
+    finally:
+        temp.unlink(missing_ok=True)
+    return record
+
+
+def _build_original_unit(
+    job_dir: Path,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    model: dict[str, Any],
+    tools: dict[str, Any],
+    now: str,
+) -> dict[str, Any]:
+    """Prepare the converted original audio as a separate AAC track."""
+    temp = job_dir / 'artifacts' / f'.original-{uuid.uuid4().hex[:12]}.m4a'
+    try:
+        audio.prepare_original_audio(
+            Path(manifest['binding']['video_path']),
+            manifest['media']['audio_stream']['index'],
+            temp,
+            ffmpeg_path=tools['ffmpeg'],
+            ffprobe_path=tools['ffprobe'],
+            timeout_seconds=tools['timeout_seconds'],
+        )
+        record = _register_pipeline_artifact(
+            job_dir,
+            manifest,
+            manifest_path,
+            kind='original_audio',
+            segment=None,
+            signature=model['signatures']['original'] or '',
+            source=temp,
+            suffix='m4a',
+            now=now,
+        )
+    finally:
+        temp.unlink(missing_ok=True)
+    return record
+
+
+def _snapshot_cues(
+    job_dir: Path, manifest: dict[str, Any]
+) -> tuple[SourceCue, ...]:
+    """Rebuild source cues from the immutable cue snapshot."""
+    record = manifest['snapshots']['source_cues']
+    payload = load_strict_json_file(job_dir / record['path'])
+    return tuple(
+        SourceCue(
+            position=entry['position'],
+            start_ms=entry['start_ms'],
+            end_ms=entry['end_ms'],
+            text=entry['text'],
+        )
+        for entry in payload['cues']
+    )
+
+
+def _build_subtitles_unit(
+    job_dir: Path,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    now: str,
+) -> dict[str, Any]:
+    """Render the complete Russian subtitle file from the snapshot."""
+    translation_record = manifest['snapshots']['translation']
+    document = load_translation_document(job_dir / translation_record['path'])
+    cues = _snapshot_cues(job_dir, manifest)
+    text = russian_srt(cues, document.segments)
+    temp = job_dir / 'artifacts' / f'.subtitles-{uuid.uuid4().hex[:12]}.srt'
+    try:
+        create_new_file(temp, text.encode())
+        record = _register_pipeline_artifact(
+            job_dir,
+            manifest,
+            manifest_path,
+            kind='subtitles',
+            segment=None,
+            signature=manifest['subtitle_signature'],
+            source=temp,
+            suffix='srt',
+            now=now,
+        )
+    finally:
+        temp.unlink(missing_ok=True)
+    return record
+
+
+def _verify_source_binding(manifest: dict[str, Any]) -> None:
+    """Refuse container work when the bound sources changed on disk."""
+    binding = manifest['binding']
+    video_path = Path(binding['video_path'])
+    srt_path = Path(binding['srt_path'])
+    if not video_path.is_file():
+        raise ContractError(
+            f'bound source video is missing: {video_path}; supply the'
+            ' original input or prepare the job again'
+        )
+    actual_video = sha256_file(video_path)
+    if actual_video.lower() != str(binding['video_sha256']).lower():
+        raise ContractError(
+            'bound source video changed since prepare; container work'
+            ' copies its exact packets and requires a fresh prepare'
+        )
+    if not srt_path.is_file():
+        raise ContractError(
+            f'bound source SRT is missing: {srt_path}; supply the'
+            ' original input or prepare the job again'
+        )
+    actual_srt = sha256_file(srt_path)
+    if actual_srt.lower() != str(binding['srt_sha256']).lower():
+        raise ContractError(
+            'bound source SRT changed since prepare; the English track'
+            ' requires a fresh prepare with the matching translation'
+        )
+
+
+def _candidate_expectation(
+    job_dir: Path,
+    manifest: dict[str, Any],
+    narration_record: dict[str, Any],
+    subtitles_record: dict[str, Any],
+    original_record: dict[str, Any] | None,
+) -> CandidateExpectation:
+    """Build the declared source facts for candidate verification."""
+    binding = manifest['binding']
+    media_view = manifest['media']
+    audio_stream = media_view['audio_stream']
+    copied = media_view['audio_disposition'] == 'copy'
+    policy = manifest['policy']
+    duration = media_view['duration_seconds']
+    if duration is None:
+        raise ContractError(
+            'the recorded media carries no duration; verification'
+            ' expectations cannot declare complete intervals'
+        )
+    narration_record_path = job_dir / narration_record['path']
+    return CandidateExpectation(
+        video_source=Path(binding['video_path']),
+        original_packet_source=(
+            Path(binding['video_path'])
+            if copied
+            else job_dir / (original_record or {}).get('path', '')
+        ),
+        original_packet_stream_index=audio_stream['index'],
+        original_is_copied=copied,
+        narration_packet_source=narration_record_path,
+        original_channels=audio_stream['channels'],
+        original_sample_rate=audio_stream['sample_rate_hz'],
+        original_end_ms=_duration_to_ms(duration),
+        narration_end_ms=_timeline_duration_ms(
+            _timeline_total_frames(manifest)
+        ),
+        english_srt_path=Path(binding['srt_path']),
+        russian_srt_path=job_dir / subtitles_record['path'],
+        profile=TrackProfile(
+            narration_default=policy['startup_narration_default'],
+            original_default=policy['startup_original_default'],
+            subtitles_default=policy['startup_subtitles_default'],
+            subtitles_forced=policy['startup_subtitles_forced'],
+        ),
+    )
+
+
+def _load_publication_receipt(job_dir: Path) -> dict[str, Any] | None:
+    """Load the durable publication receipt or return None."""
+    path = job_dir / PUBLICATION_RECEIPT
+    if not path.is_file():
+        return None
+    data = load_strict_json_file(path)
+    if not isinstance(data, dict) or data.get('schema') != 1:
+        raise ContractError(
+            f'publication receipt {path} is malformed or of an unknown'
+            ' schema; inspect it manually before any recovery'
+        )
+    receipt: dict[str, Any] = data
+    return receipt
+
+
+def _identity_of(path: Path) -> dict[str, Any]:
+    """Return the actual filesystem identity of one existing file."""
+    status = path.stat()
+    return {
+        'device': status.st_dev,
+        'inode': status.st_ino,
+        'size': status.st_size,
+    }
+
+
+def _identity_matches(receipt: dict[str, Any] | None, path: Path) -> bool:
+    """Report whether one file carries the receipt recorded identity."""
+    if receipt is None:
+        return False
+    identity = receipt.get('identity')
+    if not isinstance(identity, dict):
+        return False
+    try:
+        status = path.stat()
+    except OSError:
+        return False
+    return (
+        status.st_dev == identity.get('device')
+        and status.st_ino == identity.get('inode')
+        and status.st_size == identity.get('size')
+    )
+
+
+def _write_publication_receipt(job_dir: Path, payload: dict[str, Any]) -> None:
+    """Durably persist the publication receipt."""
+    (job_dir / EVIDENCE_DIR).mkdir(parents=True, exist_ok=True)
+    atomic_write_json(job_dir / PUBLICATION_RECEIPT, payload)
+
+
+def _publish_candidate(
+    job_dir: Path,
+    candidate_record: dict[str, Any],
+    output_path: Path,
+    now: str,
+) -> dict[str, Any]:
+    """Publish the registered verified candidate without clobbering.
+
+    An existing output is accepted only when the durable receipt
+    proves it is the actual file this job linked, by device, inode
+    and size. Byte equality alone, and a registered candidate alone,
+    never prove ownership of a preexisting destination file.
+    """
+    candidate_path = job_dir / candidate_record['path']
+    if output_path.exists():
+        receipt = _load_publication_receipt(job_dir)
+        if _identity_matches(receipt, output_path):
+            if receipt is not None and receipt.get('state') != 'completed':
+                completed = dict(receipt)
+                completed['state'] = 'completed'
+                completed['completed_at'] = now
+                _write_publication_receipt(job_dir, completed)
+            return {
+                'state': 'published',
+                'path': str(output_path),
+                'sha256': candidate_record['sha256'],
+                'recognized': True,
+            }
+        raise PipelineFailure(
+            'destination',
+            f'refusing to overwrite an existing output without owned'
+            f' publication provenance: {output_path}; a file with'
+            ' matching bytes is still a foreign destination',
+            3,
+        )
+    fd, temp_name = tempfile.mkstemp(
+        dir=output_path.parent,
+        prefix=f'.{output_path.name}.publish-',
+        suffix='.mp4',
+    )
+    temp = Path(temp_name)
+    try:
+        with (
+            open(candidate_path, 'rb') as reader,
+            os.fdopen(fd, 'wb') as writer,
+        ):
+            shutil.copyfileobj(reader, writer, length=COPY_CHUNK_BYTES)
+            writer.flush()
+            os.fsync(writer.fileno())
+        _write_publication_receipt(
+            job_dir,
+            {
+                'schema': 1,
+                'state': 'linking',
+                'output_path': str(output_path),
+                'identity': _identity_of(temp),
+                'sha256': candidate_record['sha256'],
+                'candidate': {
+                    'path': candidate_record['path'],
+                    'sha256': candidate_record['sha256'],
+                },
+                'created_at': now,
+                'completed_at': None,
+            },
+        )
+        try:
+            os.link(temp, output_path)
+        except FileExistsError as error:
+            raise PipelineFailure(
+                'destination',
+                f'the output destination appeared during publication:'
+                f' {output_path}; it is preserved untouched',
+                3,
+            ) from error
+    finally:
+        temp.unlink(missing_ok=True)
+    fsync_directory(output_path.parent)
+    _write_publication_receipt(
+        job_dir,
+        {
+            'schema': 1,
+            'state': 'completed',
+            'output_path': str(output_path),
+            'identity': _identity_of(output_path),
+            'sha256': candidate_record['sha256'],
+            'candidate': {
+                'path': candidate_record['path'],
+                'sha256': candidate_record['sha256'],
+            },
+            'created_at': now,
+            'completed_at': now,
+        },
+    )
+    return {
+        'state': 'published',
+        'path': str(output_path),
+        'sha256': candidate_record['sha256'],
+        'recognized': False,
+    }
+
+
+def _publish_extra_copy(
+    job_dir: Path,
+    candidate_record: dict[str, Any],
+    extra_output: Path,
+) -> dict[str, Any]:
+    """Publish one additional fresh copy of the verified candidate."""
+    try:
+        copy_new_file(job_dir / candidate_record['path'], extra_output)
+    except DestinationExistsError:
+        raise PipelineFailure(
+            'destination',
+            f'the requested assemble output already exists:'
+            f' {extra_output}; it is preserved untouched',
+            3,
+        ) from None
+    return {
+        'state': 'published',
+        'path': str(extra_output),
+        'sha256': candidate_record['sha256'],
+        'recognized': False,
+    }
+
+
+def _container_stage(
+    job_dir: Path,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    model: dict[str, Any],
+    settings: Settings,
+    tools: dict[str, Any],
+    now: str,
+    extra_output: Path | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Assemble, verify, register and publish the final candidate."""
+    _verify_source_binding(manifest)
+    container_signature = manifest['container_signature']
+    candidate_record = _current_record(
+        manifest, 'container_track', None, container_signature
+    )
+    output_path = Path(manifest['output_path'])
+    verification_view: dict[str, Any] | None = None
+    if candidate_record is not None:
+        integrity = verify_integrity(
+            job_dir,
+            (
+                IntegrityRecord(
+                    label='container_track artifact for the job',
+                    relative_path=candidate_record['path'],
+                    sha256=candidate_record['sha256'],
+                ),
+            ),
+        )
+        if integrity:
+            candidate_record = None
+    if candidate_record is None:
+        receipt = _load_publication_receipt(job_dir)
+        if output_path.exists() and not _identity_matches(
+            receipt, output_path
+        ):
+            raise PipelineFailure(
+                'destination',
+                f'refusing to build a candidate while an unowned file'
+                f' occupies the output path: {output_path}',
+                3,
+            )
+        candidate_record, verification_view = _assemble_candidate(
+            job_dir,
+            manifest,
+            manifest_path,
+            model,
+            settings,
+            tools,
+            now,
+            output_path,
+        )
+    publication = _publish_candidate(
+        job_dir, candidate_record, output_path, now
+    )
+    if extra_output is not None:
+        _publish_extra_copy(job_dir, candidate_record, extra_output)
+    return publication, verification_view
+
+
+def _assemble_candidate(
+    job_dir: Path,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    model: dict[str, Any],
+    settings: Settings,
+    tools: dict[str, Any],
+    now: str,
+    output_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build one fresh staging candidate, verify and register it."""
+    narration_record = _current_record(
+        manifest,
+        'narration_audio',
+        None,
+        model['signatures']['narration'],
+    )
+    subtitles_record = _current_record(
+        manifest, 'subtitles', None, manifest['subtitle_signature']
+    )
+    if narration_record is None or subtitles_record is None:
+        raise PipelineFailure(
+            'contract',
+            'the prepared narration and subtitle tracks are required'
+            ' before container assembly',
+            3,
+        )
+    original_record = None
+    if manifest['media']['audio_disposition'] == 'convert':
+        original_record = _current_record(
+            manifest,
+            'original_audio',
+            None,
+            model['signatures']['original'] or '',
+        )
+        if original_record is None:
+            raise PipelineFailure(
+                'contract',
+                'the converted original audio track is required before'
+                ' container assembly',
+                3,
+            )
+    expectation = _candidate_expectation(
+        job_dir,
+        manifest,
+        narration_record,
+        subtitles_record,
+        original_record,
+    )
+    if manifest['media']['audio_disposition'] == 'copy':
+        original_audio: CopiedAudioStream | ConvertedAudioTrack = (
+            CopiedAudioStream(
+                stream_index=manifest['media']['audio_stream']['index']
+            )
+        )
+    else:
+        assert original_record is not None
+        original_audio = ConvertedAudioTrack(
+            path=job_dir / original_record['path']
+        )
+    staging = output_path.parent / (
+        f'.{output_path.name}.staging-{uuid.uuid4().hex}.mp4'
+    )
+    request = MuxRequest(
+        video_path=Path(manifest['binding']['video_path']),
+        original_audio=original_audio,
+        narration_path=job_dir / narration_record['path'],
+        english_srt_path=Path(manifest['binding']['srt_path']),
+        russian_srt_path=job_dir / subtitles_record['path'],
+        destination=staging,
+        profile=TrackProfile(
+            narration_default=manifest['policy']['startup_narration_default'],
+            original_default=manifest['policy']['startup_original_default'],
+            subtitles_default=manifest['policy']['startup_subtitles_default'],
+            subtitles_forced=manifest['policy']['startup_subtitles_forced'],
+        ),
+    )
+    try:
+        mux.build_candidate(request, settings)
+        report = verification.verify_candidate(staging, expectation, settings)
+        if not report.ok:
+            raise PipelineFailure(
+                'verification',
+                'candidate verification failed:'
+                f' {", ".join(report.failed_checks)}',
+                6,
+                report=report.to_dict(),
+            )
+        record = _register_pipeline_artifact(
+            job_dir,
+            manifest,
+            manifest_path,
+            kind='container_track',
+            segment=None,
+            signature=manifest['container_signature'],
+            source=staging,
+            suffix='mp4',
+            now=now,
+        )
+    finally:
+        staging.unlink(missing_ok=True)
+    return record, report.to_dict()
+
+
+def _raw_complete(manifest: dict[str, Any]) -> bool:
+    """Report whether every retained raw response is current."""
+    raw = _classify_records(
+        'raw_response',
+        {s['id']: s['synthesis_signature'] for s in manifest['segments']},
+        manifest['artifacts'],
+        frozenset(),
+    )
+    return all(raw.get(s['id']) == 'ok' for s in manifest['segments'])
+
+
+def _speech_view(speech: SpeechExecutionResult | None) -> dict[str, Any]:
+    """Return the JSON view of one speech execution outcome."""
+    if speech is None:
+        return {'executed': False, 'request_count': 0}
+    return {
+        'executed': True,
+        'planned': list(speech.planned),
+        'reused': list(speech.reused),
+        'completed': list(speech.completed),
+        'failed': dict(speech.failed),
+        'uncertain': dict(speech.uncertain),
+        'blocked_unresolved': [
+            dict(item) for item in speech.blocked_unresolved
+        ],
+        'request_count': speech.request_count,
+    }
+
+
+def _failure_view(error: BaseException) -> dict[str, Any]:
+    """Return the durable failure view of one pipeline error."""
+    exit_code, kind, detail = describe_pipeline_failure(error)
+    return {'kind': kind, 'detail': detail, 'exit_code': exit_code}
+
+
+def _report_stamp(now: str) -> str:
+    """Build one filename safe stamp from an ISO timestamp."""
+    return re.sub(r'[^0-9A-Za-z]', '', now)[:14]
+
+
+def _write_run_report(
+    job_dir: Path,
+    manifest: dict[str, Any] | None,
+    *,
+    command: str,
+    speech: SpeechExecutionResult | None,
+    built: list[str],
+    reused: list[str],
+    verification_view: dict[str, Any] | None,
+    publication: dict[str, Any] | None,
+    failure: dict[str, Any] | None,
+    failure_report: dict[str, Any] | None = None,
+    now: str,
+) -> str:
+    """Persist one durable run report and return its relative path."""
+    text_outputs: dict[str, Any] = {}
+    if manifest is not None:
+        text_outputs['full_translation'] = {
+            'path': manifest['snapshots']['translation']['path'],
+            'sha256': manifest['snapshots']['translation']['sha256'],
+        }
+        text_outputs['narration_text'] = {
+            'path': manifest['snapshots']['narration']['path'],
+            'sha256': manifest['snapshots']['narration']['sha256'],
+        }
+        subtitles_record = _current_record(
+            manifest, 'subtitles', None, manifest['subtitle_signature']
+        )
+        if subtitles_record is not None:
+            text_outputs['russian_subtitles'] = {
+                'path': subtitles_record['path'],
+                'sha256': subtitles_record['sha256'],
+            }
+    payload = {
+        'command': command,
+        'created_at': now,
+        'job_revision': None if manifest is None else manifest['revision'],
+        'speech': _speech_view(speech),
+        'built': built,
+        'reused': reused,
+        'verification': verification_view,
+        'failed_verification': failure_report,
+        'publication': publication,
+        'text_outputs': text_outputs,
+        'automated_checks': [
+            'job manifest and retained artifact integrity verified',
+            'translation binding and source cue coverage validated at'
+            ' prepare time',
+            'stage reuse decided from current signatures and verified bytes',
+            'publication governed by the no clobber link and durable receipt',
+        ],
+        'pending_human_checks': [
+            'human listening acceptance of the synthesized narration is'
+            ' pending',
+            'startup audio and subtitle behavior in QuickTime Player'
+            ' and IINA is pending manual verification',
+            'translation meaning and speech intelligibility remain'
+            ' human review responsibilities',
+        ],
+        'failure': failure,
+    }
+    evidence = job_dir / EVIDENCE_DIR
+    evidence.mkdir(parents=True, exist_ok=True)
+    name = f'run-{_report_stamp(now)}-{uuid.uuid4().hex[:8]}.json'
+    relative = f'{EVIDENCE_DIR}/{name}'
+    atomic_write_json(job_dir / relative, payload)
+    return relative
+
+
+def _latest_report_name(job_dir: Path) -> str | None:
+    """Return the newest durable run report name when present."""
+    evidence = job_dir / EVIDENCE_DIR
+    if not evidence.is_dir():
+        return None
+    names = sorted(entry.name for entry in evidence.glob('run-*.json'))
+    return names[-1] if names else None
+
+
+def run_job_pipeline(
+    job_dir: Path,
+    *,
+    allow_paid: bool = False,
+    limits: SpendingLimits | None = None,
+    transport: xai_client.Transport | None = None,
+    key_reader: Callable[[str], str | None] | None = None,
+    settings: Settings | None = None,
+    now: Callable[[], str] | None = None,
+    retry_uncertain: str | None = None,
+) -> RunResult:
+    """Run the complete guarded pipeline over one prepared job.
+
+    One writer lock covers speech synthesis through publication. An
+    unchanged complete cache makes zero provider calls and reads no
+    key; any failed, uncertain or blocked speech unit stops the
+    pipeline before assembly with a non success outcome.
+    """
+    job_dir = Path(job_dir).expanduser().resolve()
+    now_fn = now or utc_now_iso
+    reader = key_reader or os.environ.get
+    resolved = settings or load_settings()
+    with JobLock.acquire(job_dir):
+        return _run_pipeline_locked(
+            job_dir,
+            assemble_only=False,
+            allow_paid=allow_paid,
+            limits=limits,
+            transport=transport,
+            key_reader=reader,
+            settings=resolved,
+            now_fn=now_fn,
+            retry_operation_id=retry_uncertain,
+            extra_output=None,
+        )
+
+
+def assemble_job_pipeline(
+    job_dir: Path,
+    *,
+    settings: Settings | None = None,
+    extra_output: Path | None = None,
+    now: Callable[[], str] | None = None,
+) -> RunResult:
+    """Assemble and publish from intact retained artifacts offline.
+
+    No provider transport, credential access or synthesis happens
+    here by construction: the job must already carry complete
+    prepared speech, audio and subtitle artifacts.
+    """
+    job_dir = Path(job_dir).expanduser().resolve()
+    now_fn = now or utc_now_iso
+    resolved = settings or load_settings()
+    with JobLock.acquire(job_dir):
+        return _run_pipeline_locked(
+            job_dir,
+            assemble_only=True,
+            allow_paid=False,
+            limits=None,
+            transport=None,
+            key_reader=os.environ.get,
+            settings=resolved,
+            now_fn=now_fn,
+            retry_operation_id=None,
+            extra_output=extra_output,
+        )
+
+
+def _run_pipeline_locked(
+    job_dir: Path,
+    *,
+    assemble_only: bool,
+    allow_paid: bool,
+    limits: SpendingLimits | None,
+    transport: xai_client.Transport | None,
+    key_reader: Callable[[str], str | None],
+    settings: Settings,
+    now_fn: Callable[[], str],
+    retry_operation_id: str | None,
+    extra_output: Path | None,
+) -> RunResult:
+    """Pipeline body that requires the held job lock."""
+    command = 'assemble' if assemble_only else 'run'
+    manifest: dict[str, Any] | None = None
+    speech: SpeechExecutionResult | None = None
+    built: list[str] = []
+    reused: list[str] = []
+    verification_view: dict[str, Any] | None = None
+    publication: dict[str, Any] | None = None
+    try:
+        manifest = load_job_manifest(job_dir / MANIFEST_NAME)
+        _verify_job_integrity(job_dir, manifest)
+        _verify_window_feasibility(manifest)
+        if not assemble_only:
+            if retry_operation_id is not None:
+                speech = _retry_uncertain_operation_locked(
+                    job_dir,
+                    retry_operation_id,
+                    allow_paid=allow_paid,
+                    limits=limits,
+                    transport=transport,
+                    key_reader=key_reader,
+                    now_fn=now_fn,
+                )
+                if speech.failed or speech.uncertain:
+                    raise PipelineFailure(
+                        'provider',
+                        'the named uncertain operation did not'
+                        ' complete; the explicit retry outcome is'
+                        ' recorded in the journal',
+                        5,
+                    )
+                manifest = load_job_manifest(job_dir / MANIFEST_NAME)
+            _planned, _reused_units = _planned_segments(
+                manifest, manifest['artifacts'], frozenset()
+            )
+            if _planned:
+                speech = _execute_speech_operations_locked(
+                    job_dir,
+                    allow_paid=allow_paid,
+                    limits=limits,
+                    transport=transport,
+                    key_reader=key_reader,
+                    now_fn=now_fn,
+                )
+                manifest = load_job_manifest(job_dir / MANIFEST_NAME)
+                if speech.failed or speech.uncertain:
+                    kinds = {
+                        **speech.failed,
+                        **speech.uncertain,
+                    }
+                    raise PipelineFailure(
+                        'provider',
+                        'speech execution stopped with non success'
+                        f' outcomes: {kinds}; the job preserves all'
+                        ' receipts and stays non successful',
+                        5,
+                    )
+                if speech.blocked_unresolved:
+                    raise PipelineFailure(
+                        'provider',
+                        'speech execution is blocked by unresolved'
+                        ' operations requiring an explicit retry:'
+                        f' {list(speech.blocked_unresolved)}',
+                        5,
+                    )
+        failed_labels: frozenset[str] = frozenset()
+        model = _assembly_model(manifest, manifest['artifacts'], failed_labels)
+        units = model['units']
+        tools = _speech_tools(settings)
+        manifest_path = job_dir / MANIFEST_NAME
+        for segment in manifest['segments']:
+            segment_id = segment['id']
+            record: dict[str, Any] | None
+            if units['normalized_audio'].get(segment_id) != 'ok':
+                record = _build_normalized_unit(
+                    job_dir,
+                    manifest,
+                    manifest_path,
+                    segment,
+                    tools,
+                    now_fn(),
+                )
+                built.append(_unit_label('normalized_audio', segment_id))
+            else:
+                record = _current_record(
+                    manifest,
+                    'normalized_audio',
+                    segment_id,
+                    segment['synthesis_signature'],
+                )
+                reused.append(_unit_label('normalized_audio', segment_id))
+            assert record is not None
+            if units['fitted_audio'].get(segment_id) != 'ok':
+                _build_fitted_unit(
+                    job_dir,
+                    manifest,
+                    manifest_path,
+                    segment,
+                    record,
+                    tools,
+                    now_fn(),
+                )
+                built.append(_unit_label('fitted_audio', segment_id))
+            else:
+                reused.append(_unit_label('fitted_audio', segment_id))
+        if units['timeline_audio'] != 'ok':
+            _build_timeline_unit(
+                job_dir, manifest, manifest_path, model, tools, now_fn()
+            )
+            built.append(_unit_label('timeline_audio', None))
         else:
-            uncertain[segment['id']] = _latest_failure_kind(
-                writable_journal, segment['id']
-            )
-        return SpeechExecutionResult(
-            planned=(segment['id'],),
-            reused=tuple(reused),
-            completed=completed,
-            failed=failed,
-            uncertain=uncertain,
-            blocked_unresolved=(),
-            request_count=1,
+            reused.append(_unit_label('timeline_audio', None))
+        timeline_record = _current_record(
+            manifest,
+            'timeline_audio',
+            None,
+            model['signatures']['timeline'],
         )
+        assert timeline_record is not None
+        if units['narration_audio'] != 'ok':
+            _build_narration_unit(
+                job_dir,
+                manifest,
+                manifest_path,
+                timeline_record,
+                model,
+                tools,
+                now_fn(),
+            )
+            built.append(_unit_label('narration_audio', None))
+        else:
+            reused.append(_unit_label('narration_audio', None))
+        if manifest['media']['audio_disposition'] == 'convert':
+            if units['original_audio'] != 'ok':
+                _build_original_unit(
+                    job_dir,
+                    manifest,
+                    manifest_path,
+                    model,
+                    tools,
+                    now_fn(),
+                )
+                built.append(_unit_label('original_audio', None))
+            else:
+                reused.append(_unit_label('original_audio', None))
+        subtitle_record = _current_record(
+            manifest, 'subtitles', None, manifest['subtitle_signature']
+        )
+        if subtitle_record is None:
+            _build_subtitles_unit(job_dir, manifest, manifest_path, now_fn())
+            built.append(_unit_label('subtitles', None))
+        else:
+            reused.append(_unit_label('subtitles', None))
+        publication, verification_view = _container_stage(
+            job_dir,
+            manifest,
+            manifest_path,
+            model,
+            settings,
+            tools,
+            now_fn(),
+            extra_output,
+        )
+    except BaseException as error:
+        failure = _failure_view(error)
+        failure_report = getattr(error, 'report', None)
+        with contextlib.suppress(OSError):
+            if manifest is not None:
+                _write_run_report(
+                    job_dir,
+                    manifest,
+                    command=command,
+                    speech=speech,
+                    built=built,
+                    reused=reused,
+                    verification_view=verification_view,
+                    publication=publication,
+                    failure=failure,
+                    failure_report=failure_report,
+                    now=now_fn(),
+                )
+        raise
+    report_relative = _write_run_report(
+        job_dir,
+        manifest,
+        command=command,
+        speech=speech,
+        built=built,
+        reused=reused,
+        verification_view=verification_view,
+        publication=publication,
+        failure=None,
+        now=now_fn(),
+    )
+    assert publication is not None
+    return RunResult(
+        command=command,
+        revision=manifest['revision'],
+        speech=speech,
+        built=tuple(built),
+        reused=tuple(reused),
+        verification=verification_view,
+        publication=publication,
+        report_path=report_relative,
+    )

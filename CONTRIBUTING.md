@@ -1,6 +1,6 @@
 # Contributing
 
-lecture-localizer is in early development: the installable package currently provides local tool diagnostics, while the localization pipeline itself is not implemented. Useful contributions include workflow feedback, concrete use cases, documentation corrections, and small examples using synthetic or rights-cleared media.
+lecture-localizer is in early development: the installable package currently provides local tool diagnostics, validated persistent jobs, guarded speech synthesis, complete fitted narration, verified MP4 assembly and the guarded run and offline assemble commands. Live speech quality, listening acceptance and the full feature remain unaccepted. Useful contributions include workflow feedback, concrete use cases, documentation corrections, and small examples using synthetic or rights-cleared media.
 
 ## Discuss a change
 

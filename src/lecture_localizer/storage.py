@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -53,7 +54,7 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def _fsync_directory(directory: Path) -> None:
+def fsync_directory(directory: Path) -> None:
     """Flush a directory entry so a replace survives a crash."""
     fd = os.open(directory, os.O_RDONLY)
     try:
@@ -78,7 +79,7 @@ def atomic_write_bytes(path: str | Path, data: bytes) -> None:
         if temp_name and os.path.exists(temp_name):
             os.unlink(temp_name)
         raise
-    _fsync_directory(directory)
+    fsync_directory(directory)
 
 
 def _mkstemp_in(directory: Path, name: str) -> tuple[int, str]:
@@ -107,7 +108,7 @@ def create_new_file(path: str | Path, data: bytes) -> None:
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
-    _fsync_directory(target.parent)
+    fsync_directory(target.parent)
 
 
 def move_new_file(source: str | Path, target: str | Path) -> None:
@@ -129,7 +130,46 @@ def move_new_file(source: str | Path, target: str | Path) -> None:
             f'refusing to overwrite an existing destination: {target_path}'
         ) from error
     os.unlink(source_path)
-    _fsync_directory(target_path.parent)
+    fsync_directory(target_path.parent)
+
+
+_COPY_CHUNK_BYTES = 1 << 20
+
+
+def copy_new_file(source: str | Path, target: str | Path) -> None:
+    """Copy one file to a fresh destination without clobbering it.
+
+    The bytes are streamed through a temporary file on the destination
+    filesystem, so cross filesystem registration of a large candidate
+    never loads the whole file into memory. The destination name is
+    claimed by a no clobber link only after the copy is fully written
+    and flushed, so an existing destination, including a dangling
+    symlink, stays untouched and the temporary file is removed.
+    """
+    source_path = Path(source)
+    target_path = Path(target)
+    fd, temp_name = _mkstemp_in(target_path.parent, target_path.name)
+    linked = False
+    try:
+        with (
+            open(source_path, 'rb') as reader,
+            os.fdopen(fd, 'wb') as writer,
+        ):
+            shutil.copyfileobj(reader, writer, length=_COPY_CHUNK_BYTES)
+            writer.flush()
+            os.fsync(writer.fileno())
+        try:
+            os.link(temp_name, target_path)
+        except FileExistsError as error:
+            raise DestinationExistsError(
+                f'refusing to overwrite an existing destination: {target_path}'
+            ) from error
+        linked = True
+    finally:
+        if not linked:
+            os.unlink(temp_name)
+    os.unlink(temp_name)
+    fsync_directory(target_path.parent)
 
 
 @dataclass(frozen=True)

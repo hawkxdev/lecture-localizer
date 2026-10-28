@@ -2,7 +2,7 @@
 
 A proposed CLI for localizing lecture videos while preserving the original media.
 
-**Status:** Development. An installable package with local tool diagnostics and validated persistent jobs is available; speech synthesis and output assembly are not implemented yet.
+**Status:** Development. An installable package with local tool diagnostics, validated persistent jobs, guarded speech synthesis, fitted narration, verified MP4 assembly and the complete guarded run/offline assemble commands is available. Real speech quality, listening acceptance and reference player behavior remain unverified; the full feature is not accepted yet.
 
 ## Implemented: `lecture-localizer doctor`
 
@@ -60,6 +60,26 @@ When the video or SRT bytes change, resumption requires a translation whose sour
 Exit codes follow the implementation plan: 0 success, 2 usage error, 3 invalid input or contract (hash or cue mismatch, unsupported media profile, destination collision, unknown job version), 7 tool or filesystem failure including lock contention, 130 interruption. The output path must not exist and must stay outside the job directory; sources must be distinct files outside the job directory.
 
 Settings files keep the documented tool fields and now accept the job policy fields `fitting_max_speedup` (default 1.2) and the startup track defaults `startup_narration_default`, `startup_original_default`, `startup_subtitles_default` and `startup_subtitles_forced`. Unknown fields are still rejected and no credentials belong in settings.
+
+## Implemented: `lecture-localizer run`, `assemble` and the exit table
+
+`run` executes the complete guarded pipeline over one prepared job under a single writer lock: guarded speech synthesis, PCM normalization, per segment fitting, timeline assembly, narration and original audio preparation, Russian subtitle generation, MP4 candidate assembly, persisted candidate verification and non-overwriting publication.
+
+```sh
+.venv/bin/lecture-localizer run --job /path/to/job-directory \
+  [--allow-paid --limits /path/to/limits.json] \
+  [--retry-uncertain OPERATION_ID]
+.venv/bin/lecture-localizer assemble --job /path/to/job-directory \
+  [--output /path/to/additional-fresh-output.mp4]
+```
+
+Paid requests require `--allow-paid` plus an explicit limits JSON file (`max_requests`, `max_text_chars`, `max_cost_estimate`, `price_per_request`, `price_basis`; unknown fields are rejected) and the `XAI_API_KEY` environment variable. The guards run in that order before any network activity; an unchanged complete cache makes zero provider calls and reads no key. An interrupted or unknown-outcome request stays visibly unresolved in the operations journal and blocks new paid work until the exact operation is retried by ID with refreshed limits; the original receipt is preserved.
+
+Each run writes a durable report under `evidence/` in the job directory with the speech summary, per segment fit evidence, the named verification checks, publication state and the immutable text output paths and hashes (full translation, resolved narration text, Russian subtitles), and separates automated evidence from the pending human checks: listening acceptance, QuickTime Player and IINA startup behavior and translation meaning remain manual review responsibilities and are never granted by a successful run.
+
+The MP4 candidate is built in a staging file on the destination filesystem, verified against the declared prepared sources, registered immutably inside the job, and published through a no-clobber hard link. A durable publication receipt records the actual linked file identity (device, inode, size): an existing output is recognized as this job's result only through that receipt, and any other preexisting file, including a byte identical copy created by another process, is preserved untouched and reported as a collision. An interrupted publication resumes from the registered verified candidate. `assemble` performs the container assembly and publication offline from intact retained artifacts and cannot reach the speech provider; it refuses jobs whose prepared speech, audio or subtitle artifacts are incomplete.
+
+The job `status` report now also shows assembly readiness of the prepared units, the publication state (`published`, `pending`, `collision` or blocked) and the latest run report name. Exit codes follow the implementation plan: 0 success (a readable blocked status also exits 0 while reporting its problems), 2 usage error, 3 invalid input, settings or job contract including destination collisions, 4 paid execution denied before any request, 5 provider or transport failure including unresolved uncertain operations, 6 speech fitting refusal or failed candidate verification, 7 tool, media process or filesystem failure, 130 interruption. Settings are loaded from `LECTURE_LOCALIZER_SETTINGS` for tool paths and subprocess timeouts; the job policy recorded at prepare time governs run.
 
 ## Proposed workflow
 
