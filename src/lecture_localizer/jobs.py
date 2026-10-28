@@ -3285,6 +3285,14 @@ def _verify_source_decodability(
             f'the decode tool failed to run: {error}',
             7,
         ) from error
+    if result.returncode < 0:
+        raise PipelineFailure(
+            'tooling',
+            f'the decode tool was terminated by signal'
+            f' {-result.returncode}; inspect local tools and available'
+            ' resources before running again',
+            7,
+        )
     if result.returncode != 0:
         tail = (
             result.stderr.strip().splitlines()[-3:]

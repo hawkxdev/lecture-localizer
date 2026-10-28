@@ -295,6 +295,7 @@ def test_uncertain_http_blocks_then_named_retry_completes(
         """Provider transport that ends every request uncertainly."""
 
         def __call__(self, **kwargs: Any) -> FakeResponse:
+            """Raise the scripted uncertain response."""
             raise TransportUncertainFailure(
                 'partial_response',
                 'the response ended before a complete body arrived',
@@ -334,6 +335,7 @@ def test_definitive_http_failure_is_non_success(tmp_path: Path) -> None:
         """Provider transport returning a definitive HTTP 500."""
 
         def __call__(self, **kwargs: Any) -> FakeResponse:
+            """Return the scripted HTTP failure."""
             self.requests.append({})
             return FakeResponse(
                 chunks=(b'{"error": "denied"}',),
@@ -869,6 +871,7 @@ class InterruptingTransportStatic(CountingTransport):
     """Provider transport that raises KeyboardInterrupt once called."""
 
     def __call__(self, **kwargs: Any) -> FakeResponse:
+        """Interrupt before a response completes."""
         raise KeyboardInterrupt
 
 
@@ -1100,6 +1103,7 @@ def test_interrupted_final_journal_write_reconciles_without_requests(
     real_write = jobs_module._write_journal
 
     def failing_write(path: Path, journal: dict[str, Any], now: str) -> None:
+        """Fail the final journal completion write."""
         last_state = (
             journal['operations'][-1]['state'] if journal['operations'] else ''
         )
@@ -1315,6 +1319,7 @@ def test_reconciliation_requires_current_signature(tmp_path: Path) -> None:
         """Provider transport that ends every request uncertainly."""
 
         def __call__(self, **kwargs: Any) -> FakeResponse:
+            """Raise the scripted uncertain response."""
             raise TransportUncertainFailure(
                 'partial_response',
                 'the response ended before a complete body arrived',
@@ -1373,6 +1378,7 @@ def test_reconciliation_never_falsifies_known_uncertain_attempt(
     real_write = jobs_module._write_journal
 
     def failing_write(path: Path, journal: dict[str, Any], now: str) -> None:
+        """Fail the final journal completion write."""
         last_state = (
             journal['operations'][-1]['state'] if journal['operations'] else ''
         )
@@ -1392,6 +1398,7 @@ def test_reconciliation_never_falsifies_known_uncertain_attempt(
         """Provider transport that ends every request uncertainly."""
 
         def __call__(self, **kwargs: Any) -> FakeResponse:
+            """Raise the scripted uncertain response."""
             raise TransportUncertainFailure(
                 'inactivity_timeout',
                 'the response read phase exceeded its inactivity limit',
@@ -1463,5 +1470,28 @@ def test_decode_timeout_is_tooling_failure(tmp_path: Path) -> None:
         )
     assert excinfo.value.exit_code == 7
     assert 'timed out' in excinfo.value.detail.lower()
+    assert transport.requests == []
+    assert keys.reads == 0
+
+
+def test_decode_signal_termination_is_tooling_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import signal
+    import subprocess
+    from unittest.mock import Mock
+
+    kit = make_kit(tmp_path)
+    prepare(kit)
+    transport = CountingTransport()
+    keys = CountingKeys()
+    terminated = subprocess.CompletedProcess(
+        args=[], returncode=-signal.SIGTERM, stdout='', stderr=''
+    )
+    monkeypatch.setattr(subprocess, 'run', Mock(return_value=terminated))
+    with pytest.raises(PipelineFailure, match='signal') as excinfo:
+        run_full(kit, tmp_path, transport=transport, keys=keys)
+    assert excinfo.value.exit_code == 7
     assert transport.requests == []
     assert keys.reads == 0
