@@ -305,6 +305,7 @@ def test_copy_new_file_closes_descriptor_when_source_missing(
     real_mkstemp = storage_module._mkstemp_in
 
     def spy_mkstemp(directory: Path, name: str) -> tuple[int, str]:
+        """Record the created descriptor while delegating."""
         descriptor, temp_name = real_mkstemp(directory, name)
         captured.append(descriptor)
         return descriptor, temp_name

@@ -1147,6 +1147,7 @@ def test_latest_report_reflects_actual_last_invocation(
     real_uuid4 = uuid_module.uuid4
 
     def controlled_uuid4() -> Any:
+        """Return scripted UUIDs, then fall back to real ones."""
         try:
             return next(controlled)
         except StopIteration:
@@ -1232,5 +1233,224 @@ def test_corrupt_bound_source_stops_before_any_request(
     keys = CountingKeys()
     with pytest.raises(ContractError):
         run_full(kit, tmp_path, transport=transport, keys=keys)
+    assert transport.requests == []
+    assert keys.reads == 0
+
+
+def test_renamed_occupied_destination_with_stale_candidate_is_collision(
+    tmp_path: Path,
+) -> None:
+    import os
+
+    kit = make_kit(tmp_path)
+    prepare(kit)
+    run_full(kit, tmp_path)
+    occupied_bytes = kit['output'].read_bytes()
+    renamed = tmp_path / 'renamed-result.mp4'
+    kit['output'].rename(renamed)
+    payload = json.loads(kit['translation'].read_text(encoding='utf-8'))
+    payload['segments'][0]['translation'] = (
+        'Изменённый перевод для проверки занятия назначения.'
+    )
+    path = tmp_path / 'translation-rebind3.json'
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
+        encoding='utf-8',
+    )
+    prepare(
+        kit,
+        translation=rebind_translation(path, kit['video'], kit['srt']),
+        output=kit['output'],
+    )
+    os.link(renamed, kit['output'])
+    transport = CountingTransport()
+    keys = CountingKeys()
+    with pytest.raises(PipelineFailure) as excinfo:
+        run_full(kit, tmp_path, transport=transport, keys=keys)
+    assert excinfo.value.exit_code == 3
+    assert kit['output'].read_bytes() == occupied_bytes
+    status = read_job_status(kit['job'])
+    assert status['publication']['state'] == 'collision'
+
+
+def test_assemble_requested_extra_output_is_created(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    prepare(kit)
+    run_full(kit, tmp_path)
+    extra = tmp_path / 'requested-extra.mp4'
+    result = assemble_job_pipeline(kit['job'], extra_output=extra)
+    assert result.publication['state'] == 'published'
+    assert extra.is_file()
+    candidate = artifact_records(kit['job'], 'container_track')[0]
+    assert sha256(extra) == candidate['sha256']
+
+
+def test_reconciliation_requires_current_signature(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path, name='src-own')
+    prepare(kit)
+    run_full(kit, tmp_path)
+    payload = json.loads(kit['translation'].read_text(encoding='utf-8'))
+    payload['segments'][0]['narration'] = (
+        'Формулировка версии Б и неопределённый запрос.'
+    )
+    path = tmp_path / 'translation-own-b.json'
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
+        encoding='utf-8',
+    )
+    prepare(
+        kit,
+        translation=rebind_translation(path, kit['video'], kit['srt']),
+        output=tmp_path / 'out-own-b.mp4',
+    )
+
+    class UncertainTransport(CountingTransport):
+        def __call__(self, **kwargs: Any) -> FakeResponse:
+            raise TransportUncertainFailure(
+                'partial_response',
+                'the response ended before a complete body arrived',
+            )
+
+    with pytest.raises(PipelineFailure):
+        run_full(kit, tmp_path, transport=UncertainTransport())
+    payload = json.loads(kit['translation'].read_text(encoding='utf-8'))
+    del payload['segments'][0]['narration']
+    path = tmp_path / 'translation-own-a.json'
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
+        encoding='utf-8',
+    )
+    prepare(
+        kit,
+        translation=rebind_translation(path, kit['video'], kit['srt']),
+        output=tmp_path / 'out-own-a.mp4',
+    )
+    journal = json.loads(
+        (kit['job'] / 'operations.json').read_text(encoding='utf-8')
+    )
+    uncertain_ops = [
+        op
+        for op in journal['operations']
+        if op['state'] in ('started', 'uncertain', 'reserved')
+    ]
+    assert len(uncertain_ops) == 1
+    transport = CountingTransport()
+    keys = CountingKeys()
+    with pytest.raises(PipelineFailure) as excinfo:
+        run_full(kit, tmp_path, transport=transport, keys=keys)
+    assert excinfo.value.exit_code == 5
+    assert transport.requests == []
+    journal = json.loads(
+        (kit['job'] / 'operations.json').read_text(encoding='utf-8')
+    )
+    uncertain_ops = [
+        op
+        for op in journal['operations']
+        if op['state'] in ('started', 'uncertain', 'reserved')
+    ]
+    assert len(uncertain_ops) == 1
+    attempts = uncertain_ops[0]['attempts']
+    assert attempts[-1]['verdict'] == 'uncertain'
+
+
+def test_reconciliation_never_falsifies_known_uncertain_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kit = make_kit(tmp_path, name='src-att')
+    prepare(kit)
+    import lecture_localizer.jobs as jobs_module
+
+    real_write = jobs_module._write_journal
+
+    def failing_write(path: Path, journal: dict[str, Any], now: str) -> None:
+        last_state = (
+            journal['operations'][-1]['state'] if journal['operations'] else ''
+        )
+        if last_state == 'completed':
+            raise OSError('simulated journal interruption')
+        real_write(path, journal, now)
+
+    monkeypatch.setattr(jobs_module, '_write_journal', failing_write)
+    with pytest.raises(OSError, match='simulated journal'):
+        run_full(kit, tmp_path)
+    monkeypatch.setattr(jobs_module, '_write_journal', real_write)
+    journal_path = kit['job'] / 'operations.json'
+    payload = json.loads(journal_path.read_text(encoding='utf-8'))
+    operation_id = payload['operations'][0]['operation_id']
+
+    class UncertainTransport(CountingTransport):
+        def __call__(self, **kwargs: Any) -> FakeResponse:
+            raise TransportUncertainFailure(
+                'inactivity_timeout',
+                'the response read phase exceeded its inactivity limit',
+            )
+
+    from lecture_localizer.jobs import retry_uncertain_operation
+
+    retried = retry_uncertain_operation(
+        kit['job'],
+        operation_id,
+        allow_paid=True,
+        limits=limits(),
+        transport=UncertainTransport(),
+        key_reader=CountingKeys(),
+    )
+    assert list(retried.uncertain) == ['s001']
+    transport = CountingTransport()
+    keys = CountingKeys()
+    with pytest.raises(PipelineFailure) as run_failure:
+        run_full(kit, tmp_path, transport=transport, keys=keys)
+    assert run_failure.value.exit_code == 5
+    assert transport.requests == []
+    assert keys.reads == 0
+    payload = json.loads(journal_path.read_text(encoding='utf-8'))
+    operation = payload['operations'][0]
+    assert operation['state'] == 'uncertain'
+    attempts = operation['attempts']
+    assert attempts[0]['verdict'] == 'completed'
+    assert attempts[0]['response'] is None
+    assert attempts[1]['verdict'] == 'uncertain'
+    registered = artifact_records(kit['job'], 'raw_response')
+    assert len(registered) == 1
+    assert attempts[0]['evidence']['sha256'] == registered[0]['sha256']
+
+
+def test_malformed_latest_report_keeps_status_readable(
+    tmp_path: Path,
+) -> None:
+    kit = make_kit(tmp_path)
+    prepare(kit)
+    run_full(kit, tmp_path)
+    first_status = read_job_status(kit['job'])
+    latest = first_status['latest_report']
+    assert latest is not None
+    report_file = kit['job'] / 'evidence' / latest
+    damaged = report_file.read_text(encoding='utf-8')
+    report_file.write_text('[]\n', encoding='utf-8')
+    status = read_job_status(kit['job'])
+    assert status['command'] == 'status'
+    assert report_file.read_text(encoding='utf-8') == '[]\n'
+    assert status['latest_report'] != latest or status['latest_report'] is None
+    report_file.write_text(damaged, encoding='utf-8')
+
+
+def test_decode_timeout_is_tooling_failure(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path, name='src-timeout')
+    kit['job'] = tmp_path / 'job-timeout'
+    kit['output'] = tmp_path / 'out-timeout.mp4'
+    prepare(kit)
+    transport = CountingTransport()
+    keys = CountingKeys()
+    with pytest.raises(PipelineFailure) as excinfo:
+        run_full(
+            kit,
+            tmp_path,
+            transport=transport,
+            keys=keys,
+            settings=Settings(subprocess_timeout_seconds=0.000001),
+        )
+    assert excinfo.value.exit_code == 7
+    assert 'timed out' in excinfo.value.detail.lower()
     assert transport.requests == []
     assert keys.reads == 0

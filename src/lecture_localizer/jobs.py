@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 import uuid
@@ -1660,18 +1661,22 @@ def _publication_status_view(
     if not output_path.exists():
         view['state'] = 'pending'
         return view
-    recorded = receipt.get('sha256') if isinstance(receipt, dict) else None
-    proxy = {'sha256': recorded}
-    if _owned_publication_matches(receipt, output_path, proxy):
+    candidate_record = _current_record(
+        manifest, 'container_track', None, manifest['container_signature']
+    )
+    if candidate_record is not None and _owned_publication_matches(
+        receipt, output_path, candidate_record
+    ):
         view['state'] = 'published'
         view['recognized'] = True
-        view['sha256'] = recorded
+        view['sha256'] = candidate_record['sha256']
         return view
     view['state'] = 'collision'
     view['blocked'].append(
         'the output path holds a file without owned publication'
-        f' provenance: {output_path}; it is preserved untouched and'
-        ' never accepted by byte equality or file identity alone'
+        f' provenance for the current candidate: {output_path}; it is'
+        ' preserved untouched and never accepted by byte equality or'
+        ' file identity alone'
     )
     return view
 
@@ -3257,13 +3262,40 @@ def _verify_source_decodability(
         '-',
     ]
     try:
-        media.checked_run_strict(argv, settings.subprocess_timeout_seconds)
-    except MediaToolError as error:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=settings.subprocess_timeout_seconds,
+            env=media.scrubbed_environment(),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise PipelineFailure(
+            'tooling',
+            f'the source decode check timed out after'
+            f' {settings.subprocess_timeout_seconds}s; raise'
+            ' subprocess_timeout_seconds or inspect the local tools'
+            f' before running again: {error}',
+            7,
+        ) from error
+    except OSError as error:
+        raise PipelineFailure(
+            'tooling',
+            f'the decode tool failed to run: {error}',
+            7,
+        ) from error
+    if result.returncode != 0:
+        tail = (
+            result.stderr.strip().splitlines()[-3:]
+            if result.stderr.strip()
+            else []
+        )
         raise ContractError(
             'the bound source video does not decode completely, which'
             ' stops processing before any paid synthesis; supply a'
-            f' decodable source and prepare again: {error}'
-        ) from error
+            f' decodable source and prepare again: {" | ".join(tail)}'
+        )
 
 
 def _reconcile_registered_operations(
@@ -3271,12 +3303,17 @@ def _reconcile_registered_operations(
 ) -> None:
     """Resolve unresolved operations that already carry durable evidence.
 
-    An operation left started or uncertain by an interrupted journal
-    write is reconciled without any request when its segment holds the
-    current verified raw response artifact: the committed outcome is
-    recorded truthfully with a reference to that evidence. Nothing is
-    retried and no provider receipt is fabricated; operations without
-    such evidence keep their uncertainty.
+    Ownership is proven before any reconciliation: the operation must
+    carry the current synthesis and request signatures of its segment
+    and the exact posted text digest, the segment must hold the
+    current verified raw response artifact with the same synthesis
+    signature, and exactly one attempt with an unknown verdict must
+    exist. That interrupted attempt is then recorded truthfully as
+    completed with a reference to the evidence bytes. A later attempt
+    with a known outcome is never touched, the operation keeps its
+    uncertainty when its latest attempt stays uncertain, nothing is
+    retried and no provider receipt is fabricated; anything without
+    full proof keeps its unresolved state.
     """
     journal = load_operations_journal(job_dir)
     if journal is None:
@@ -3302,28 +3339,48 @@ def _reconcile_registered_operations(
         )
         if segment is None:
             continue
+        if operation['synthesis_signature'] != segment['synthesis_signature']:
+            continue
         record = _current_record(
             manifest,
             'raw_response',
             segment_id,
             segment['synthesis_signature'],
         )
-        if record is None:
+        if (
+            record is None
+            or record['signature'] != operation['synthesis_signature']
+        ):
             continue
-        if operation['attempts']:
-            attempt = operation['attempts'][-1]
-            attempt['verdict'] = 'completed'
-            attempt['finished_at'] = now
-            attempt['artifact'] = {
-                'path': record['path'],
-                'sha256': record['sha256'],
-            }
-            attempt['evidence'] = {
-                'path': record['path'],
-                'sha256': record['sha256'],
-                'bytes': (job_dir / record['path']).stat().st_size,
-            }
-        operation['state'] = 'completed'
+        try:
+            text = _posted_text(job_dir, manifest, segment_id)
+        except ContractError:
+            continue
+        if operation['posted_text_sha256'] != _segment_text_hash(text):
+            continue
+        if operation['request_signature'] != request_signature(text):
+            continue
+        unknown = [
+            attempt
+            for attempt in operation['attempts']
+            if attempt['verdict'] is None
+        ]
+        if len(unknown) != 1:
+            continue
+        attempt = unknown[0]
+        attempt['verdict'] = 'completed'
+        attempt['finished_at'] = now
+        attempt['artifact'] = {
+            'path': record['path'],
+            'sha256': record['sha256'],
+        }
+        attempt['evidence'] = {
+            'path': record['path'],
+            'sha256': record['sha256'],
+            'bytes': (job_dir / record['path']).stat().st_size,
+        }
+        if operation['attempts'][-1] is attempt:
+            operation['state'] = 'completed'
     _write_journal(job_dir / OPERATIONS_NAME, writable, now)
 
 
@@ -3715,27 +3772,15 @@ def _container_stage(
         if integrity:
             candidate_record = None
     if candidate_record is None:
-        receipt = _load_publication_receipt(job_dir)
         if output_path.exists():
-            recorded_sha = (
-                receipt.get('sha256') if isinstance(receipt, dict) else None
-            )
-            proxy = {'sha256': recorded_sha}
-            if not _owned_publication_matches(receipt, output_path, proxy):
-                raise PipelineFailure(
-                    'destination',
-                    f'refusing to build a candidate while an unowned'
-                    f' file occupies the output path: {output_path}',
-                    3,
-                )
-            return (
-                {
-                    'state': 'published',
-                    'path': str(output_path),
-                    'sha256': recorded_sha,
-                    'recognized': True,
-                },
-                None,
+            raise PipelineFailure(
+                'destination',
+                f'refusing to build a candidate while an unowned or'
+                f' non-current file occupies the output path:'
+                f' {output_path}; it is preserved untouched, and a'
+                ' receipt from another revision never recognizes it'
+                ' for the current one',
+                3,
             )
         candidate_record, verification_view = _assemble_candidate(
             job_dir,
@@ -3982,18 +4027,17 @@ def _latest_report_name(job_dir: Path) -> str | None:
         return None
     best: tuple[str, str] | None = None
     for entry in sorted(evidence.glob('run-*.json')):
-        with contextlib.suppress(ContractError, OSError):
+        with contextlib.suppress(ContractError, OSError, ValueError):
             payload = load_strict_json_file(entry)
+            if not isinstance(payload, dict):
+                continue
             created_at = payload.get('created_at')
             if not isinstance(created_at, str) or not created_at:
                 continue
             key = (created_at, entry.name)
             if best is None or key > best:
                 best = key
-    if best is None:
-        names = sorted(entry.name for entry in evidence.glob('run-*.json'))
-        return names[-1] if names else None
-    return best[1]
+    return best[1] if best is not None else None
 
 
 def run_job_pipeline(
