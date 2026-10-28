@@ -17,6 +17,7 @@ from lecture_localizer.storage import (
     StorageError,
     atomic_write_bytes,
     atomic_write_json,
+    copy_new_file,
     create_new_file,
     ensure_distinct_files,
     ensure_outside,
@@ -292,3 +293,26 @@ def test_move_new_file_retains_source_when_destination_appears(
         move_new_file(source, target)
     assert target.read_bytes() == b'race winner'
     assert source.read_bytes() == b'new bytes'
+
+
+def test_copy_new_file_closes_descriptor_when_source_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lecture_localizer.storage as storage_module
+
+    captured: list[int] = []
+    real_mkstemp = storage_module._mkstemp_in
+
+    def spy_mkstemp(directory: Path, name: str) -> tuple[int, str]:
+        """Record the created descriptor while delegating."""
+        descriptor, temp_name = real_mkstemp(directory, name)
+        captured.append(descriptor)
+        return descriptor, temp_name
+
+    monkeypatch.setattr(storage_module, '_mkstemp_in', spy_mkstemp)
+    with pytest.raises(OSError):
+        copy_new_file(tmp_path / 'absent-source.bin', tmp_path / 'target.bin')
+    with pytest.raises(OSError):
+        os.fstat(captured[-1])
+    assert not (tmp_path / 'target.bin').exists()

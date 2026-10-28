@@ -7,7 +7,10 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from lecture_localizer.jobs import SpendingLimits
 
 SETTINGS_ENV_VAR = 'LECTURE_LOCALIZER_SETTINGS'
 DEFAULT_TIMEOUT_SECONDS = 120.0
@@ -168,3 +171,56 @@ def load_settings(explicit_path: str | None = None) -> Settings:
     if path is None:
         return Settings()
     return settings_from_file(path)
+
+
+_LIMITS_FIELDS = (
+    'max_requests',
+    'max_text_chars',
+    'max_cost_estimate',
+    'price_per_request',
+    'price_basis',
+)
+
+
+def spending_limits_from_mapping(data: Any) -> SpendingLimits:
+    """Build validated spending limits from a parsed mapping."""
+    from lecture_localizer.jobs import SpendingLimits
+
+    if not isinstance(data, dict):
+        raise SettingsError('spending limits root must be a JSON object')
+    unknown = sorted(set(data) - set(_LIMITS_FIELDS))
+    if unknown:
+        raise SettingsError(
+            f'unknown spending limit fields: {", ".join(unknown)}'
+        )
+    missing = sorted(name for name in _LIMITS_FIELDS if name not in data)
+    if missing:
+        raise SettingsError(
+            f'missing spending limit fields: {", ".join(missing)}'
+        )
+    try:
+        return SpendingLimits(
+            max_requests=data['max_requests'],
+            max_text_chars=data['max_text_chars'],
+            max_cost_estimate=data['max_cost_estimate'],
+            price_per_request=data['price_per_request'],
+            price_basis=data['price_basis'],
+        )
+    except ValueError as error:
+        raise SettingsError(f'invalid spending limits: {error}') from error
+
+
+def spending_limits_from_file(path: str | Path) -> SpendingLimits:
+    """Load validated spending limits from one JSON file."""
+    with open(path, encoding='utf-8') as handle:
+        try:
+            data = json.load(handle)
+        except json.JSONDecodeError as error:
+            raise SettingsError(
+                f'spending limits file is not valid JSON: {error}'
+            ) from error
+        except UnicodeDecodeError as error:
+            raise SettingsError(
+                'spending limits file is not valid UTF-8'
+            ) from error
+    return spending_limits_from_mapping(data)

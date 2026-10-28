@@ -10,12 +10,22 @@ from pathlib import Path
 
 from lecture_localizer import __version__
 from lecture_localizer.contracts import ContractError
-from lecture_localizer.jobs import PrepareResult, prepare_job, read_job_status
+from lecture_localizer.jobs import (
+    PrepareResult,
+    RunResult,
+    SpendingLimits,
+    assemble_job_pipeline,
+    describe_pipeline_failure,
+    prepare_job,
+    read_job_status,
+    run_job_pipeline,
+)
 from lecture_localizer.media import DoctorReport, MediaToolError, run_doctor
 from lecture_localizer.settings import (
     SETTINGS_ENV_VAR,
     SettingsError,
     load_settings,
+    spending_limits_from_file,
 )
 from lecture_localizer.storage import (
     DestinationExistsError,
@@ -25,7 +35,11 @@ from lecture_localizer.storage import (
 from lecture_localizer.subtitles import SubtitlesError
 
 EXIT_OK = 0
+EXIT_USAGE = 2
 EXIT_INVALID_INPUT = 3
+EXIT_PAID_DENIED = 4
+EXIT_PROVIDER = 5
+EXIT_VERIFICATION = 6
 EXIT_TOOL_FAILURE = 7
 EXIT_INTERRUPTED = 130
 
@@ -113,6 +127,54 @@ def build_parser() -> argparse.ArgumentParser:
         dest='as_json',
         action='store_true',
         help='Print the status report as JSON',
+    )
+    run = commands.add_parser(
+        'run',
+        help='Execute the authorized job and publish the verified result',
+    )
+    run.add_argument(
+        '--job',
+        required=True,
+        type=Path,
+        dest='job_dir',
+        help='Existing prepared job directory',
+    )
+    run.add_argument(
+        '--allow-paid',
+        action='store_true',
+        dest='allow_paid',
+        help='Explicitly permit paid speech requests when needed',
+    )
+    run.add_argument(
+        '--limits',
+        type=Path,
+        default=None,
+        dest='limits_path',
+        help='JSON file with explicit numeric spending limits',
+    )
+    run.add_argument(
+        '--retry-uncertain',
+        default=None,
+        dest='retry_uncertain',
+        help='Operation ID of one unresolved paid operation to retry',
+    )
+    assemble = commands.add_parser(
+        'assemble',
+        help='Assemble and publish from retained artifacts offline',
+    )
+    assemble.add_argument(
+        '--job',
+        required=True,
+        type=Path,
+        dest='job_dir',
+        help='Existing prepared job directory',
+    )
+    assemble.add_argument(
+        '--output',
+        type=Path,
+        default=None,
+        dest='output_path',
+        help='Additional fresh output path for a second copy',
     )
     return parser
 
@@ -294,6 +356,12 @@ def _render_status(report: dict[str, object]) -> str:
         state = stages[stage]
         assert isinstance(state, dict)
         lines.append(f'stage {stage}: {state["state"]}')
+    assembly = report.get('assembly')
+    if isinstance(assembly, dict):
+        lines.append(f'assembly complete: {assembly["complete"]}')
+    publication = report.get('publication')
+    if isinstance(publication, dict):
+        lines.append(f'publication: {publication["state"]}')
     blocked = report['blocked']
     assert isinstance(blocked, list)
     lines.append(f'blocked conditions: {len(blocked)}')
@@ -302,6 +370,119 @@ def _render_status(report: dict[str, object]) -> str:
     verdict = 'BLOCKED' if blocked else 'OK'
     lines.append(f'status: {verdict}')
     return '\n'.join(lines)
+
+
+def _render_run(result: RunResult) -> str:
+    """Render the run or assemble outcome as human readable text."""
+    lines = [
+        f'{result.command}: revision {result.revision}',
+    ]
+    if result.speech is not None:
+        lines.append(
+            f'speech: {len(result.speech.completed)} completed,'
+            f' {len(result.speech.reused)} reused,'
+            f' {result.speech.request_count} requests'
+        )
+    lines.append(f'built units: {len(result.built)}')
+    for unit in result.built:
+        lines.append(f'  built {unit}')
+    lines.append(f'reused units: {len(result.reused)}')
+    verification = result.verification
+    if verification is not None:
+        verdict = 'passed' if verification.get('ok') else 'FAILED'
+        checks = verification.get('checks', [])
+        lines.append(f'verification: {verdict} ({len(checks)} checks)')
+    else:
+        lines.append('verification: registered candidate reused')
+    publication = result.publication
+    lines.append(f'publication: {publication["state"]} {publication["path"]}')
+    lines.append(f'report: {result.report_path}')
+    lines.append(
+        'pending human checks: listening acceptance and reference'
+        ' player startup remain manual'
+    )
+    return '\n'.join(lines)
+
+
+def _load_run_limits(
+    args: argparse.Namespace,
+) -> tuple[SpendingLimits | None, int]:
+    """Load the spending limits file for one run invocation."""
+    if args.limits_path is None:
+        return None, EXIT_OK
+    try:
+        return spending_limits_from_file(args.limits_path), EXIT_OK
+    except SettingsError as error:
+        print(f'invalid spending limits: {error}', file=sys.stderr)
+        return None, EXIT_INVALID_INPUT
+    except OSError as error:
+        print(f'spending limits file cannot be read: {error}', file=sys.stderr)
+        return None, EXIT_TOOL_FAILURE
+
+
+def _run_run(args: argparse.Namespace) -> int:
+    """Run the run command and return its exit code."""
+    try:
+        settings = load_settings()
+    except SettingsError as error:
+        print(f'invalid settings: {error}', file=sys.stderr)
+        return EXIT_INVALID_INPUT
+    except OSError as error:
+        print(f'settings file cannot be read: {error}', file=sys.stderr)
+        return EXIT_TOOL_FAILURE
+    limits, limits_exit = _load_run_limits(args)
+    if limits_exit != EXIT_OK:
+        return limits_exit
+    try:
+        result = run_job_pipeline(
+            args.job_dir,
+            allow_paid=args.allow_paid,
+            limits=limits,
+            settings=settings,
+            retry_uncertain=args.retry_uncertain,
+        )
+    except KeyboardInterrupt:
+        print(
+            'interrupted; job state stays at its last checkpoint',
+            file=sys.stderr,
+        )
+        return EXIT_INTERRUPTED
+    except Exception as error:
+        exit_code, kind, detail = describe_pipeline_failure(error)
+        print(f'{kind}: {detail}', file=sys.stderr)
+        return exit_code
+    print(_render_run(result))
+    return EXIT_OK
+
+
+def _run_assemble(args: argparse.Namespace) -> int:
+    """Run the assemble command and return its exit code."""
+    try:
+        settings = load_settings()
+    except SettingsError as error:
+        print(f'invalid settings: {error}', file=sys.stderr)
+        return EXIT_INVALID_INPUT
+    except OSError as error:
+        print(f'settings file cannot be read: {error}', file=sys.stderr)
+        return EXIT_TOOL_FAILURE
+    try:
+        result = assemble_job_pipeline(
+            args.job_dir,
+            settings=settings,
+            extra_output=args.output_path,
+        )
+    except KeyboardInterrupt:
+        print(
+            'interrupted; job state stays at its last checkpoint',
+            file=sys.stderr,
+        )
+        return EXIT_INTERRUPTED
+    except Exception as error:
+        exit_code, kind, detail = describe_pipeline_failure(error)
+        print(f'{kind}: {detail}', file=sys.stderr)
+        return exit_code
+    print(_render_run(result))
+    return EXIT_OK
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -315,6 +496,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_prepare(args)
         if args.command == 'status':
             return _run_status(args)
+        if args.command == 'run':
+            return _run_run(args)
+        if args.command == 'assemble':
+            return _run_assemble(args)
     except KeyboardInterrupt:
         print(
             'interrupted; job state stays at its last checkpoint',
@@ -329,7 +514,10 @@ __all__ = [
     'EXIT_INTERRUPTED',
     'EXIT_INVALID_INPUT',
     'EXIT_OK',
+    'EXIT_PROVIDER',
     'EXIT_TOOL_FAILURE',
+    'EXIT_USAGE',
+    'EXIT_VERIFICATION',
     'SETTINGS_ENV_VAR',
     'build_parser',
     'main',

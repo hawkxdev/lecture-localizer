@@ -249,6 +249,9 @@
               "raw_response",
               "normalized_audio",
               "fitted_audio",
+              "timeline_audio",
+              "narration_audio",
+              "original_audio",
               "subtitles",
               "container_track"
             ]

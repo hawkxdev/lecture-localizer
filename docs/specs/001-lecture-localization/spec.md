@@ -2,7 +2,7 @@
 
 ## Preparation state
 
-Feature phase: `in_progress`. This specification owns the scenario and its phase record. The scenario, acceptance criteria and technical choices below are approved. The initial speedup limit remains subject to listening validation. The [implementation plan](plan.md) and its stage sequence are approved. Stage 1 (installable package and local tool checks) is delivered through [PR 6](https://github.com/hawkxdev/lecture-localizer/pull/6); Stage 2 (validated persistent jobs and selective reuse) is assigned through [issue 7](https://github.com/hawkxdev/lecture-localizer/issues/7). A live pilot needs its own protocol and authorization.
+Feature phase: `in_progress`. This specification owns the scenario and its phase record. The scenario, acceptance criteria and technical choices below are approved. The initial speedup limit remains subject to listening validation. The [implementation plan](plan.md) and its stage sequence are approved. Stage 1 (installable package and local tool checks) is delivered through [PR 6](https://github.com/hawkxdev/lecture-localizer/pull/6); Stage 2 (validated persistent jobs and selective reuse) is delivered through the merged [issue 7](https://github.com/hawkxdev/lecture-localizer/issues/7) work; the component stages are delivered through PRs 16, 15 and 17; the integrated guarded run and offline assembly of stages 5.4-5.5 is implemented in [PR 18](https://github.com/hawkxdev/lecture-localizer/pull/18), which owns its current technical review and merge status. Stage 6 and full-feature acceptance remain open. A live pilot needs its own protocol and authorization.
 
 ## User and purpose
 

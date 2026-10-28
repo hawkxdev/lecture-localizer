@@ -1,6 +1,6 @@
 # Contributing
 
-lecture-localizer is in early development: the installable package currently provides local tool diagnostics, while the localization pipeline itself is not implemented. Useful contributions include workflow feedback, concrete use cases, documentation corrections, and small examples using synthetic or rights-cleared media.
+lecture-localizer is in early development: the installable package currently provides local tool diagnostics, validated persistent jobs, guarded speech synthesis, complete fitted narration, verified MP4 assembly and the guarded run and offline assemble commands. Live speech quality, listening acceptance and the full feature remain unaccepted. Useful contributions include workflow feedback, concrete use cases, documentation corrections, and small examples using synthetic or rights-cleared media.
 
 ## Discuss a change
 
@@ -27,7 +27,7 @@ Run the local quality runner from the repository root:
 scripts/qc-python-cli.sh
 ```
 
-The runner creates `.venv` when it is missing and then, propagating every failure: Ruff format check, Ruff check, mypy, the stage test suite, the package build, an artifact privacy gate that rejects any archive member outside the public allowlist and any runtime or user data under the package root, and a fresh-venv wheel installation smoke test that runs the `lecture-localizer` console entry and loads both packaged schemas from the installed wheel. The doctor tests exercise the real local FFmpeg, ffprobe and MP4Box, so those tools must be installed for the suite to pass; this is a setup prerequisite, not a hidden skip. Full diagnostics on macOS additionally follow [README.md](README.md).
+The runner creates `.venv` when it is missing and then, propagating every failure: Ruff format check, Ruff check, mypy, the stage test suite, the package build, an artifact privacy gate that rejects any archive member outside the public allowlist and any runtime or user data under the package root, and a fresh-venv wheel installation smoke test that runs the `lecture-localizer` console entry and loads all three packaged schemas from the installed wheel. The doctor tests exercise the real local FFmpeg, ffprobe and MP4Box, so those tools must be installed for the suite to pass; this is a setup prerequisite, not a hidden skip. Full diagnostics on macOS additionally follow [README.md](README.md).
 
 Synthetic, rights-safe media fixtures are created only in an explicit new directory:
 
