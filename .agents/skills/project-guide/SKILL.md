@@ -18,7 +18,7 @@ Own lecture-localizer's media vocabulary and implementation knowledge. `README.m
 
 ## Implemented capabilities (stage 2 through 5)
 
-The integrated pipeline of stages 2 to 5 is delivered; full stage 6 acceptance remains open. Listening and player acceptance are specific to the exact output and the owner report, separate from source reproducibility and provisional speedup validation.
+The integrated pipeline is delivered, and the short reference scenario has completed stage 6 checks and owner acceptance. The feature specification owns its phase and exact evidence scope. Translation meaning, narration, QuickTime/IINA behavior and the separate 1.20 comparison are accepted for the reference artifacts; this does not establish other voices, platforms or long-lecture workloads.
 
 | Capability | Owner |
 |---|---|

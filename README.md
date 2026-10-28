@@ -1,8 +1,8 @@
 # lecture-localizer
 
-A proposed CLI for localizing lecture videos while preserving the original media.
+A local CLI for localizing lecture videos while preserving the original media.
 
-**Status:** Development. An installable package with local tool diagnostics, validated persistent jobs, guarded speech synthesis, fitted narration, verified MP4 assembly and the complete guarded run/offline assemble commands is available. Full feature acceptance remains open; automated checks do not replace listening and player checks on the actual output.
+**Status:** Development. An installable package with local tool diagnostics, validated persistent jobs, guarded speech synthesis, fitted narration, verified MP4 assembly and the complete guarded run/offline assemble commands is available. The first scenario is accepted on a short macOS reference sample, including reviewed translation, listening, QuickTime/IINA behavior and a 1.20 speed comparison. Long-lecture use, other voices and other platforms remain unverified; review each new output.
 
 ## Implemented: `lecture-localizer doctor`
 
@@ -121,7 +121,7 @@ The ordinary WAV parser remains strict. After a complete HTTP response, the spee
 
 Local recovery stores a strict version 1 receipt under `evidence/recoveries/`, binds the exact historical attempt, source, request and artifact hashes, and retains its separately derived WAV under `evidence/canonical-wav/`. The receipt is published before the manifest checkpoint, so repeating the same recovery safely finishes an interrupted checkpoint without another request or changing the original HTTP history. `status` and run reports show local validation separately from failed provider-attempt history; missing or inconsistent recovery provenance blocks reuse. Unknown receipt versions are rejected rather than migrated.
 
-## Proposed workflow
+## Workflow
 
 1. Provide a local video, source subtitles, and a reviewed translation.
 2. Keep the complete translation separate from the text prepared for narration.

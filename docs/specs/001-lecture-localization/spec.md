@@ -2,7 +2,11 @@
 
 ## Preparation state
 
-Feature phase: `in_progress`. This specification owns the scenario and its phase record. The scenario, acceptance criteria and technical choices below are approved. The initial speedup limit remains subject to listening validation. The [implementation plan](plan.md) and its stage sequence are approved. Stage 1 (installable package and local tool checks) is delivered through [PR 6](https://github.com/hawkxdev/lecture-localizer/pull/6); Stage 2 (validated persistent jobs and selective reuse) is delivered through the merged [issue 7](https://github.com/hawkxdev/lecture-localizer/issues/7) work; the component stages are delivered through PRs 16, 15 and 17; the integrated guarded run and offline assembly of stages 5.4-5.5 is implemented in [PR 18](https://github.com/hawkxdev/lecture-localizer/pull/18), which owns its current technical review and merge status. Stage 6 and full-feature acceptance remain open. A live pilot needs its own protocol and authorization.
+Feature phase: `accepted`. This specification remains the single phase and requirement owner for feature 001. The approved first scenario is accepted on the short macOS reference example; its scope and criteria are unchanged.
+
+Result: [main fb15e0f](https://github.com/hawkxdev/lecture-localizer/commit/fb15e0f99787578b441129cd38d721e8af1ad39a), delivered through [PR 19](https://github.com/hawkxdev/lecture-localizer/pull/19), including the guarded integration from [PR 18](https://github.com/hawkxdev/lecture-localizer/pull/18). The delivered tree equals the tested result. Required evidence includes local quality on Python 3.12.9 and 3.14.6, published clean-clone reproduction and the owner's translation, listening and reference-player decisions summarised below.
+
+Blockers: none established for the six acceptance criteria of this scenario. Acceptance does not imply every voice, source encoding, operating system or long-lecture workload was tested. New paid execution, publication, releases and deployments retain their own authority. The next product step is use on separately selected inputs with their own spending limits and output checks.
 
 ## User and purpose
 
@@ -93,14 +97,14 @@ Preserve the original video timeline. A segment's source window runs from the ea
 
 Start narration at the beginning of its window. If it is shorter than the window, retain normal speed and fill the remaining time with silence. If it is longer, allow local speedup while preserving pitch. Do not shift following segments, extend the video, or trim speech endings or quiet sections. Preserve the complete provider audio response separately from fitted audio.
 
-The approved initial maximum speedup is `1.20`, or 20 percent. This is a provisional guard for a future listening check, not a demonstrated intelligibility threshold. Keep fitting parameters in job settings, outside the translation JSON.
+The approved initial maximum speedup is `1.20`, or 20 percent. The owner accepted an original-versus-atempo comparison of the three retained Russian Eve phrases. This supports the chosen limit for that sample, not a universal intelligibility threshold. Keep fitting parameters in job settings, outside the translation JSON; actual output-length checks and refusal without trimming remain mandatory.
 
 For measured speech duration `D` and positive available window duration `W`, the required speedup is `max(1, D / W)`. If it exceeds `1.20`, stop the affected segment. After fitting, measure the audio again and require the complete result to fit inside the window. Never trim the result merely to satisfy that check.
 
 | Five-second window | Required speedup | Timing disposition |
 |---|---|---|
 | Four seconds of speech | `1.00` | Normal speed, followed by one second of silence |
-| Six seconds of speech | `1.20` | Within the provisional limit; still requires fitting and listening checks |
+| Six seconds of speech | `1.20` | Within the configured limit; still requires actual fitting checks and suitable listening review for new material |
 | 6.1 seconds of speech | `1.22` | Stop and report the segment |
 
 A timing failure preserves the job and original speech. Report the segment ID, available time, measured duration, required speedup and configured limit. Wording revision occurs outside the application; do not automatically shorten text or mark the job complete.
@@ -156,7 +160,7 @@ Target Python 3.12 or later, with initial platform acceptance on macOS. Minimum-
 
 Use an explicit Draft 2020-12 JSON Schema alongside strict JSON parsing and semantic checks. Schema validation alone does not detect duplicate keys already discarded by a parser or establish input-hash identity and complete ordered cue coverage.
 
-The proposed package location is `src/lecture_localizer`, exposed as `lecture-localizer`. Its command responsibilities are approved; exact arguments and exit codes belong in the implementation plan:
+The package location is `src/lecture_localizer`, exposed as `lecture-localizer`. Its command responsibilities are approved; exact arguments and exit codes belong in the implementation plan:
 
 | Command | Responsibility |
 |---|---|
@@ -207,10 +211,23 @@ Project-authored code remains MIT. HTTPX and jsonschema retain their own license
 
 Meaning and listening quality need human review; container and timing checks alone do not prove them. External adoption is a separate desirable outcome.
 
-The documented spoken-source recipe obtains three hash-pinned public recordings and prepares matching subtitles and reviewed translation without provider access. AC6 reproduction is verified for published revision `1447185f3bd02c06993572cb7c1b4df586c30915` in [PR 19](https://github.com/hawkxdev/lecture-localizer/pull/19): an anonymous clean public clone, a new Python 3.12.9 environment, cold source retrieval, preparation and offline repetition pass without private files or provider credentials. All 60 tracked files match that revision. This establishes reproduction of the example inputs and job preparation, not a new paid synthesis or full feature acceptance; main delivery still depends on PR integration.
+### Reference acceptance evidence
+
+| Criterion | Result and evidence |
+|---|---|
+| AC1 | Original sources and existing outputs are preserved. Current job/source hashes and the accepted MP4 match; collision and alias regressions exercise refusal without overwrite. |
+| AC2 | All three source cues, the full translation, the resolved narration text and extracted Russian subtitles match. The owner explicitly confirmed the meaning of all three documented translations. Optional separate narration and translation-only changes have distinct regression coverage. |
+| AC3 | Five persisted streams and their language/default/forced flags pass verification. The owner confirmed track switching and QuickTime Player/IINA behavior on the exact reference MP4. Player versions and individual startup selections were not supplied; no cross-version claim is made. |
+| AC4 | All 14 named MP4 checks pass. The owner accepted the complete reference narration and a separate three-pair `atempo=1.200000` comparison, including intelligibility and phrase endings. Frame-limit and post-fit overflow regressions preserve refusal without trimming. |
+| AC5 | Retained responses are recovered and assembled offline without a new provider request or key read; original failed-attempt history remains unchanged. Interruption, uncertainty, corruption and selective invalidation have distinguishing regressions. |
+| AC6 | An anonymous public clone of `1447185f3bd02c06993572cb7c1b4df586c30915` reproduced the spoken inputs and job preparation in a new Python 3.12.9 environment without private files or credentials. Final PR and merged-main trees preserve the same executable files. The tone fixture remains separate. |
+
+The accepted 60 second MP4 has SHA256 `c3fd351b343c22e4fe2a446dba51d415015ab601f18113fd9ce1427e2090d2d7`; the 40.341875 second speed comparison has SHA256 `debb3a293f40120658ff7c83eab6d5820237b774c6f2b7ad5f57e5df9184bf3d`. These owner-reviewed local artifacts and provider response bodies are excluded from the source and package. Local checks are author self-verification, not independent review.
+
+Full local quality passes 505 tests without skips on Python 3.12.9 and 3.14.6, including Ruff, mypy, build, archive privacy, wheel installation and all four schemas. Runtime dependency versions and their retained notices were reviewed; the application does not bundle those dependencies or native binaries. The public recipe and attribution describe the obtainable English inputs. Generating new Russian speech still requires the reader's own key and explicit paid limits.
 
 ## Scenario boundary and open choices
 
 The scenario starts with local media, matching English SRT subtitles and reviewed Russian text in JSON. Recording, platform access, transcription, translation generation and narration rewriting are outside this scenario.
 
-The runtime, command responsibilities, media tools, speech-fitting approach, audio encoding parameters and first-distribution boundary are approved above. The implementation plan defines task-level interfaces, dependency pins, tests and failure handling. Local automated checks cover Python 3.12.9 and 3.14.6; they do not establish every interpreter, encoding or operating-system variant. The owner reported satisfactory listening, track switching and QuickTime/IINA behavior for one 60 second output; that acceptance applies to that sample. Actual long-lecture use and the provisional speedup limit still need their separate validation.
+The runtime, command responsibilities, media tools, speech-fitting approach, audio encoding parameters and first-distribution boundary are approved above. The implementation plan defines task-level interfaces, dependency pins, tests and failure handling. Local automated checks cover Python 3.12.9 and 3.14.6; they do not establish every interpreter, encoding or operating-system variant. The owner accepted the reference translation, narration, track switching and QuickTime/IINA behavior, then the separate 1.20 comparison. Actual long-lecture use and additional voices, encodings and platforms remain unverified limits of this evidence; they are extensions beyond the accepted reference evidence.
