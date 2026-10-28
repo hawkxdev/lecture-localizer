@@ -207,7 +207,7 @@ Project-authored code remains MIT. HTTPX and jsonschema retain their own license
 
 Meaning and listening quality need human review; container and timing checks alone do not prove them. External adoption is a separate desirable outcome.
 
-The documented spoken-source recipe obtains three hash-pinned public recordings and prepares matching subtitles and reviewed translation without provider access. A clean exported public source tree has reproduced those inputs and passed preparation; that observation does not establish delivery from a published Git clone. AC6 remains open until that delivery is verified.
+The documented spoken-source recipe obtains three hash-pinned public recordings and prepares matching subtitles and reviewed translation without provider access. AC6 reproduction is verified for published revision `1447185f3bd02c06993572cb7c1b4df586c30915` in [PR 19](https://github.com/hawkxdev/lecture-localizer/pull/19): an anonymous clean public clone, a new Python 3.12.9 environment, cold source retrieval, preparation and offline repetition pass without private files or provider credentials. All 60 tracked files match that revision. This establishes reproduction of the example inputs and job preparation, not a new paid synthesis or full feature acceptance; main delivery still depends on PR integration.
 
 ## Scenario boundary and open choices
 
