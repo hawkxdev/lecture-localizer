@@ -151,8 +151,13 @@ def copy_new_file(source: str | Path, target: str | Path) -> None:
     fd, temp_name = _mkstemp_in(target_path.parent, target_path.name)
     linked = False
     try:
+        try:
+            reader = open(source_path, 'rb')  # noqa: SIM115
+        except BaseException:
+            os.close(fd)
+            raise
         with (
-            open(source_path, 'rb') as reader,
+            reader,
             os.fdopen(fd, 'wb') as writer,
         ):
             shutil.copyfileobj(reader, writer, length=_COPY_CHUNK_BYTES)

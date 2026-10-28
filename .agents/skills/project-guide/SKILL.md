@@ -46,7 +46,7 @@ Doctor verifies the real features the media profile needs: FFmpeg H.264 decoding
 
 ## Artifact model
 
-The job artifacts below are implemented by Stage 2; later output artifacts remain proposals.
+The job artifacts below are implemented; the artifact table lists the actual persisted job state.
 
 | Artifact | Meaning |
 |---|---|

@@ -876,3 +876,361 @@ def test_limits_file_loader_validates(tmp_path: Path) -> None:
 
     with pytest.raises(SettingsError):
         spending_limits_from_file(bad)
+
+
+def test_source_change_or_loss_stops_before_any_request(
+    tmp_path: Path,
+) -> None:
+    for mode in ('video_changed', 'srt_deleted'):
+        kit = make_kit(tmp_path, name=f'src-{mode}')
+        kit['job'] = tmp_path / f'job-{mode}'
+        kit['output'] = tmp_path / f'out-{mode}.mp4'
+        prepare(kit)
+        if mode == 'video_changed':
+            with kit['video'].open('ab') as stream:
+                stream.write(b'source-change-after-prepare')
+        else:
+            kit['srt'].unlink()
+        transport = CountingTransport()
+        keys = CountingKeys()
+        with pytest.raises(ContractError):
+            run_full(kit, tmp_path, transport=transport, keys=keys)
+        assert transport.requests == [], mode
+        assert keys.reads == 0, mode
+
+
+def test_in_place_output_edit_is_collision_with_stale_receipt(
+    tmp_path: Path,
+) -> None:
+    kit = make_kit(tmp_path)
+    prepare(kit)
+    run_full(kit, tmp_path)
+    with kit['output'].open('r+b') as stream:
+        stream.seek(-1, 2)
+        previous = stream.read(1)
+        stream.seek(-1, 2)
+        stream.write(bytes([previous[0] ^ 1]))
+    identity_before = (
+        kit['output'].stat().st_dev,
+        kit['output'].stat().st_ino,
+        kit['output'].stat().st_size,
+    )
+    modified = kit['output'].read_bytes()
+    with pytest.raises(PipelineFailure) as excinfo:
+        run_full(kit, tmp_path)
+    assert excinfo.value.exit_code == 3
+    assert kit['output'].read_bytes() == modified
+    identity_after = (
+        kit['output'].stat().st_dev,
+        kit['output'].stat().st_ino,
+        kit['output'].stat().st_size,
+    )
+    assert identity_before == identity_after
+    status = read_job_status(kit['job'])
+    assert status['publication']['state'] == 'collision'
+
+
+def test_rebound_foreign_hardlink_at_new_destination_is_collision(
+    tmp_path: Path,
+) -> None:
+    import os
+
+    kit = make_kit(tmp_path)
+    prepare(kit)
+    run_full(kit, tmp_path)
+    old_output = kit['output']
+    old_bytes = old_output.read_bytes()
+    payload = json.loads(kit['translation'].read_text(encoding='utf-8'))
+    payload['segments'][0]['translation'] = (
+        'Изменённый полный перевод для повторной публикации.'
+    )
+    path = tmp_path / 'translation-rebound2.json'
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
+        encoding='utf-8',
+    )
+    new_output = tmp_path / 'out-v2.mp4'
+    prepare(
+        kit,
+        translation=rebind_translation(path, kit['video'], kit['srt']),
+        output=new_output,
+    )
+    os.link(old_output, new_output)
+    with pytest.raises(PipelineFailure) as excinfo:
+        run_full(kit, tmp_path)
+    assert excinfo.value.exit_code == 3
+    assert new_output.read_bytes() == old_bytes
+
+
+def test_converted_pcm_44100_stereo_publishes(tmp_path: Path) -> None:
+    import subprocess
+
+    require_real_media()
+    source_dir = tmp_path / 'src-conv'
+    source_dir.mkdir()
+    converted = source_dir / 'converted.mov'
+    command = [
+        'ffmpeg',
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-nostdin',
+        '-f',
+        'lavfi',
+        '-i',
+        'color=c=black:s=128x96:r=10:d=2.0',
+        '-f',
+        'lavfi',
+        '-i',
+        'sine=frequency=440:duration=2.0',
+        '-c:v',
+        'libx264',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'pcm_s16le',
+        '-ar',
+        '44100',
+        '-ac',
+        '2',
+        '-y',
+        str(converted),
+    ]
+    subprocess.run(
+        command, capture_output=True, text=True, timeout=120, check=True
+    )
+    srt = write_srt(source_dir / 'lecture.srt', DEFAULT_CUES)
+    translation = write_translation(
+        source_dir / 'translation.json',
+        converted,
+        srt,
+        default_segments(),
+    )
+    kit = {
+        'video': converted,
+        'srt': srt,
+        'translation': translation,
+        'job': tmp_path / 'job-conv',
+        'output': tmp_path / 'out-conv.mp4',
+    }
+    prepare(kit)
+    transport = CountingTransport()
+    keys = CountingKeys()
+    result = run_full(kit, tmp_path, transport=transport, keys=keys)
+    assert len(transport.requests) == 2
+    assert keys.reads == 1
+    assert result.publication['state'] == 'published'
+    assert result.verification is not None
+    assert result.verification['ok'] is True
+
+
+def test_status_readable_for_unknown_duration(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    prepare(kit)
+    manifest_path = kit['job'] / 'manifest.json'
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    manifest['media']['duration_seconds'] = None
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True)
+        + '\n',
+        encoding='utf-8',
+    )
+    status = read_job_status(kit['job'])
+    assert any('duration' in str(item).lower() for item in status['blocked'])
+    assert status['assembly']['complete'] is False
+    transport = CountingTransport()
+    keys = CountingKeys()
+    with pytest.raises(ContractError):
+        run_full(kit, tmp_path, transport=transport, keys=keys)
+    assert transport.requests == []
+    assert keys.reads == 0
+
+
+def test_corrupt_registered_candidate_reports_blocked_publication(
+    tmp_path: Path,
+) -> None:
+    kit = make_kit(tmp_path)
+    prepare(kit)
+    run_full(kit, tmp_path)
+    record = artifact_records(kit['job'], 'container_track')[0]
+    target = kit['job'] / record['path']
+    target.write_bytes(target.read_bytes()[:-64])
+    status = read_job_status(kit['job'])
+    assert status['publication']['candidate'] == 'corrupt'
+    assert status['publication']['state'] != 'published'
+    assert any('candidate' in str(item).lower() for item in status['blocked'])
+
+
+def test_unknown_journal_version_blocks_cached_run(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    prepare(kit)
+    run_full(kit, tmp_path)
+    journal = kit['job'] / 'operations.json'
+    payload = json.loads(journal.read_text(encoding='utf-8'))
+    payload['schema_version'] = 999
+    journal.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
+        encoding='utf-8',
+    )
+    transport = CountingTransport()
+    keys = CountingKeys()
+    with pytest.raises(ContractError):
+        run_full(kit, tmp_path, transport=transport, keys=keys)
+    assert transport.requests == []
+    assert keys.reads == 0
+    status = read_job_status(kit['job'])
+    assert any('journal' in str(item).lower() for item in status['blocked'])
+
+
+def test_interrupted_final_journal_write_reconciles_without_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kit = make_kit(tmp_path)
+    prepare(kit)
+    import lecture_localizer.jobs as jobs_module
+
+    real_write = jobs_module._write_journal
+
+    def failing_write(path: Path, journal: dict[str, Any], now: str) -> None:
+        last_state = (
+            journal['operations'][-1]['state'] if journal['operations'] else ''
+        )
+        if last_state == 'completed':
+            raise OSError('simulated journal interruption')
+        real_write(path, journal, now)
+
+    monkeypatch.setattr(jobs_module, '_write_journal', failing_write)
+    with pytest.raises(OSError, match='simulated journal'):
+        run_full(kit, tmp_path)
+    manifest_records = artifact_records(kit['job'], 'raw_response')
+    assert len(manifest_records) == 1
+    monkeypatch.setattr(jobs_module, '_write_journal', real_write)
+    journal_path = kit['job'] / 'operations.json'
+    payload = json.loads(journal_path.read_text(encoding='utf-8'))
+    states = [op['state'] for op in payload['operations']]
+    assert states == ['started']
+    transport = CountingTransport()
+    keys = CountingKeys()
+    result = run_full(kit, tmp_path, transport=transport, keys=keys)
+    assert len(transport.requests) == 1
+    assert keys.reads == 1
+    assert result.publication['state'] == 'published'
+    payload = json.loads(journal_path.read_text(encoding='utf-8'))
+    states = [op['state'] for op in payload['operations']]
+    assert states == ['completed', 'completed']
+    reconciled = payload['operations'][0]['attempts'][-1]
+    assert reconciled['verdict'] == 'completed'
+    assert reconciled['response'] is None
+    reconciled_evidence = reconciled['evidence']
+    registered = artifact_records(kit['job'], 'raw_response')[0]
+    assert reconciled_evidence['sha256'] == registered['sha256']
+    assert reconciled_evidence['path'] == registered['path']
+
+
+def test_latest_report_reflects_actual_last_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uuid as uuid_module
+
+    kit = make_kit(tmp_path)
+    prepare(kit)
+    run_full(kit, tmp_path)
+
+    controlled = iter(
+        [
+            uuid_module.UUID('ffffffff-ffff-4fff-afff-ffffffffffff'),
+            uuid_module.UUID('00000000-0000-4000-a000-000000000000'),
+        ]
+    )
+    real_uuid4 = uuid_module.uuid4
+
+    def controlled_uuid4() -> Any:
+        try:
+            return next(controlled)
+        except StopIteration:
+            return real_uuid4()
+
+    monkeypatch.setattr(uuid_module, 'uuid4', controlled_uuid4)
+    first = run_full(kit, tmp_path)
+    second = run_full(kit, tmp_path)
+    status = read_job_status(kit['job'])
+    assert status['latest_report'] == Path(second.report_path).name
+    assert status['latest_report'] != Path(first.report_path).name
+    first_created = json.loads(
+        (kit['job'] / first.report_path).read_text(encoding='utf-8')
+    )['created_at']
+    second_created = json.loads(
+        (kit['job'] / second.report_path).read_text(encoding='utf-8')
+    )['created_at']
+    assert second_created >= first_created
+
+
+def test_corrupt_bound_source_stops_before_any_request(
+    tmp_path: Path,
+) -> None:
+    import json as json_module
+    import subprocess
+
+    require_real_media()
+    from lecture_localizer.media import scrubbed_environment
+
+    kit = make_kit(tmp_path, name='src-decode')
+    kit['job'] = tmp_path / 'job-decode'
+    kit['output'] = tmp_path / 'out-decode.mp4'
+    probe = subprocess.run(
+        [
+            'ffprobe',
+            '-v',
+            'error',
+            '-select_streams',
+            'v:0',
+            '-show_packets',
+            '-show_entries',
+            'packet=pos,size',
+            '-of',
+            'json',
+            str(kit['video']),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=scrubbed_environment(),
+    )
+    packets = json_module.loads(probe.stdout)['packets']
+    victim = packets[len(packets) // 2]
+    with kit['video'].open('r+b') as stream:
+        stream.seek(int(victim['pos']))
+        stream.write(b'\x00' * int(victim['size']))
+    payload = json.loads(kit['translation'].read_text(encoding='utf-8'))
+    payload['source']['video_sha256'] = sha256(kit['video'])
+    kit['translation'].write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
+        encoding='utf-8',
+    )
+    prepare(kit)
+    decode = subprocess.run(
+        [
+            'ffmpeg',
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-nostdin',
+            '-xerror',
+            '-i',
+            str(kit['video']),
+            '-f',
+            'null',
+            '-',
+        ],
+        capture_output=True,
+        env=scrubbed_environment(),
+    )
+    assert decode.returncode != 0
+    transport = CountingTransport()
+    keys = CountingKeys()
+    with pytest.raises(ContractError):
+        run_full(kit, tmp_path, transport=transport, keys=keys)
+    assert transport.requests == []
+    assert keys.reads == 0

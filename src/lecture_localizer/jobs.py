@@ -1252,12 +1252,62 @@ def _assembly_view(
     artifacts: list[dict[str, Any]],
     failed_labels: frozenset[str],
 ) -> dict[str, Any]:
-    """Summarize downstream assembly readiness with actionable blockers."""
+    """Summarize downstream assembly readiness with actionable blockers.
+
+    A recorded missing duration keeps the job readable: assembly is
+    reported as unplannable instead of raising, and no duration value
+    is ever invented.
+    """
+    blocked: list[str] = []
+    if manifest['media']['duration_seconds'] is None:
+        blocked.append(
+            'the recorded media carries no duration, so the assembly'
+            ' timeline cannot be planned; supply a source whose'
+            ' duration ffprobe can report and prepare again'
+        )
+        per_segment: dict[str, Any] = {
+            'normalized_audio': _classify_records(
+                'normalized_audio',
+                {
+                    s['id']: s['synthesis_signature']
+                    for s in manifest['segments']
+                },
+                artifacts,
+                failed_labels,
+            ),
+            'fitted_audio': _classify_records(
+                'fitted_audio',
+                {
+                    s['id']: s['fitting_signature']
+                    for s in manifest['segments']
+                },
+                artifacts,
+                failed_labels,
+            ),
+        }
+        return {
+            'complete': False,
+            'blocked': blocked,
+            'units': {
+                **per_segment,
+                'timeline_audio': 'missing',
+                'narration_audio': 'missing',
+                **(
+                    {'original_audio': 'missing'}
+                    if manifest['media']['audio_disposition'] == 'convert'
+                    else {}
+                ),
+            },
+            'signatures': {
+                'timeline': None,
+                'narration': None,
+                'original': None,
+            },
+        }
     model = _assembly_model(manifest, artifacts, failed_labels)
     units = model['units']
     normalized = units['normalized_audio']
     fitted = units['fitted_audio']
-    blocked: list[str] = []
     for segment in manifest['segments']:
         segment_id = segment['id']
         if (
@@ -1532,7 +1582,9 @@ def read_job_status(job_dir: Path) -> dict[str, Any]:
     blocked.extend(assembly['blocked'])
     operations, journal_blocked = _status_operations_view(job_dir)
     blocked.extend(journal_blocked)
-    publication = _publication_status_view(job_dir, manifest, artifacts)
+    publication = _publication_status_view(
+        job_dir, manifest, artifacts, failed_labels
+    )
     blocked.extend(publication.get('blocked', []))
     return {
         'command': 'status',
@@ -1566,13 +1618,20 @@ def _publication_status_view(
     job_dir: Path,
     manifest: dict[str, Any],
     artifacts: list[dict[str, Any]],
+    failed_labels: frozenset[str],
 ) -> dict[str, Any]:
-    """Derive the read only publication state of one job."""
+    """Derive the read only publication state of one job.
+
+    The candidate classification consumes the actual integrity
+    results, and recognizing a published output needs the full
+    receipt chain: the exact destination, the recorded file identity
+    and intact bytes hashing to the recorded digest.
+    """
     container = _classify_records(
         'container_track',
         {None: manifest['container_signature']},
         artifacts,
-        frozenset(),
+        failed_labels,
     )[None]
     output_path = Path(manifest['output_path'])
     view: dict[str, Any] = {
@@ -1601,17 +1660,18 @@ def _publication_status_view(
     if not output_path.exists():
         view['state'] = 'pending'
         return view
-    if _identity_matches(receipt, output_path):
+    recorded = receipt.get('sha256') if isinstance(receipt, dict) else None
+    proxy = {'sha256': recorded}
+    if _owned_publication_matches(receipt, output_path, proxy):
         view['state'] = 'published'
         view['recognized'] = True
-        if receipt is not None:
-            view['sha256'] = receipt.get('sha256')
+        view['sha256'] = recorded
         return view
     view['state'] = 'collision'
     view['blocked'].append(
         'the output path holds a file without owned publication'
         f' provenance: {output_path}; it is preserved untouched and'
-        ' never accepted by byte equality alone'
+        ' never accepted by byte equality or file identity alone'
     )
     return view
 
@@ -3128,7 +3188,13 @@ def _build_subtitles_unit(
 
 
 def _verify_source_binding(manifest: dict[str, Any]) -> None:
-    """Refuse container work when the bound sources changed on disk."""
+    """Refuse pipeline work when the bound sources changed on disk.
+
+    The check runs before any paid request and again before the
+    container consumes the source packets, so a source changed,
+    truncated or removed after prepare never reaches synthesis or a
+    candidate built from foreign bytes.
+    """
     binding = manifest['binding']
     video_path = Path(binding['video_path'])
     srt_path = Path(binding['srt_path'])
@@ -3156,12 +3222,206 @@ def _verify_source_binding(manifest: dict[str, Any]) -> None:
         )
 
 
+def _verify_source_decodability(
+    manifest: dict[str, Any], settings: Settings
+) -> None:
+    """Refuse execution when the bound source fails a full decode.
+
+    Matching hashes alone cannot prove a decodable source: a damaged
+    video packet keeps every byte hash while stopping real playback.
+    The approved criterion requires a read or decode failure to stop
+    processing before paid synthesis, so the selected streams are
+    fully decoded here with strict error propagation.
+    """
+    video_path = Path(manifest['binding']['video_path'])
+    selected = manifest['media']['audio_stream']['index']
+    try:
+        ffmpeg = media.discover_tool('ffmpeg', settings.ffmpeg_path)
+    except MediaToolError as error:
+        raise PipelineFailure('tooling', str(error), 7) from error
+    argv = [
+        str(ffmpeg),
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-nostdin',
+        '-xerror',
+        '-i',
+        str(video_path),
+        '-map',
+        '0:v:0',
+        '-map',
+        f'0:{selected}',
+        '-f',
+        'null',
+        '-',
+    ]
+    try:
+        media.checked_run_strict(argv, settings.subprocess_timeout_seconds)
+    except MediaToolError as error:
+        raise ContractError(
+            'the bound source video does not decode completely, which'
+            ' stops processing before any paid synthesis; supply a'
+            f' decodable source and prepare again: {error}'
+        ) from error
+
+
+def _reconcile_registered_operations(
+    job_dir: Path, manifest: dict[str, Any], now_fn: Callable[[], str]
+) -> None:
+    """Resolve unresolved operations that already carry durable evidence.
+
+    An operation left started or uncertain by an interrupted journal
+    write is reconciled without any request when its segment holds the
+    current verified raw response artifact: the committed outcome is
+    recorded truthfully with a reference to that evidence. Nothing is
+    retried and no provider receipt is fabricated; operations without
+    such evidence keep their uncertainty.
+    """
+    journal = load_operations_journal(job_dir)
+    if journal is None:
+        return
+    unresolved = [
+        operation
+        for operation in journal['operations']
+        if operation['state'] in UNRESOLVED_OPERATION_STATES
+    ]
+    if not unresolved:
+        return
+    writable = _new_journal(journal, now_fn())
+    now = now_fn()
+    for operation in unresolved:
+        segment_id = operation['segment_id']
+        segment = next(
+            (
+                candidate
+                for candidate in manifest['segments']
+                if candidate['id'] == segment_id
+            ),
+            None,
+        )
+        if segment is None:
+            continue
+        record = _current_record(
+            manifest,
+            'raw_response',
+            segment_id,
+            segment['synthesis_signature'],
+        )
+        if record is None:
+            continue
+        if operation['attempts']:
+            attempt = operation['attempts'][-1]
+            attempt['verdict'] = 'completed'
+            attempt['finished_at'] = now
+            attempt['artifact'] = {
+                'path': record['path'],
+                'sha256': record['sha256'],
+            }
+            attempt['evidence'] = {
+                'path': record['path'],
+                'sha256': record['sha256'],
+                'bytes': (job_dir / record['path']).stat().st_size,
+            }
+        operation['state'] = 'completed'
+    _write_journal(job_dir / OPERATIONS_NAME, writable, now)
+
+
+def _require_resolved_completed_cache(
+    manifest: dict[str, Any], job_dir: Path
+) -> None:
+    """Keep an unresolved required operation from publishing silently.
+
+    After evidence based reconciliation, an operation that is still
+    unresolved while its segment already counts as cached stops the
+    run as a non success: the completed cache must not hide an
+    explicit pending paid decision.
+    """
+    journal = load_operations_journal(job_dir)
+    unresolved = [
+        operation
+        for operation in (journal or {}).get('operations', [])
+        if operation['state'] in UNRESOLVED_OPERATION_STATES
+    ]
+    if not unresolved:
+        return
+    planned, _reused = _planned_segments(
+        manifest, manifest['artifacts'], frozenset()
+    )
+    planned_ids = {segment['id'] for segment in planned}
+    stuck = [
+        operation
+        for operation in unresolved
+        if operation['segment_id'] not in planned_ids
+    ]
+    if stuck:
+        raise PipelineFailure(
+            'provider',
+            'unresolved paid operations block the completed cache'
+            ' without registered raw evidence:'
+            f' {[operation["operation_id"] for operation in stuck]};'
+            ' an explicit retry decision is required',
+            5,
+        )
+
+
+def _prepared_audio_facts(
+    artifact_path: Path, settings: Settings
+) -> tuple[int, int]:
+    """Measure the channels and sample rate of one prepared AAC file.
+
+    The converted original track is the verification ground truth, so
+    its declared facts come from probing the actual prepared artifact
+    instead of the source stream it was converted from.
+    """
+    ffprobe = media.discover_tool('ffprobe', settings.ffprobe_path)
+    result = media.checked_run_strict(
+        [
+            str(ffprobe),
+            '-v',
+            'error',
+            '-select_streams',
+            'a:0',
+            '-show_entries',
+            'stream=channels,sample_rate',
+            '-of',
+            'json',
+            str(artifact_path),
+        ],
+        settings.subprocess_timeout_seconds,
+    )
+    try:
+        payload = json.loads(result.stdout)
+        stream = payload['streams'][0]
+        channels = int(stream['channels'])
+        rate = int(stream['sample_rate'])
+    except (
+        json.JSONDecodeError,
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise ContractError(
+            f'the prepared original audio artifact {artifact_path}'
+            ' carries unusable stream facts and cannot anchor'
+            f' verification expectations: {error}'
+        ) from error
+    if channels < 1 or rate < 1:
+        raise ContractError(
+            f'the prepared original audio artifact {artifact_path}'
+            ' declares unusable channel or sample rate values'
+        )
+    return channels, rate
+
+
 def _candidate_expectation(
     job_dir: Path,
     manifest: dict[str, Any],
     narration_record: dict[str, Any],
     subtitles_record: dict[str, Any],
     original_record: dict[str, Any] | None,
+    settings: Settings,
 ) -> CandidateExpectation:
     """Build the declared source facts for candidate verification."""
     binding = manifest['binding']
@@ -3175,19 +3435,28 @@ def _candidate_expectation(
             'the recorded media carries no duration; verification'
             ' expectations cannot declare complete intervals'
         )
+    original_path = (
+        Path(binding['video_path'])
+        if copied
+        else job_dir / (original_record or {}).get('path', '')
+    )
+    if copied:
+        original_channels = audio_stream['channels']
+        original_sample_rate = audio_stream['sample_rate_hz']
+    else:
+        assert original_record is not None
+        original_channels, original_sample_rate = _prepared_audio_facts(
+            job_dir / original_record['path'], settings
+        )
     narration_record_path = job_dir / narration_record['path']
     return CandidateExpectation(
         video_source=Path(binding['video_path']),
-        original_packet_source=(
-            Path(binding['video_path'])
-            if copied
-            else job_dir / (original_record or {}).get('path', '')
-        ),
+        original_packet_source=original_path,
         original_packet_stream_index=audio_stream['index'],
         original_is_copied=copied,
         narration_packet_source=narration_record_path,
-        original_channels=audio_stream['channels'],
-        original_sample_rate=audio_stream['sample_rate_hz'],
+        original_channels=original_channels,
+        original_sample_rate=original_sample_rate,
         original_end_ms=_duration_to_ms(duration),
         narration_end_ms=_timeline_duration_ms(
             _timeline_total_frames(manifest)
@@ -3246,6 +3515,37 @@ def _identity_matches(receipt: dict[str, Any] | None, path: Path) -> bool:
     )
 
 
+def _owned_publication_matches(
+    receipt: dict[str, Any] | None,
+    output_path: Path,
+    candidate_record: dict[str, Any],
+) -> bool:
+    """Recognize one output as this job's own published result.
+
+    Recognition needs the full durable provenance chain: the receipt
+    must name this exact destination, the actual file must still carry
+    the recorded device, inode and size, and its intact bytes must
+    hash to the recorded digest and to the current registered
+    candidate. Byte equality alone, a registered candidate alone, or
+    an unchanged stat identity alone never prove ownership.
+    """
+    if receipt is None:
+        return False
+    if receipt.get('output_path') != str(output_path):
+        return False
+    recorded = receipt.get('sha256')
+    if not isinstance(recorded, str) or not recorded:
+        return False
+    if recorded != candidate_record['sha256']:
+        return False
+    if not _identity_matches(receipt, output_path):
+        return False
+    try:
+        return sha256_file(output_path) == recorded
+    except OSError:
+        return False
+
+
 def _write_publication_receipt(job_dir: Path, payload: dict[str, Any]) -> None:
     """Durably persist the publication receipt."""
     (job_dir / EVIDENCE_DIR).mkdir(parents=True, exist_ok=True)
@@ -3268,7 +3568,7 @@ def _publish_candidate(
     candidate_path = job_dir / candidate_record['path']
     if output_path.exists():
         receipt = _load_publication_receipt(job_dir)
-        if _identity_matches(receipt, output_path):
+        if _owned_publication_matches(receipt, output_path, candidate_record):
             if receipt is not None and receipt.get('state') != 'completed':
                 completed = dict(receipt)
                 completed['state'] = 'completed'
@@ -3284,7 +3584,9 @@ def _publish_candidate(
             'destination',
             f'refusing to overwrite an existing output without owned'
             f' publication provenance: {output_path}; a file with'
-            ' matching bytes is still a foreign destination',
+            ' matching bytes, or one keeping the recorded size and'
+            ' file identity after an in place edit, is still a'
+            ' foreign destination',
             3,
         )
     fd, temp_name = tempfile.mkstemp(
@@ -3294,8 +3596,13 @@ def _publish_candidate(
     )
     temp = Path(temp_name)
     try:
+        try:
+            reader = open(candidate_path, 'rb')  # noqa: SIM115
+        except BaseException:
+            os.close(fd)
+            raise
         with (
-            open(candidate_path, 'rb') as reader,
+            reader,
             os.fdopen(fd, 'wb') as writer,
         ):
             shutil.copyfileobj(reader, writer, length=COPY_CHUNK_BYTES)
@@ -3409,14 +3716,26 @@ def _container_stage(
             candidate_record = None
     if candidate_record is None:
         receipt = _load_publication_receipt(job_dir)
-        if output_path.exists() and not _identity_matches(
-            receipt, output_path
-        ):
-            raise PipelineFailure(
-                'destination',
-                f'refusing to build a candidate while an unowned file'
-                f' occupies the output path: {output_path}',
-                3,
+        if output_path.exists():
+            recorded_sha = (
+                receipt.get('sha256') if isinstance(receipt, dict) else None
+            )
+            proxy = {'sha256': recorded_sha}
+            if not _owned_publication_matches(receipt, output_path, proxy):
+                raise PipelineFailure(
+                    'destination',
+                    f'refusing to build a candidate while an unowned'
+                    f' file occupies the output path: {output_path}',
+                    3,
+                )
+            return (
+                {
+                    'state': 'published',
+                    'path': str(output_path),
+                    'sha256': recorded_sha,
+                    'recognized': True,
+                },
+                None,
             )
         candidate_record, verification_view = _assemble_candidate(
             job_dir,
@@ -3484,6 +3803,7 @@ def _assemble_candidate(
         narration_record,
         subtitles_record,
         original_record,
+        settings,
     )
     if manifest['media']['audio_disposition'] == 'copy':
         original_audio: CopiedAudioStream | ConvertedAudioTrack = (
@@ -3650,12 +3970,30 @@ def _write_run_report(
 
 
 def _latest_report_name(job_dir: Path) -> str | None:
-    """Return the newest durable run report name when present."""
+    """Return the newest durable run report by its recorded time.
+
+    The selection reads the durable created_at field of every report
+    instead of trusting filename suffixes, so same second invocations
+    and their random name tokens cannot reorder the actual history;
+    failed invocations write reports too and take part in the order.
+    """
     evidence = job_dir / EVIDENCE_DIR
     if not evidence.is_dir():
         return None
-    names = sorted(entry.name for entry in evidence.glob('run-*.json'))
-    return names[-1] if names else None
+    best: tuple[str, str] | None = None
+    for entry in sorted(evidence.glob('run-*.json')):
+        with contextlib.suppress(ContractError, OSError):
+            payload = load_strict_json_file(entry)
+            created_at = payload.get('created_at')
+            if not isinstance(created_at, str) or not created_at:
+                continue
+            key = (created_at, entry.name)
+            if best is None or key > best:
+                best = key
+    if best is None:
+        names = sorted(entry.name for entry in evidence.glob('run-*.json'))
+        return names[-1] if names else None
+    return best[1]
 
 
 def run_job_pipeline(
@@ -3751,6 +4089,12 @@ def _run_pipeline_locked(
         manifest = load_job_manifest(job_dir / MANIFEST_NAME)
         _verify_job_integrity(job_dir, manifest)
         _verify_window_feasibility(manifest)
+        if not assemble_only:
+            _check_operations_journal(job_dir)
+            _reconcile_registered_operations(job_dir, manifest, now_fn)
+            _require_resolved_completed_cache(manifest, job_dir)
+        _verify_source_binding(manifest)
+        _verify_source_decodability(manifest, settings)
         if not assemble_only:
             if retry_operation_id is not None:
                 speech = _retry_uncertain_operation_locked(
