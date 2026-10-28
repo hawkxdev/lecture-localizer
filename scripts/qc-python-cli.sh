@@ -64,6 +64,7 @@ FORBIDDEN = ("private", ".memory", ".agents", ".venv", ".github", ".git")
 SCHEMA_RESOURCES = (
     "schemas/translation-v1.schema.json",
     "schemas/job-v1.schema.json",
+    "schemas/operations-v1.schema.json",
 )
 EXPECTED_SDIST = (
     "src/lecture_localizer/cli.py",
@@ -73,6 +74,7 @@ EXPECTED_SDIST = (
     "src/lecture_localizer/settings.py",
     "src/lecture_localizer/storage.py",
     "src/lecture_localizer/subtitles.py",
+    "src/lecture_localizer/xai_client.py",
     *(f"src/lecture_localizer/{name}" for name in SCHEMA_RESOURCES),
     "src/lecture_localizer/__init__.py",
     "tests/test_media.py",
@@ -223,7 +225,7 @@ EOF
 
 stage "installed schema resources"
 "$SMOKE/venv/bin/python" - <<'EOF'
-"""Load both packaged schemas from the installed wheel and use them."""
+"""Load packaged schemas from the installed wheel and use them."""
 
 from importlib import resources
 
@@ -258,14 +260,18 @@ def load(name: str) -> dict:
     return json.loads(text)
 
 
-for name in ("translation-v1.schema.json", "job-v1.schema.json"):
+for name in (
+    "translation-v1.schema.json",
+    "job-v1.schema.json",
+    "operations-v1.schema.json",
+):
     schema = load(name)
     Draft202012Validator.check_schema(schema)
 
 validator = Draft202012Validator(load("translation-v1.schema.json"))
 errors = list(validator.iter_errors(TRANSLATION_SAMPLE))
 assert not errors, errors
-print("installed schema resources OK: both schemas load and validate")
+print("installed schema resources OK: all packaged schemas load and validate")
 EOF
 
 printf '\nqc-python-cli: PASS\n'

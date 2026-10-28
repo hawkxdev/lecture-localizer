@@ -8,7 +8,13 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
+from test_xai_client import (
+    FakeResponse,
+    FakeTransport,
+    build_wav_bytes,
+)
 
 from conftest import (
     DEFAULT_CUES,
@@ -27,9 +33,15 @@ from conftest import (
 )
 from lecture_localizer.contracts import ContractError
 from lecture_localizer.jobs import (
+    PaidExecutionDenied,
     PrepareResult,
+    SpendingLimits,
+    _require_execution_permission,
+    execute_speech_operations,
     prepare_job,
+    preview_speech_operations,
     read_job_status,
+    retry_uncertain_operation,
 )
 from lecture_localizer.media import MediaToolError
 from lecture_localizer.settings import Settings
@@ -41,6 +53,9 @@ from lecture_localizer.storage import (
     atomic_write_json,
     sha256_bytes,
 )
+from lecture_localizer.xai_client import SpeechRequestError
+
+KEY_MATERIAL = 'reflecting-secret-key-value'
 
 
 def make_kit(tmp_path: Path, name: str = 'src') -> dict[str, Path]:
@@ -1177,3 +1192,1023 @@ def test_installed_wheel_permits_unrelated_host_projects(
     assert main(argv) == 0
     assert 'revision 1 (created)' in capsys.readouterr().out
     assert user_job.is_dir()
+
+
+# --- Guarded speech operations and the durable journal (issue 11) ---
+
+TEST_LIMITS = SpendingLimits(
+    max_requests=10,
+    max_text_chars=100000,
+    max_cost_estimate=10.0,
+    price_per_request=0.01,
+    price_basis='synthetic test price list',
+)
+
+
+def trap_reader(name: str) -> str | None:
+    """Fail the test when a key is read at the wrong moment."""
+    raise AssertionError(f'key read attempted for {name}')
+
+
+def recording_key_reader(calls: list[str]) -> Callable[[str], str | None]:
+    """Return a reader that records every key lookup."""
+
+    def reader(name: str) -> str | None:
+        calls.append(name)
+        return 'test-secret-key-value'
+
+    return reader
+
+
+def success_transport() -> FakeTransport:
+    """Return a fake transport answering one small valid WAV."""
+    return FakeTransport(FakeResponse(chunks=(build_wav_bytes(samples=4),)))
+
+
+class InspectingTransport:
+    """Transport that reads the journal at request time."""
+
+    def __init__(
+        self,
+        job_dir: Path,
+        observed: list[dict[str, Any]],
+    ) -> None:
+        """Bind the job directory and the observation sink."""
+        self.job_dir = job_dir
+        self.observed = observed
+        self.requests: list[dict[str, Any]] = []
+
+    def __call__(
+        self,
+        *,
+        url: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        timeout: httpx.Timeout,
+    ) -> FakeResponse:
+        """Record the durable journal state seen during the request."""
+        self.requests.append(payload)
+        state = load_journal(self.job_dir)
+        self.observed.append(state['operations'][-1])
+        return FakeResponse(chunks=(build_wav_bytes(samples=4),))
+
+
+def timeout_transport() -> FakeTransport:
+    """Return a fake transport raising one inactivity timeout."""
+    return FakeTransport(httpx.ReadTimeout('peer went quiet'))
+
+
+def load_journal(job_dir: Path) -> dict[str, Any]:
+    """Parse the operations journal of one job."""
+    data: dict[str, Any] = json.loads(
+        (job_dir / 'operations.json').read_text(encoding='utf-8')
+    )
+    return data
+
+
+def test_prepare_and_status_without_journal(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    assert not (kit['job'] / 'operations.json').exists()
+    status = read_job_status(kit['job'])
+    assert status['operations']['state'] == 'absent'
+    assert status['operations']['operations'] == 0
+    assert run_prepare(kit).unchanged
+
+
+def test_prepare_blocks_malformed_journal(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    (kit['job'] / 'operations.json').write_text(
+        json.dumps(
+            {
+                'schema_version': 2,
+                'updated_at': '2026-10-27T10:00:00+00:00',
+                'operations': [],
+            }
+        ),
+        encoding='utf-8',
+    )
+    with pytest.raises(ContractError, match='operations journal'):
+        run_prepare(kit)
+    (kit['job'] / 'operations.json').write_text('{not json', encoding='utf-8')
+    with pytest.raises(ContractError, match='operations journal'):
+        run_prepare(kit)
+    status = read_job_status(kit['job'])
+    assert status['operations']['state'] == 'malformed'
+    assert any('operations journal' in line for line in status['blocked'])
+
+
+def test_prepare_blocks_unknown_journal_fields(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    (kit['job'] / 'operations.json').write_text(
+        json.dumps(
+            {
+                'schema_version': 1,
+                'updated_at': '2026-10-27T10:00:00+00:00',
+                'operations': [],
+                'extra_field': 'unexpected',
+            }
+        ),
+        encoding='utf-8',
+    )
+    with pytest.raises(ContractError, match='operations journal'):
+        run_prepare(kit)
+
+
+def test_prepare_never_resets_an_uncertain_journal(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    execute_speech_operations(
+        kit['job'],
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=timeout_transport(),
+        key_reader=lambda name: 'test-secret-key-value',
+    )
+    journal_bytes = (kit['job'] / 'operations.json').read_bytes()
+    segments = [
+        {
+            'id': 's001',
+            'source_cues': [1],
+            'translation': 'Первая реплика.',
+            'narration': 'Совершенно другая озвучка.',
+        },
+        *default_segments()[1:],
+    ]
+    changed = write_translation(
+        tmp_path / 'changed.json', kit['video'], kit['srt'], segments
+    )
+    run_prepare(kit, translation=changed)
+    assert (kit['job'] / 'operations.json').read_bytes() == journal_bytes
+    status = read_job_status(kit['job'])
+    assert status['operations']['by_state'].get('uncertain') == 2
+    assert len(status['operations']['unresolved']) == 2
+
+
+def test_complete_cache_reuse_makes_zero_requests(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    plant_all_synthesis_artifacts(kit['job'])
+    transport = FakeTransport(AssertionError('transport must never be called'))
+    result = execute_speech_operations(
+        kit['job'],
+        allow_paid=False,
+        limits=None,
+        transport=transport,
+        key_reader=trap_reader,
+    )
+    assert result.request_count == 0
+    assert result.reused == ('s001', 's002')
+    assert transport.requests == []
+
+
+def test_missing_permission_stops_before_key(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    transport = FakeTransport(AssertionError('transport must never be called'))
+    with pytest.raises(PaidExecutionDenied) as raised:
+        execute_speech_operations(
+            kit['job'],
+            allow_paid=False,
+            limits=TEST_LIMITS,
+            transport=transport,
+            key_reader=trap_reader,
+        )
+    assert raised.value.kind == 'permission'
+    assert transport.requests == []
+    assert not (kit['job'] / 'operations.json').exists()
+
+
+def test_missing_limits_stop_before_key(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    with pytest.raises(PaidExecutionDenied) as raised:
+        execute_speech_operations(
+            kit['job'],
+            allow_paid=True,
+            limits=None,
+            transport=success_transport(),
+            key_reader=trap_reader,
+        )
+    assert raised.value.kind == 'limits'
+
+
+def test_missing_key_stops_before_http(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    transport = FakeTransport(AssertionError('transport must never be called'))
+    with pytest.raises(PaidExecutionDenied) as raised:
+        execute_speech_operations(
+            kit['job'],
+            allow_paid=True,
+            limits=TEST_LIMITS,
+            transport=transport,
+            key_reader=lambda name: None,
+        )
+    assert raised.value.kind == 'key'
+    assert transport.requests == []
+
+
+def test_request_count_limit_stops_before_http(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    limits = SpendingLimits(
+        max_requests=1,
+        max_text_chars=100000,
+        max_cost_estimate=10.0,
+        price_per_request=0.01,
+        price_basis='synthetic test price list',
+    )
+    transport = FakeTransport(AssertionError('transport must never be called'))
+    with pytest.raises(PaidExecutionDenied) as raised:
+        execute_speech_operations(
+            kit['job'],
+            allow_paid=True,
+            limits=limits,
+            transport=transport,
+            key_reader=trap_reader,
+        )
+    assert raised.value.kind == 'limits_exceeded'
+    assert transport.requests == []
+
+
+def test_text_volume_limit_stops_before_http(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    limits = SpendingLimits(
+        max_requests=10,
+        max_text_chars=1,
+        max_cost_estimate=10.0,
+        price_per_request=0.01,
+        price_basis='synthetic test price list',
+    )
+    with pytest.raises(PaidExecutionDenied, match='text characters'):
+        execute_speech_operations(
+            kit['job'],
+            allow_paid=True,
+            limits=limits,
+            transport=success_transport(),
+            key_reader=trap_reader,
+        )
+
+
+def test_window_beyond_duration_stops_before_http(
+    tmp_path: Path,
+) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    manifest_path = kit['job'] / 'manifest.json'
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    manifest['segments'][0]['window']['end_ms'] = 999999
+    atomic_write_json(manifest_path, manifest)
+    transport = FakeTransport(AssertionError('transport must never be called'))
+    with pytest.raises(ContractError, match='beyond the recorded video'):
+        execute_speech_operations(
+            kit['job'],
+            allow_paid=True,
+            limits=TEST_LIMITS,
+            transport=transport,
+            key_reader=trap_reader,
+        )
+    assert transport.requests == []
+
+
+def test_reservation_and_start_are_durable_before_http(
+    tmp_path: Path,
+) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    observed: list[dict[str, Any]] = []
+    transport = InspectingTransport(kit['job'], observed)
+    result = execute_speech_operations(
+        kit['job'],
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=transport,
+        key_reader=recording_key_reader([]),
+    )
+    assert result.completed == ('s001', 's002')
+    assert len(transport.requests) == 2
+    assert len(observed) == 2
+    for operation in observed:
+        assert operation['state'] == 'started'
+        attempt = operation['attempts'][-1]
+        assert attempt['verdict'] is None
+        assert attempt['started_at']
+        assert operation['reserved_at']
+
+
+def test_success_records_receipt_manifest_and_journal(
+    tmp_path: Path,
+) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    calls: list[str] = []
+    result = execute_speech_operations(
+        kit['job'],
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=success_transport(),
+        key_reader=recording_key_reader(calls),
+    )
+    assert result.request_count == 2
+    journal = load_journal(kit['job'])
+    assert len(journal['operations']) == 2
+    operation = journal['operations'][0]
+    assert operation['state'] == 'completed'
+    attempt = operation['attempts'][0]
+    assert attempt['verdict'] == 'completed'
+    assert attempt['response']['status'] == 200
+    assert attempt['response']['content_type'] == 'audio/wav'
+    assert attempt['response']['wav']['sample_rate_hz'] == 48000
+    artifact_path = kit['job'] / attempt['artifact']['path']
+    assert artifact_path.is_file()
+    manifest = json.loads(
+        (kit['job'] / 'manifest.json').read_text(encoding='utf-8')
+    )
+    assert manifest['stages']['synthesis']['state'] == 'complete'
+    raw_records = [
+        a for a in manifest['artifacts'] if a['kind'] == 'raw_response'
+    ]
+    assert len(raw_records) == 2
+    journal_text = (kit['job'] / 'operations.json').read_text(encoding='utf-8')
+    assert 'test-secret-key-value' not in journal_text
+    assert calls == ['XAI_API_KEY']
+
+
+def test_http_error_is_definitive_with_evidence(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    transport = FakeTransport(
+        FakeResponse(
+            chunks=(b'{"error": "bad request"}',),
+            status_code=400,
+            headers={'content-type': 'application/json'},
+        )
+    )
+    result = execute_speech_operations(
+        kit['job'],
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=transport,
+        key_reader=lambda name: 'test-secret-key-value',
+    )
+    assert set(result.failed) == {'s001', 's002'}
+    journal = load_journal(kit['job'])
+    operation = journal['operations'][0]
+    assert operation['state'] == 'failed'
+    attempt = operation['attempts'][0]
+    assert attempt['failure']['kind'] == 'http_status'
+    evidence = attempt['evidence']
+    assert evidence is not None
+    assert (kit['job'] / evidence['path']).read_bytes() == (
+        b'{"error": "bad request"}'
+    )
+
+
+def test_uncertain_blocks_new_planning_until_retry(
+    tmp_path: Path,
+) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    first = execute_speech_operations(
+        kit['job'],
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=timeout_transport(),
+        key_reader=lambda name: 'test-secret-key-value',
+    )
+    assert set(first.uncertain) == {'s001', 's002'}
+    second = execute_speech_operations(
+        kit['job'],
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=success_transport(),
+        key_reader=lambda name: 'test-secret-key-value',
+    )
+    assert second.request_count == 0
+    assert len(second.blocked_unresolved) == 2
+    journal = load_journal(kit['job'])
+    assert len(journal['operations']) == 2
+    operation_id = journal['operations'][0]['operation_id']
+    receipt_before = json.dumps(journal['operations'][0]['attempts'][0])
+    third = retry_uncertain_operation(
+        kit['job'],
+        operation_id,
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=success_transport(),
+        key_reader=lambda name: 'test-secret-key-value',
+    )
+    assert third.completed == ('s001',)
+    journal = load_journal(kit['job'])
+    retried = journal['operations'][0]
+    assert retried['state'] == 'completed'
+    assert len(retried['attempts']) == 2
+    assert retried['attempts'][0]['verdict'] == 'uncertain'
+    assert json.dumps(retried['attempts'][0]) == receipt_before
+    assert retried['attempts'][1]['linked_retry'] is True
+    assert retried['attempts'][1]['verdict'] == 'completed'
+    status = read_job_status(kit['job'])
+    assert status['operations']['by_state'].get('uncertain') == 1
+    assert status['operations']['by_state'].get('completed') == 1
+
+
+def test_retry_refuses_changed_narration(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    execute_speech_operations(
+        kit['job'],
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=timeout_transport(),
+        key_reader=lambda name: 'test-secret-key-value',
+    )
+    journal = load_journal(kit['job'])
+    operation_id = journal['operations'][0]['operation_id']
+    segments = [
+        {
+            'id': 's001',
+            'source_cues': [1],
+            'translation': 'Первая реплика.',
+            'narration': 'Изменённый текст озвучки.',
+        },
+        *default_segments()[1:],
+    ]
+    changed = write_translation(
+        tmp_path / 'changed.json', kit['video'], kit['srt'], segments
+    )
+    run_prepare(kit, translation=changed)
+    with pytest.raises(ContractError, match='signature'):
+        retry_uncertain_operation(
+            kit['job'],
+            operation_id,
+            allow_paid=True,
+            limits=TEST_LIMITS,
+            transport=success_transport(),
+            key_reader=lambda name: 'test-secret-key-value',
+        )
+
+
+def test_retry_refuses_unknown_operation(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    with pytest.raises(ContractError, match='no operation'):
+        retry_uncertain_operation(
+            kit['job'],
+            'f' * 32,
+            allow_paid=True,
+            limits=TEST_LIMITS,
+            transport=success_transport(),
+            key_reader=trap_reader,
+        )
+
+
+def test_retry_without_permission_keeps_uncertainty(
+    tmp_path: Path,
+) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    execute_speech_operations(
+        kit['job'],
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=timeout_transport(),
+        key_reader=lambda name: 'test-secret-key-value',
+    )
+    journal = load_journal(kit['job'])
+    operation_id = journal['operations'][0]['operation_id']
+    with pytest.raises(PaidExecutionDenied, match='permission'):
+        retry_uncertain_operation(
+            kit['job'],
+            operation_id,
+            allow_paid=False,
+            limits=TEST_LIMITS,
+            transport=success_transport(),
+            key_reader=trap_reader,
+        )
+    journal_after = load_journal(kit['job'])
+    assert journal_after['operations'][0]['state'] == 'uncertain'
+    assert len(journal_after['operations'][0]['attempts']) == 1
+
+
+def test_storage_failure_is_uncertain(tmp_path: Path) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    artifacts_dir = kit['job'] / 'artifacts'
+    artifacts_dir.mkdir()
+    artifacts_dir.chmod(0o500)
+    try:
+        result = execute_speech_operations(
+            kit['job'],
+            allow_paid=True,
+            limits=TEST_LIMITS,
+            transport=success_transport(),
+            key_reader=lambda name: 'test-secret-key-value',
+        )
+    finally:
+        artifacts_dir.chmod(0o755)
+    assert set(result.uncertain) == {'s001', 's002'}
+    journal = load_journal(kit['job'])
+    assert (
+        journal['operations'][0]['attempts'][0]['failure']['kind']
+        == 'storage_error'
+    )
+
+
+def test_cancellation_journals_uncertainty_before_exit(
+    tmp_path: Path,
+) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    transport = FakeTransport(
+        FakeResponse(
+            chunks=(b'partial',),
+            fail_after=KeyboardInterrupt(),
+        )
+    )
+    with pytest.raises(KeyboardInterrupt):
+        execute_speech_operations(
+            kit['job'],
+            allow_paid=True,
+            limits=TEST_LIMITS,
+            transport=transport,
+            key_reader=lambda name: 'test-secret-key-value',
+        )
+    journal = load_journal(kit['job'])
+    operation = journal['operations'][0]
+    assert operation['state'] == 'uncertain'
+    assert operation['attempts'][0]['failure']['kind'] == 'cancelled'
+
+
+def test_damaged_raw_provenance_stops_execution(
+    tmp_path: Path,
+) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    plant_all_synthesis_artifacts(kit['job'])
+    manifest = json.loads(
+        (kit['job'] / 'manifest.json').read_text(encoding='utf-8')
+    )
+    corrupt_path = kit['job'] / manifest['artifacts'][0]['path']
+    corrupt_path.write_bytes(b'damaged bytes')
+    transport = FakeTransport(AssertionError('transport must never be called'))
+    with pytest.raises(ContractError, match='integrity'):
+        execute_speech_operations(
+            kit['job'],
+            allow_paid=True,
+            limits=TEST_LIMITS,
+            transport=transport,
+            key_reader=trap_reader,
+        )
+    assert transport.requests == []
+
+
+def test_preview_reports_planned_work_and_volume(
+    tmp_path: Path,
+) -> None:
+    kit = make_kit(tmp_path)
+    run_prepare(kit)
+    manifest = json.loads(
+        (kit['job'] / 'manifest.json').read_text(encoding='utf-8')
+    )
+    first = next(s for s in manifest['segments'] if s['id'] == 's001')
+    plant_synthetic_artifact(
+        kit['job'],
+        'raw_response',
+        's001',
+        first['synthesis_signature'],
+    )
+    preview = preview_speech_operations(kit['job'])
+    assert preview['planned'] == ['s002']
+    assert preview['planned_count'] == 1
+    assert preview['planned_text_chars'] == len('Вторая реплика.')
+    assert preview['reused'] == ['s001']
+
+
+# --- First correction round controls (R1 R3 R5 R6) ---
+
+
+def test_reflecting_error_message_never_persists_the_key(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport(
+        httpx.ReadTimeout(
+            f'connection dropped while reading for {KEY_MATERIAL}'
+        )
+    )
+    result = execute_speech_operations(
+        _prepare_simple_job(tmp_path),
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=transport,
+        key_reader=lambda name: KEY_MATERIAL,
+    )
+    assert set(result.uncertain) == {'s001', 's002'}
+    journal_text = (tmp_path / 'job' / 'operations.json').read_text(
+        encoding='utf-8'
+    )
+    assert KEY_MATERIAL not in journal_text
+    assert '[redacted]' in journal_text
+
+
+def test_oversized_narration_preflight_refuses_before_key_and_journal(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / 'src'
+    source.mkdir()
+    require_real_media()
+    video = make_media(source / 'lecture.mp4')
+    srt = write_srt(source / 'lecture.srt', DEFAULT_CUES)
+    segments = [
+        {
+            'id': 's001',
+            'source_cues': [1],
+            'translation': 'Первая реплика.',
+            'narration': 'я' * 60001,
+        },
+        {
+            'id': 's002',
+            'source_cues': [2],
+            'translation': 'Вторая реплика.',
+        },
+    ]
+    translation = write_translation(
+        source / 'translation.json', video, srt, segments
+    )
+    job = tmp_path / 'job'
+    prepare_job(
+        video_path=video,
+        srt_path=srt,
+        translation_path=translation,
+        job_dir=job,
+        output_path=tmp_path / 'out.mp4',
+        source_audio=None,
+        settings=Settings(),
+    )
+    transport = FakeTransport(AssertionError('transport must never be called'))
+    with pytest.raises(SpeechRequestError):
+        execute_speech_operations(
+            job,
+            allow_paid=True,
+            limits=TEST_LIMITS,
+            transport=transport,
+            key_reader=trap_reader,
+        )
+    assert transport.requests == []
+    assert not (job / 'operations.json').exists()
+    with pytest.raises(SpeechRequestError):
+        execute_speech_operations(
+            job,
+            allow_paid=True,
+            limits=TEST_LIMITS,
+            transport=transport,
+            key_reader=trap_reader,
+        )
+    assert not (job / 'operations.json').exists()
+
+
+def test_unicode_and_separator_ids_keep_the_job_readable(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / 'src'
+    source.mkdir()
+    require_real_media()
+    video = make_media(source / 'lecture.mp4')
+    srt = write_srt(source / 'lecture.srt', DEFAULT_CUES)
+    segments = [
+        {
+            'id': 'часть1',  # noqa: RUF001
+            'source_cues': [1],
+            'translation': 'Первая реплика.',
+        },
+        {
+            'id': 'part 2/slash',
+            'source_cues': [2],
+            'translation': 'Вторая реплика.',
+        },
+    ]
+    translation = write_translation(
+        source / 'translation.json', video, srt, segments
+    )
+    job = tmp_path / 'job'
+    prepare_job(
+        video_path=video,
+        srt_path=srt,
+        translation_path=translation,
+        job_dir=job,
+        output_path=tmp_path / 'out.mp4',
+        source_audio=None,
+        settings=Settings(),
+    )
+    result = execute_speech_operations(
+        job,
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=success_transport(),
+        key_reader=lambda name: KEY_MATERIAL,
+    )
+    assert result.completed == ('часть1', 'part 2/slash')  # noqa: RUF001
+    status = read_job_status(job)
+    assert status['stages']['synthesis']['state'] == 'complete'
+    assert status['operations']['by_state'].get('completed') == 2
+    assert run_prepare(
+        {
+            'video': video,
+            'srt': srt,
+            'translation': translation,
+            'job': job,
+            'output': tmp_path / 'out.mp4',
+        }
+    ).unchanged
+
+
+def test_retry_refuses_damaged_posted_text_provenance(
+    tmp_path: Path,
+) -> None:
+    job = _prepare_simple_job(tmp_path)
+    first = execute_speech_operations(
+        job,
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=timeout_transport(),
+        key_reader=lambda name: KEY_MATERIAL,
+    )
+    assert len(first.uncertain) == 2
+    journal = load_journal(job)
+    operation_id = journal['operations'][0]['operation_id']
+    journal['operations'][0]['posted_text_sha256'] = '0' * 64
+    atomic_write_json(job / 'operations.json', journal)
+    damaged_bytes = (job / 'operations.json').read_bytes()
+    transport = FakeTransport(AssertionError('transport must never be called'))
+    with pytest.raises(ContractError, match='provenance is damaged'):
+        retry_uncertain_operation(
+            job,
+            operation_id,
+            allow_paid=True,
+            limits=TEST_LIMITS,
+            transport=transport,
+            key_reader=trap_reader,
+        )
+    assert transport.requests == []
+    assert (job / 'operations.json').read_bytes() == damaged_bytes
+
+
+def _prepare_simple_job(tmp_path: Path) -> Path:
+    """Prepare a two segment job from the default synthetic kit."""
+    source = tmp_path / 'src'
+    source.mkdir()
+    require_real_media()
+    video = make_media(source / 'lecture.mp4')
+    srt = write_srt(source / 'lecture.srt', DEFAULT_CUES)
+    translation = write_translation(
+        source / 'translation.json', video, srt, default_segments()
+    )
+    job = tmp_path / 'job'
+    prepare_job(
+        video_path=video,
+        srt_path=srt,
+        translation_path=translation,
+        job_dir=job,
+        output_path=tmp_path / 'out.mp4',
+        source_audio=None,
+        settings=Settings(),
+    )
+    return job
+
+
+# --- Second review residual controls (R1 R6) ---
+
+
+def test_reflected_content_type_never_persists_the_key(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport(
+        FakeResponse(
+            chunks=(b'service error',),
+            status_code=500,
+            headers={'content-type': f'text/plain; note={KEY_MATERIAL}'},
+        )
+    )
+    job = _prepare_simple_job(tmp_path)
+    result = execute_speech_operations(
+        job,
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=transport,
+        key_reader=lambda name: KEY_MATERIAL,
+    )
+    assert set(result.failed) == {'s001', 's002'}
+    journal_text = (job / 'operations.json').read_text(encoding='utf-8')
+    assert KEY_MATERIAL not in journal_text
+    assert '[redacted]' in journal_text
+
+
+def test_retry_after_sibling_narration_change_completes(
+    tmp_path: Path,
+) -> None:
+    job = _prepare_simple_job(tmp_path)
+    first = execute_speech_operations(
+        job,
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=timeout_transport(),
+        key_reader=lambda name: KEY_MATERIAL,
+    )
+    assert len(first.uncertain) == 2
+    journal = load_journal(job)
+    operation_id = journal['operations'][0]['operation_id']
+    segments = [
+        {
+            'id': 's001',
+            'source_cues': [1],
+            'translation': 'Первая реплика.',
+            'narration': 'Первая реплика для речи.',
+        },
+        {
+            'id': 's002',
+            'source_cues': [2],
+            'translation': 'Вторая реплика.',
+            'narration': 'Совершенно новая вторая озвучка.',
+        },
+    ]
+    changed = write_translation(
+        tmp_path / 'changed.json',
+        tmp_path / 'src' / 'lecture.mp4',
+        tmp_path / 'src' / 'lecture.srt',
+        segments,
+    )
+    prepare_job(
+        video_path=tmp_path / 'src' / 'lecture.mp4',
+        srt_path=tmp_path / 'src' / 'lecture.srt',
+        translation_path=changed,
+        job_dir=job,
+        output_path=tmp_path / 'out.mp4',
+        source_audio=None,
+        settings=Settings(),
+    )
+    transport = success_transport()
+    result = retry_uncertain_operation(
+        job,
+        operation_id,
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=transport,
+        key_reader=lambda name: KEY_MATERIAL,
+    )
+    assert result.completed == ('s001',)
+    assert len(transport.requests) == 1
+    journal = load_journal(job)
+    retried = next(
+        op
+        for op in journal['operations']
+        if op['operation_id'] == operation_id
+    )
+    assert retried['state'] == 'completed'
+    assert retried['attempts'][0]['verdict'] == 'uncertain'
+    assert retried['attempts'][1]['verdict'] == 'completed'
+
+
+def test_retry_blocks_when_recorded_snapshot_is_damaged(
+    tmp_path: Path,
+) -> None:
+    job = _prepare_simple_job(tmp_path)
+    first = execute_speech_operations(
+        job,
+        allow_paid=True,
+        limits=TEST_LIMITS,
+        transport=timeout_transport(),
+        key_reader=lambda name: KEY_MATERIAL,
+    )
+    assert len(first.uncertain) == 2
+    journal = load_journal(job)
+    operation = journal['operations'][0]
+    operation_id = operation['operation_id']
+    segments = [
+        {
+            'id': 's001',
+            'source_cues': [1],
+            'translation': 'Первая реплика.',
+            'narration': 'Первая реплика для речи.',
+        },
+        {
+            'id': 's002',
+            'source_cues': [2],
+            'translation': 'Вторая реплика.',
+            'narration': 'Совершенно новая вторая озвучка.',
+        },
+    ]
+    changed = write_translation(
+        tmp_path / 'changed.json',
+        tmp_path / 'src' / 'lecture.mp4',
+        tmp_path / 'src' / 'lecture.srt',
+        segments,
+    )
+    prepare_job(
+        video_path=tmp_path / 'src' / 'lecture.mp4',
+        srt_path=tmp_path / 'src' / 'lecture.srt',
+        translation_path=changed,
+        job_dir=job,
+        output_path=tmp_path / 'out.mp4',
+        source_audio=None,
+        settings=Settings(),
+    )
+    snapshot_path = job / operation['posted_text_snapshot']['path']
+    snapshot_path.write_bytes(b'damaged snapshot bytes')
+    transport = FakeTransport(AssertionError('transport must never be called'))
+    with pytest.raises(ContractError, match='provenance is damaged'):
+        retry_uncertain_operation(
+            job,
+            operation_id,
+            allow_paid=True,
+            limits=TEST_LIMITS,
+            transport=transport,
+            key_reader=trap_reader,
+        )
+    assert transport.requests == []
+
+
+# --- Same head R7 monetary ceiling controls ---
+
+
+def test_zero_cost_ceiling_refuses_subepsilon_estimates(
+    tmp_path: Path,
+) -> None:
+    job = _prepare_simple_job(tmp_path)
+    limits = SpendingLimits(
+        max_requests=10,
+        max_text_chars=100000,
+        max_cost_estimate=0.0,
+        price_per_request=1e-12,
+        price_basis='monetary probe basis',
+    )
+    transport = FakeTransport(AssertionError('transport must never be called'))
+    with pytest.raises(PaidExecutionDenied, match='estimated cost'):
+        execute_speech_operations(
+            job,
+            allow_paid=True,
+            limits=limits,
+            transport=transport,
+            key_reader=trap_reader,
+        )
+    assert transport.requests == []
+    assert not (job / 'operations.json').exists()
+
+
+def test_exact_cost_ceiling_permits_planned_requests(
+    tmp_path: Path,
+) -> None:
+    job = _prepare_simple_job(tmp_path)
+    limits = SpendingLimits(
+        max_requests=10,
+        max_text_chars=100000,
+        max_cost_estimate=0.02,
+        price_per_request=0.01,
+        price_basis='monetary probe basis',
+    )
+    result = execute_speech_operations(
+        job,
+        allow_paid=True,
+        limits=limits,
+        transport=success_transport(),
+        key_reader=lambda name: KEY_MATERIAL,
+    )
+    assert result.completed == ('s001', 's002')
+
+
+@pytest.mark.parametrize('price', [0.50000000000025, 0.5000000001])
+def test_nonzero_cost_ceiling_refuses_any_excess(
+    tmp_path: Path, price: float
+) -> None:
+    job = _prepare_simple_job(tmp_path)
+    limits = SpendingLimits(
+        max_requests=10,
+        max_text_chars=100000,
+        max_cost_estimate=1.0,
+        price_per_request=price,
+        price_basis='invented boundary control',
+    )
+    transport = FakeTransport(AssertionError('transport must never be called'))
+    with pytest.raises(PaidExecutionDenied, match='estimated cost'):
+        execute_speech_operations(
+            job,
+            allow_paid=True,
+            limits=limits,
+            transport=transport,
+            key_reader=trap_reader,
+        )
+    assert transport.requests == []
+    assert not (job / 'operations.json').exists()
+
+
+def test_decimal_cost_ceiling_accepts_exact_three_request_total() -> None:
+    limits = SpendingLimits(
+        max_requests=3,
+        max_text_chars=100,
+        max_cost_estimate=0.3,
+        price_per_request=0.1,
+        price_basis='invented decimal boundary control',
+    )
+    assert _require_execution_permission(True, limits, 3, 30) == 0.3

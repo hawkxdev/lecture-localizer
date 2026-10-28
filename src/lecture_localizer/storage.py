@@ -110,6 +110,28 @@ def create_new_file(path: str | Path, data: bytes) -> None:
     _fsync_directory(target.parent)
 
 
+def move_new_file(source: str | Path, target: str | Path) -> None:
+    """Move one fully written file to a fresh immutable destination.
+
+    Publication is a hard link creation, which never clobbers any
+    existing destination name, including dangling symlinks and names
+    created between the check and the link, and the source file is
+    retained untouched when the destination already exists. The
+    destination directory entry is flushed so the artifact survives a
+    crash.
+    """
+    source_path = Path(source)
+    target_path = Path(target)
+    try:
+        os.link(source_path, target_path)
+    except FileExistsError as error:
+        raise DestinationExistsError(
+            f'refusing to overwrite an existing destination: {target_path}'
+        ) from error
+    os.unlink(source_path)
+    _fsync_directory(target_path.parent)
+
+
 @dataclass(frozen=True)
 class IntegrityRecord:
     """One expected file with its recorded digest."""

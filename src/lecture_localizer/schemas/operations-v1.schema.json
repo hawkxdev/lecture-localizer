@@ -1,0 +1,308 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/hawkxdev/lecture-localizer/main/src/lecture_localizer/schemas/operations-v1.schema.json",
+  "title": "Speech operation journal",
+  "description": "Separate versioned journal of guarded speech operations for one job. Unknown versions are rejected rather than migrated, and existing manifests never embed this journal.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "updated_at", "operations"],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "updated_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "operations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/operation"
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "operationId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "relativePath": {
+      "type": "string",
+      "pattern": "^(?!.*\\.\\.)[A-Za-z0-9_][A-Za-z0-9_/.-]*$",
+      "not": {
+        "pattern": "/$"
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_requests",
+        "max_text_chars",
+        "max_cost_estimate",
+        "price_per_request",
+        "price_basis"
+      ],
+      "properties": {
+        "max_requests": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_text_chars": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_cost_estimate": {
+          "type": "number",
+          "minimum": 0
+        },
+        "price_per_request": {
+          "type": "number",
+          "minimum": 0
+        },
+        "price_basis": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "segment_id",
+        "synthesis_signature",
+        "request_signature",
+        "posted_text_sha256",
+        "posted_text_chars",
+        "posted_text_snapshot",
+        "reserved_at",
+        "state",
+        "limits",
+        "estimated_cost",
+        "attempts"
+      ],
+      "properties": {
+        "operation_id": {
+          "$ref": "#/$defs/operationId"
+        },
+        "segment_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "synthesis_signature": {
+          "$ref": "#/$defs/sha256"
+        },
+        "request_signature": {
+          "$ref": "#/$defs/sha256"
+        },
+        "posted_text_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "posted_text_chars": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "posted_text_snapshot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "sha256"],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/relativePath"
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        },
+        "reserved_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "state": {
+          "enum": [
+            "reserved",
+            "started",
+            "completed",
+            "failed",
+            "uncertain"
+          ]
+        },
+        "limits": {
+          "$ref": "#/$defs/limits"
+        },
+        "estimated_cost": {
+          "type": "number",
+          "minimum": 0
+        },
+        "attempts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/attempt"
+          }
+        }
+      }
+    },
+    "attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempt",
+        "linked_retry",
+        "limits",
+        "started_at",
+        "finished_at",
+        "verdict",
+        "request_signature",
+        "failure",
+        "evidence",
+        "response",
+        "artifact"
+      ],
+      "properties": {
+        "attempt": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "linked_retry": {
+          "type": "boolean"
+        },
+        "limits": {
+          "$ref": "#/$defs/limits"
+        },
+        "started_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "finished_at": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+        },
+        "verdict": {
+          "enum": ["completed", "failed", "uncertain", null]
+        },
+        "request_signature": {
+          "$ref": "#/$defs/sha256"
+        },
+        "failure": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["kind", "detail"],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "minLength": 1
+            },
+            "detail": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "evidence": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["path", "sha256", "bytes"],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/relativePath"
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "response": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "content_type",
+            "bytes",
+            "sha256",
+            "wav",
+            "elapsed_seconds"
+          ],
+          "properties": {
+            "status": {
+              "type": "integer",
+              "minimum": 100
+            },
+            "content_type": {
+              "type": "string",
+              "minLength": 1
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "wav": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "required": [
+                "audio_format",
+                "channels",
+                "sample_rate_hz",
+                "bits_per_sample",
+                "data_bytes"
+              ],
+              "properties": {
+                "audio_format": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "channels": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "sample_rate_hz": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "bits_per_sample": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "data_bytes": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "elapsed_seconds": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        },
+        "artifact": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["path", "sha256"],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/relativePath"
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        }
+      }
+    }
+  }
+}
