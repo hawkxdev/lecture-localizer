@@ -2,7 +2,7 @@
 
 A proposed CLI for localizing lecture videos while preserving the original media.
 
-**Status:** Development. An installable package with local tool diagnostics, validated persistent jobs, guarded speech synthesis, fitted narration, verified MP4 assembly and the complete guarded run/offline assemble commands is available. Real speech quality, listening acceptance and reference player behavior remain unverified; the full feature is not accepted yet.
+**Status:** Development. An installable package with local tool diagnostics, validated persistent jobs, guarded speech synthesis, fitted narration, verified MP4 assembly and the complete guarded run/offline assemble commands is available. Full feature acceptance remains open; automated checks do not replace listening and player checks on the actual output.
 
 ## Implemented: `lecture-localizer doctor`
 
@@ -34,6 +34,30 @@ Synthetic, rights-safe media fixtures for local experiments and checks are gener
 ```
 
 The script refuses to write into an existing directory and creates a deterministic synthetic MP4 (tone and test pattern) plus a two-cue SRT file. It launches FFmpeg with the same credential-scrubbed environment as the rest of the media tooling and therefore needs the package installed in the environment that runs it.
+
+## Spoken English example
+
+From a source checkout or unpacked source distribution, install the package as above and run:
+
+```sh
+WORKDIR="$HOME/Movies/lecture-localizer/spoken-example"
+.venv/bin/python scripts/make-spoken-example.py "$WORKDIR/inputs"
+.venv/bin/lecture-localizer prepare \
+  --video "$WORKDIR/inputs/spoken-source.mp4" \
+  --source-srt "$WORKDIR/inputs/source.srt" \
+  --translation "$WORKDIR/inputs/translation.json" \
+  --job "$WORKDIR/job" \
+  --output "$WORKDIR/localized.mp4"
+.venv/bin/lecture-localizer status --job "$WORKDIR/job" --json
+```
+
+Use a fresh directory outside the checkout. The generator downloads three small public LibriSpeech FLAC recordings without an account or token, verifies their IDs, English texts, exact byte counts and SHA256 digests, and creates a 60 second English H.264/AAC test video, matching SRT, reviewed Russian translation, provenance and attribution. It makes no speech-provider calls, reads no provider key and never opens a player. Python, the installed package, FFmpeg with libx264/AAC support and ffprobe are required. MP4Box is also required for the later localization pipeline. The generated example is a constructed demonstration, separate from the tone fixture and from full lecture acceptance.
+
+[Source identities and texts](scripts/spoken-example-v1.json) and [source attribution and terms](scripts/SPOKEN_EXAMPLE_NOTICE.md) travel with the recipe. OpenSLR publishes the corpus under CC BY 4.0; the application's MIT license does not relicense those recordings. Source FLACs, generated media and job data stay outside Git. `example.json` records the actual source digests and tool versions. The public rows endpoint returns current asset URLs; the recorded reference revision is not a claim that the endpoint serves that revision. Any changed source content is rejected. If retrieval fails, the script stops without retries or a replacement recording and leaves an incomplete marker with any already verified files.
+
+Previously downloaded exact FLACs can be reused without network access by passing `--audio-dir /path/to/verified-flacs` to the generator and choosing another fresh destination. Byte checks still apply. Video bytes may differ across FFmpeg versions; the translation always binds to the actual newly generated video and SRT hashes.
+
+Preparation needs no speech key or paid permission. `limits.example.json` describes three requests and 318 translated characters using a dated price snapshot; review current pricing and set your own limits before explicitly allowing a paid `run`. The example file does not authorize spending. Provider output is neither bundled nor needed to prepare and inspect the job. Listening and QuickTime/IINA checks follow on the output of a separately authorized run.
 
 ## Implemented: `lecture-localizer prepare` and `status`
 
@@ -80,6 +104,22 @@ Each run writes a durable report under `evidence/` in the job directory with the
 The MP4 candidate is built in a staging file on the destination filesystem, verified against the declared prepared sources, registered immutably inside the job, and published through a no-clobber hard link. A durable publication receipt records the actual linked file identity (device, inode, size) together with its SHA 256: an existing output is recognized as this job's result only through that full chain, and any other preexisting file, including a byte identical copy created by another process or a file edited in place, is preserved untouched and reported as a collision. An interrupted publication resumes from the registered verified candidate. `assemble` completes the remaining local work from retained artifacts entirely offline: it may normalize, fit and encode from retained raw responses and rebuild the container, but it never reaches the speech provider, never reads credentials and refuses jobs whose required retained artifacts are missing or corrupt.
 
 The job `status` report now also shows assembly readiness of the prepared units, the publication state (`published`, `pending`, `collision` or blocked) together with the integrity state of the registered candidate, and the latest run report name. Source videos whose bytes fail a full decode stop `run` before any paid request even when their recorded hashes still match. Exit codes follow the implementation plan: 0 success (a readable blocked status also exits 0 while reporting its problems), 2 usage error, 3 invalid input, settings or job contract including destination collisions, 4 paid execution denied before any request, 5 provider or transport failure including unresolved uncertain operations, 6 speech fitting refusal or failed candidate verification, 7 tool, media process or filesystem failure, 130 interruption. Settings are loaded from `LECTURE_LOCALIZER_SETTINGS` for tool paths and subprocess timeouts; the job policy recorded at prepare time governs run.
+
+## Implemented: offline response recovery
+
+`recover` explicitly revalidates one retained failed speech response. It makes no provider request, reads no key and preserves the original `operations.json` and failure verdict. Select the exact operation and attempt reported by `status` and its journal:
+
+```sh
+.venv/bin/lecture-localizer recover --job /path/to/job-directory \
+  --operation OPERATION_ID --attempt 1
+.venv/bin/lecture-localizer assemble --job /path/to/job-directory
+```
+
+Recovery requires the latest failed `invalid_audio` attempt of the current segment and request, a complete recorded HTTP 200 `audio/wav` response, matching text provenance and intact retained bytes. A later operation or attempt, uncertain transport outcome, changed request, missing/corrupt evidence or an escaping/symlink path is refused. No automatic paid retry is implied.
+
+The ordinary WAV parser remains strict. After a complete HTTP response, the speech adapter also recognizes one narrowly defined 44-byte PCM envelope: mono, 48 kHz, signed 16-bit samples, RIFF size `0x80000023` and data size `0x7FFFFFFF`, with nonempty whole sample frames below that declared size. It preserves that response verbatim and derives a separate canonical WAV with actual lengths before normalization. Other malformed or truncated WAV bodies remain failures. Recognizing this envelope does not prove that every word was spoken; listening remains a separate check.
+
+Local recovery stores a strict version 1 receipt under `evidence/recoveries/`, binds the exact historical attempt, source, request and artifact hashes, and retains its separately derived WAV under `evidence/canonical-wav/`. The receipt is published before the manifest checkpoint, so repeating the same recovery safely finishes an interrupted checkpoint without another request or changing the original HTTP history. `status` and run reports show local validation separately from failed provider-attempt history; missing or inconsistent recovery provenance blocks reuse. Unknown receipt versions are rejected rather than migrated.
 
 ## Proposed workflow
 

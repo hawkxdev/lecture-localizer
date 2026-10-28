@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "source": {
+    "dataset": "hf-internal-testing/librispeech_asr_dummy",
+    "reference_revision": "5be91486e11a2d616f4ec5db8d3fd248585ac07a",
+    "config": "clean",
+    "split": "validation",
+    "rows_url": "https://datasets-server.huggingface.co/rows",
+    "corpus_url": "https://www.openslr.org/12/",
+    "license": "CC-BY-4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "sample_rate_hz": 16000,
+    "channels": 1
+  },
+  "video": {
+    "duration_seconds": 60,
+    "width": 320,
+    "height": 180,
+    "frame_rate": 25
+  },
+  "pricing": {
+    "usd_per_million_chars": "15",
+    "observed_on": "2026-10-28",
+    "url": "https://docs.x.ai/developers/pricing"
+  },
+  "segments": [
+    {
+      "id": "s001",
+      "source_id": "1272-128104-0000",
+      "row_index": 0,
+      "bytes": 120041,
+      "sha256": "4e25e22555cd16e90edb0a3b49fdcf1fe652b2a1250ab643634db33895c75b41",
+      "source_text": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+      "translation": "Мистер Куилтер - апостол средних классов, и мы рады приветствовать его благую весть.",
+      "start_ms": 1000,
+      "end_ms": 13000
+    },
+    {
+      "id": "s002",
+      "source_id": "1272-128104-0001",
+      "row_index": 1,
+      "bytes": 101672,
+      "sha256": "46a9d58622b4675b29564da2d9ba73e702241c5fa969f12c387cad4aa984276a",
+      "source_text": "NOR IS MISTER QUILTER'S MANNER LESS INTERESTING THAN HIS MATTER",
+      "translation": "Манера мистера Куилтера не менее интересна, чем содержание его рассуждений.",
+      "start_ms": 15000,
+      "end_ms": 27000
+    },
+    {
+      "id": "s003",
+      "source_id": "1272-128104-0002",
+      "row_index": 2,
+      "bytes": 255853,
+      "sha256": "59bf7bb1129c11734a8dd362ad52b4e10ae31c03f0879fc92f7107ecd513513f",
+      "source_text": "HE TELLS US THAT AT THIS FESTIVE SEASON OF THE YEAR WITH CHRISTMAS AND ROAST BEEF LOOMING BEFORE US SIMILES DRAWN FROM EATING AND ITS RESULTS OCCUR MOST READILY TO THE MIND",
+      "translation": "Он говорит нам, что в это праздничное время года, когда впереди Рождество и ростбиф, на ум легче всего приходят сравнения, связанные с едой и её последствиями.",
+      "start_ms": 29000,
+      "end_ms": 58000
+    }
+  ],
+  "notice_file": "SPOKEN_EXAMPLE_NOTICE.md"
+}

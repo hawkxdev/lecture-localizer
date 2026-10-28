@@ -26,7 +26,7 @@ stage "ruff check"
 "$VENV/bin/ruff" check "$ROOT/src" "$ROOT/tests" "$ROOT/scripts"
 
 stage "mypy"
-"$VENV/bin/mypy" "$ROOT/src" "$ROOT/tests" "$ROOT/scripts/make-synthetic-example.py"
+"$VENV/bin/mypy" "$ROOT/src" "$ROOT/tests" "$ROOT/scripts/make-synthetic-example.py" "$ROOT/scripts/make-spoken-example.py"
 
 stage "pytest"
 "$VENV/bin/pytest" "$ROOT/tests"
@@ -65,11 +65,17 @@ SCHEMA_RESOURCES = (
     "schemas/translation-v1.schema.json",
     "schemas/job-v1.schema.json",
     "schemas/operations-v1.schema.json",
+    "schemas/recovery-v1.schema.json",
+)
+SCRIPT_RESOURCES = (
+    "scripts/spoken-example-v1.json",
+    "scripts/SPOKEN_EXAMPLE_NOTICE.md",
 )
 EXPECTED_SDIST = (
     "src/lecture_localizer/cli.py",
     "src/lecture_localizer/contracts.py",
     "src/lecture_localizer/jobs.py",
+    "src/lecture_localizer/recoveries.py",
     "src/lecture_localizer/media.py",
     "src/lecture_localizer/settings.py",
     "src/lecture_localizer/storage.py",
@@ -90,9 +96,13 @@ EXPECTED_SDIST = (
     "tests/test_mux.py",
     "tests/test_verification.py",
     "tests/test_pipeline.py",
+    "tests/test_recoveries.py",
+    "tests/test_spoken_example.py",
     "tests/conftest.py",
     "scripts/make-synthetic-example.py",
+    "scripts/make-spoken-example.py",
     "scripts/qc-python-cli.sh",
+    *SCRIPT_RESOURCES,
 )
 
 
@@ -110,6 +120,13 @@ def validate_sdist(raw_members: list[str]) -> str | None:
     missing = [name for name in EXPECTED_SDIST if name not in members]
     if missing:
         return f"missing expected product files: {missing}"
+    script_data = [
+        name for name in members
+        if name.startswith("scripts/") and not name.endswith(("/", ".py", ".sh"))
+        and name not in SCRIPT_RESOURCES
+    ]
+    if script_data:
+        return f"unapproved data inside scripts: {script_data[:5]}"
     runtime = runtime_data_members(
         [name for name in members if name.startswith("src/lecture_localizer/")],
         "src/lecture_localizer/",
@@ -156,6 +173,10 @@ control_schema_data = validate_sdist(
     [prefix + "src/lecture_localizer/schemas/manifest.json"]
     + [prefix + name for name in EXPECTED_SDIST]
 )
+control_script_data = validate_sdist(
+    [prefix + "scripts/raw-response.wav"]
+    + [prefix + name for name in EXPECTED_SDIST]
+)
 control_ok = validate_sdist(
     [prefix + name for name in SDIST_ALLOWLIST if name != "PKG-INFO"]
     + [prefix + name for name in EXPECTED_SDIST]
@@ -168,6 +189,8 @@ if control_runtime is None or "runtime or user data" not in control_runtime:
     raise SystemExit("privacy gate failed its runtime data control")
 if control_schema_data is None or "runtime or user data" not in control_schema_data:
     raise SystemExit("privacy gate failed its schema data control")
+if control_script_data is None or "unapproved data inside scripts" not in control_script_data:
+    raise SystemExit("privacy gate failed its script data control")
 if control_ok is not None:
     raise SystemExit(f"privacy gate failed its allowlist control: {control_ok}")
 
@@ -273,6 +296,7 @@ for name in (
     "translation-v1.schema.json",
     "job-v1.schema.json",
     "operations-v1.schema.json",
+    "recovery-v1.schema.json",
 ):
     schema = load(name)
     Draft202012Validator.check_schema(schema)

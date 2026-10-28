@@ -146,6 +146,168 @@ def make_client(transport: FakeTransport) -> SpeechClient:
     return SpeechClient(SECRET_KEY, transport=transport)
 
 
+def streaming_wav_bytes(samples: int = 8) -> bytes:
+    """Build the observed completed streaming envelope."""
+    body = bytearray(build_wav_bytes(samples=samples))
+    struct.pack_into('<I', body, 4, 0x80000023)
+    struct.pack_into('<I', body, 40, 0x7FFFFFFF)
+    return bytes(body)
+
+
+def test_completed_streaming_response_preserves_original_bytes(
+    tmp_path: Path,
+) -> None:
+    raw = streaming_wav_bytes()
+    transport = FakeTransport(FakeResponse(chunks=(raw[:23], raw[23:])))
+    sink = tmp_path / 'response.wav'
+    receipt = make_client(transport).synthesize(text='Полный текст', sink=sink)
+    assert receipt.wav.data_bytes == 16
+    assert receipt.sha256 == hashlib.sha256(raw).hexdigest()
+    assert sink.read_bytes() == raw
+    assert len(transport.requests) == 1
+
+
+def test_incomplete_streaming_response_remains_uncertain(
+    tmp_path: Path,
+) -> None:
+    raw = streaming_wav_bytes()
+    transport = FakeTransport(
+        FakeResponse(
+            chunks=(raw,),
+            fail_after=httpx.ReadError('stream interrupted'),
+        )
+    )
+    with pytest.raises(TransportUncertainFailure):
+        make_client(transport).synthesize(
+            text='Полный текст', sink=tmp_path / 'response.wav'
+        )
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        'empty',
+        'partial_frame',
+        'other_riff',
+        'other_data',
+        'stereo',
+        'rate',
+        'sample_width',
+        'fmt_size',
+        'float_format',
+        'finite_truncated',
+    ],
+)
+def test_completed_response_rejects_other_or_incomplete_envelopes(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    body = bytearray(streaming_wav_bytes())
+    if case == 'empty':
+        body = body[:44]
+    elif case == 'partial_frame':
+        body = body[:-1]
+    elif case == 'other_riff':
+        struct.pack_into('<I', body, 4, 0xFFFFFFFF)
+    elif case == 'other_data':
+        struct.pack_into('<I', body, 40, 0xFFFFFFFF)
+    elif case == 'stereo':
+        struct.pack_into('<H', body, 22, 2)
+        struct.pack_into('<I', body, 28, 192000)
+        struct.pack_into('<H', body, 32, 4)
+    elif case == 'rate':
+        struct.pack_into('<I', body, 24, 44100)
+        struct.pack_into('<I', body, 28, 88200)
+    elif case == 'sample_width':
+        struct.pack_into('<H', body, 34, 8)
+        struct.pack_into('<H', body, 32, 1)
+        struct.pack_into('<I', body, 28, 48000)
+    elif case == 'fmt_size':
+        struct.pack_into('<I', body, 16, 18)
+    elif case == 'float_format':
+        struct.pack_into('<H', body, 20, 3)
+    elif case == 'finite_truncated':
+        body = bytearray(build_wav_bytes()[:-2])
+    path = tmp_path / 'bad.wav'
+    path.write_bytes(body)
+    with pytest.raises(InvalidAudioResponse):
+        xai_client.parse_completed_wav(path)
+
+
+def test_general_strict_parser_still_rejects_the_streaming_header(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / 'streaming.wav'
+    source.write_bytes(streaming_wav_bytes())
+    with pytest.raises(InvalidAudioResponse, match='declared data size'):
+        xai_client.parse_wav_header(source)
+
+
+@pytest.mark.parametrize('streamed', [False, True])
+def test_canonical_wav_preserves_exact_pcm_and_source_bytes(
+    tmp_path: Path,
+    streamed: bool,
+) -> None:
+    pcm = struct.pack('<8h', 100, -200, 300, -400, 500, -600, 700, -800)
+    raw = (streaming_wav_bytes() if streamed else build_wav_bytes())[:44] + pcm
+    source = tmp_path / 'raw.wav'
+    target = tmp_path / 'canonical.wav'
+    source.write_bytes(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    facts = xai_client.canonicalize_completed_wav(
+        source, target, source_sha256=digest
+    )
+    assert facts.data_bytes == 16
+    assert xai_client.parse_wav_header(target) == facts
+    assert (
+        xai_client.validate_canonical_wav(source, target, source_sha256=digest)
+        == facts
+    )
+    assert target.read_bytes()[44:] == pcm
+    assert source.read_bytes() == raw
+    before = target.stat().st_mtime_ns
+    xai_client.canonicalize_completed_wav(source, target, source_sha256=digest)
+    assert target.stat().st_mtime_ns == before
+
+
+def test_canonical_wav_rejects_source_change_and_preserves_foreign_target(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / 'source.wav'
+    target = tmp_path / 'canonical.wav'
+    source.write_bytes(streaming_wav_bytes())
+    with pytest.raises(InvalidAudioResponse, match='source hash changed'):
+        xai_client.canonicalize_completed_wav(
+            source, target, source_sha256='0' * 64
+        )
+    assert not target.exists()
+    target.write_bytes(b'foreign bytes')
+    with pytest.raises(InvalidAudioResponse, match='different bytes'):
+        xai_client.canonicalize_completed_wav(
+            source,
+            target,
+            source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        )
+    assert target.read_bytes() == b'foreign bytes'
+
+
+def test_canonical_wav_rejects_source_alias_and_symlink_target(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / 'source.wav'
+    source.write_bytes(streaming_wav_bytes())
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    for target in [source, tmp_path / 'alias.wav']:
+        if target != source:
+            target.symlink_to(source)
+        with pytest.raises(InvalidAudioResponse, match='distinct file'):
+            xai_client.canonicalize_completed_wav(
+                source, target, source_sha256=digest
+            )
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == digest
+
+
 def test_payload_matches_approved_mode() -> None:
     assert build_payload('текст') == {
         'text': 'текст',

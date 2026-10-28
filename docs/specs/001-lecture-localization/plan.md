@@ -30,13 +30,15 @@ Rationale: Preserves originals and completed unchanged work while exposing inter
 
 Rejected alternatives: Whole-job signatures that resynthesize unchanged narration; cache hits based on file existence; source retirement; deleting uncertain locks or other processes.
 
+Explicit local response recovery retains the failed attempt unchanged and publishes a separate strict version 1 validation receipt before adding the raw response to the manifest. The receipt binds the exact attempt, current text/request signatures, original evidence hash and independently derived canonical WAV. Interrupted registration can resume idempotently. Read-only status and run reports show local validation separately from the original HTTP verdict; damaged or missing recovery provenance blocks reuse. The operation uses the existing one-writer lock and supplies neither transport nor a key reader.
+
 ### 3. Isolate and guard direct speech requests
 
 Requirements: [spec: speech-backend-and-delivery-boundary](spec.md#speech-backend-and-delivery-boundary), [spec: technical-basis](spec.md#technical-basis).
 
 Only the selected xAI endpoint and approved WAV/48k/eve/ru/speed=1.0 mode. Persist request-start before POST, preserve the complete response before normalization, and stop uncertain outcomes for an explicit retry decision. Read XAI_API_KEY only after validated inputs and explicit limits, redact credentials and remove them from media subprocess environments. HTTP inactivity controls do not imply a hard overall duration; cancellation leaves the journaled operation visible and no automatic repeat.
 
-Rationale: Local spending guards and replay-safe state are required; no account entitlement or live response shape has been verified.
+Rationale: Local spending guards and replay-safe state are required. Offline transport correctness, observed provider responses and human speech acceptance need separate evidence; one successful request does not establish future account access or voice quality.
 
 Rejected alternatives: Automatic paid retries or provider fallback, personal Keychain/config dependencies, key-bearing process arguments, raw responses in source or distribution.
 
@@ -78,6 +80,8 @@ Rejected alternatives: Implicit stream selection, forced subtitles, global playe
 | src/lecture_localizer/storage.py | Create | Owned atomic writes, immutable artifact integrity, locking primitives and non-overwriting publication. |
 | src/lecture_localizer/jobs.py | Create | Job orchestration, per-stage signatures/invalidation, operation journal and structured job reports. |
 | src/lecture_localizer/xai_client.py | Create | Explicit synchronous request/response handling and inactivity timeouts; no full-call wall-clock guarantee or personal workflow imports. |
+| src/lecture_localizer/recoveries.py | Create | Versioned immutable local revalidation receipts, exact attempt/evidence ownership and canonical WAV provenance; no HTTP or journal rewriting. |
+| src/lecture_localizer/schemas/recovery-v1.schema.json | Create | Strict additional recovery receipt schema; unknown versions and fields are rejected without manifest/journal migration. |
 | src/lecture_localizer/audio.py | Create | PCM normalization, fitting, streaming placement and approved audio encoding. |
 | src/lecture_localizer/mux.py | Create | Explicit MP4 assembly and application of track IDs/default flags. |
 | src/lecture_localizer/verification.py | Create | Persisted output checks and evidence consumed by the job report. |
@@ -94,6 +98,7 @@ Rejected alternatives: Implicit stream selection, forced subtitles, global playe
 - Jobs -> audio -> mux -> verification. Media supplies shared tool/probe services, not provider credentials. Subtitles consume full translation independently of narration.
 - Distinguish source-cue ordinals, segment IDs, input stream indices and MP4 track IDs. Distinguish full provider response, normalized PCM, fitted PCM and encoded narration artifacts.
 - Planned CLI: doctor [--json]; prepare --video PATH --source-srt PATH --translation PATH --job DIR --output PATH [--source-audio INDEX] [--settings PATH]; run --job DIR [--allow-paid --limits PATH] [--retry-uncertain OPERATION_ID]; assemble --job DIR [--output FRESH_PATH]; status --job DIR [--json]. Paid flags/key access are required only if new requests are needed; complete-cache reuse needs none. Limits define numeric request/text/cost bounds and the applicable price basis before paid execution; this plan supplies no real values. Retry permission binds the explicit unresolved operation and current request signature.
+- Offline recovery CLI: recover --job DIR --operation OPERATION_ID --attempt N. The selected attempt must be the latest failed invalid_audio result of the current request, with matching complete HTTP 200/audio-wav evidence. Another attempt or operation, unknown transport result, changed text or damaged bytes is refused. The ordinary WAV parser remains strict; the completed-response adapter additionally supports only the exact simple 44-byte PCM1/mono/48000/16bit envelope with RIFF size 0x80000023 and data size 0x7FFFFFFF and nonempty whole physical frames below that size. Original bytes remain intact while a separate canonical copy receives actual lengths. Other finite truncation or malformed profiles stay failures. These technical checks do not prove spoken completeness or intelligibility.
 - Processing failures never return success. A successful status read is not a statement that the job passed; the reported job state retains all blocked/unverified conditions. Reports include both immutable text outputs and separate automated results, pending human review and publication/delivery state.
 
 ## Exit codes
@@ -208,6 +213,8 @@ Dependencies: Stage 5. Production/utility module radius: documentation, tests an
 
 Exit evidence: Every scoped criterion has result-version evidence and the required owner decisions, or the feature remains explicitly unaccepted with exact gaps. A passing container or source test cannot close listening/player/clean-checkout criteria.
 
+The spoken input recipe is documented in README and implemented by `scripts/make-spoken-example.py`, its adjacent source description and attribution notice. Local verification covers cold public retrieval, exact identity checks, preparation without a key and offline repetition from previously downloaded public FLACs. These inputs reproduce the accepted 60 second sample on the observed toolchain. Full local quality passes 505 tests on Python 3.12.9 and 3.14.6, including source-distribution inclusion and wheel installation. An anonymous clean public clone of published revision `1447185f3bd02c06993572cb7c1b4df586c30915` in [PR 19](https://github.com/hawkxdev/lecture-localizer/pull/19) passes AC6 source reproduction and job preparation with a new Python environment and no private configuration. Main integration and listening at the provisional speedup limit remain separate open steps.
+
 ## Verification policy
 
 Each stage runs only checks its completed code supports, maintains affected documentation/project-guide, and retains exact results and required gaps. Stage 1 creates Ruff format/check, mypy, pytest and build commands; none exist before that stage. Full offline acceptance at stages 5/6 requires actual FFmpeg/MP4Box and no required skips. Guard tests use distinct valid/invalid/boundary fixtures and demonstrable negative controls for preservation, window, cache and spending guards; do not mirror implementation. No GitHub Actions or replacement CI service.
@@ -218,7 +225,7 @@ Each stage runs only checks its completed code supports, maintains affected docu
 - On FFmpeg 9.0.2, eight short H.264/AAC/PCM/MP3/Opus mono/stereo design fixtures preserved video packets; AAC copies and conversions were inspected and fully decoded. This does not establish all encoding variants or player behavior.
 - 48k mono PCM probes covered no speedup, 1.1, 1.2 and 1.21, one/multiple nonzero-start placements and AAC-LC encoding. A 57,600-frame input at atempo=1.20 produced 48,008 frames for a 48,000-frame window; the existing postcheck correctly refuses it without clipping.
 - The same boundary fixture was independently reproduced, and a three-second headerless s16le PCM stream encoded to mono AAC-LC 48k/192k with a declared duration of 3.0 seconds and complete decoding. This is not a long-file test.
-- HTTPX/jsonschema runtime compatibility, minimum Python, live response/access, actual voice intelligibility and GUI behavior remain implementation/acceptance checks; no provider credentials or paid requests were used to prepare this plan.
+- Design probes alone do not establish HTTPX/jsonschema runtime compatibility, minimum-Python support, live access, speech intelligibility or GUI behavior; implementation and acceptance use their own result-version evidence. No provider credentials or paid requests were used to prepare this plan.
 
 ## Risks and gates
 
