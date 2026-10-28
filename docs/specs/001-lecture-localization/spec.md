@@ -117,6 +117,8 @@ A timing failure preserves the job and original speech. Report the segment ID, a
 
 Retain source responses and identify reusable work from the actual relevant inputs and settings, not segment IDs or file existence alone.
 
+Compatibility processing of a fully received speech response preserves its original bytes and derives a separate canonical WAV when necessary. Explicit offline revalidation names the recorded operation and attempt, requires intact complete HTTP evidence matching the current request, and preserves the original failed verdict. It makes no new request and does not resolve an uncertain or later paid attempt. Corrupt, incomplete or unrelated evidence remains blocked; local validation and human listening acceptance are distinct.
+
 ## Speech backend and delivery boundary
 
 The first supported speech provider is xAI, accessed directly through its Text to Speech REST API with `eve` as the initial voice. Send only the text selected for narration to the provider; retain local video processing and assembly.
@@ -163,12 +165,13 @@ The proposed package location is `src/lecture_localizer`, exposed as `lecture-lo
 | `run` | Execute the authorized job and resume unchanged completed work |
 | `assemble` | Assemble from retained artifacts without API calls |
 | `status` | Read job state and its report |
+| `recover` | Explicitly revalidate a retained failed response offline, preserving its recorded HTTP history |
 
 Run stages sequentially under one job writer. Keep a versioned JSON manifest, artifact hashes and atomic checkpoints in a user-selected job directory outside the source repository. Stage signatures separate synthesis, fitting, subtitles and container settings according to the resumption rules above. No server, database or task queue is required; execution and verification remain local.
 
 Use separately installed FFmpeg, ffprobe and GPAC MP4Box through subprocesses. FFmpeg handles audio conversion, atempo and muxing; MP4Box applies the approved MP4 track flags; ffprobe and stream extraction verify the persisted result. Check required capabilities rather than treating an arbitrary version string as proof of compatibility. Do not import pyVideoTrans internals or include any source-removal step.
 
-Request xAI speech with `voice_id=eve`, `language=ru`, `speed=1.0`, WAV output at 48 kHz and `with_timestamps=false`. Preserve the complete response body before local conversion. The request mode is documentation-backed; its actual content type, decoding and listening quality still require the authorized live pilot.
+Request xAI speech with `voice_id=eve`, `language=ru`, `speed=1.0`, WAV output at 48 kHz and `with_timestamps=false`. Preserve the complete response body before local conversion. The adapter validates response type and PCM geometry, retains the complete original bytes and derives canonical WAV separately when the recognized completed-response envelope requires it. Voice intelligibility and speech endings still require authorized human listening; structural acceptance alone does not establish them.
 
 Use mono 48 kHz signed 16-bit PCM as the working speech representation. Place complete segments at integer sample positions, adding only the necessary silence. Build long output incrementally rather than holding the whole lecture in memory. Apply atempo only when needed and remeasure its actual output against the approved window; a computed ratio alone does not establish a successful fit.
 
@@ -204,8 +207,10 @@ Project-authored code remains MIT. HTTPX and jsonschema retain their own license
 
 Meaning and listening quality need human review; container and timing checks alone do not prove them. External adoption is a separate desirable outcome.
 
+The documented spoken-source recipe obtains three hash-pinned public recordings and prepares matching subtitles and reviewed translation without provider access. A clean exported public source tree has reproduced those inputs and passed preparation; that observation does not establish delivery from a published Git clone. AC6 remains open until that delivery is verified.
+
 ## Scenario boundary and open choices
 
 The scenario starts with local media, matching English SRT subtitles and reviewed Russian text in JSON. Recording, platform access, transcription, translation generation and narration rewriting are outside this scenario.
 
-The runtime, command responsibilities, media tools, speech-fitting approach, audio encoding parameters and first-distribution boundary are approved above. The implementation plan must define task-level interfaces, dependency pins, tests and failure handling. Minimum Python compatibility, long-file handling, live speech quality and reference-player behavior remain unverified; the provisional speedup limit still needs listening validation.
+The runtime, command responsibilities, media tools, speech-fitting approach, audio encoding parameters and first-distribution boundary are approved above. The implementation plan defines task-level interfaces, dependency pins, tests and failure handling. Local automated checks cover Python 3.12.9 and 3.14.6; they do not establish every interpreter, encoding or operating-system variant. The owner reported satisfactory listening, track switching and QuickTime/IINA behavior for one 60 second output; that acceptance applies to that sample. Actual long-lecture use and the provisional speedup limit still need their separate validation.

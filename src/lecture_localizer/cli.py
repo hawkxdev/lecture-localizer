@@ -18,6 +18,7 @@ from lecture_localizer.jobs import (
     describe_pipeline_failure,
     prepare_job,
     read_job_status,
+    recover_response,
     run_job_pipeline,
 )
 from lecture_localizer.media import DoctorReport, MediaToolError, run_doctor
@@ -176,6 +177,13 @@ def build_parser() -> argparse.ArgumentParser:
         dest='output_path',
         help='Additional fresh output path for a second copy',
     )
+    recover = commands.add_parser(
+        'recover',
+        help='Revalidate a retained failed response offline',
+    )
+    recover.add_argument('--job', required=True, type=Path, dest='job_dir')
+    recover.add_argument('--operation', required=True, dest='operation_id')
+    recover.add_argument('--attempt', required=True, type=int)
     return parser
 
 
@@ -500,6 +508,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_run(args)
         if args.command == 'assemble':
             return _run_assemble(args)
+        if args.command == 'recover':
+            return _run_recover(args)
     except KeyboardInterrupt:
         print(
             'interrupted; job state stays at its last checkpoint',
@@ -508,6 +518,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_INTERRUPTED
     parser.error(f'unhandled command: {args.command}')
     raise AssertionError('unreachable')
+
+
+def _run_recover(args: argparse.Namespace) -> int:
+    """Revalidate recorded response bytes without a paid operation."""
+    try:
+        receipt = recover_response(
+            args.job_dir,
+            operation_id=args.operation_id,
+            attempt_number=args.attempt,
+        )
+    except KeyboardInterrupt:
+        return EXIT_INTERRUPTED
+    except Exception as error:
+        exit_code, kind, detail = describe_pipeline_failure(error)
+        print(f'{kind}: {detail}', file=sys.stderr)
+        return exit_code
+    print(
+        json.dumps(
+            {'command': 'recover', 'receipt': receipt},
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return EXIT_OK
 
 
 __all__ = [

@@ -18,7 +18,7 @@ Own lecture-localizer's media vocabulary and implementation knowledge. `README.m
 
 ## Implemented capabilities (stage 2 through 5)
 
-The integrated pipeline of stages 2 to 5 is delivered; stage 6 spoken example, listening and player acceptance remain open.
+The integrated pipeline of stages 2 to 5 is delivered; full stage 6 acceptance remains open. Listening and player acceptance are specific to the exact output and the owner report, separate from source reproducibility and provisional speedup validation.
 
 | Capability | Owner |
 |---|---|
@@ -27,6 +27,7 @@ The integrated pipeline of stages 2 to 5 is delivered; stage 6 spoken example, l
 | `lecture-localizer status [--json]` read only report | `src/lecture_localizer/jobs.py`, `cli.py` |
 | `lecture-localizer run` guarded pipeline with publication | `src/lecture_localizer/jobs.py`, `cli.py` |
 | `lecture-localizer assemble` offline assembly and publication | `src/lecture_localizer/jobs.py`, `cli.py` |
+| `lecture-localizer recover` explicit offline response revalidation | `src/lecture_localizer/recoveries.py`, `jobs.py`, `cli.py` |
 | Guarded synchronous speech adapter and operations journal | `src/lecture_localizer/xai_client.py`, `jobs.py` |
 | PCM normalization, fitting, streaming timeline, AAC tracks | `src/lecture_localizer/audio.py` |
 | Five stream MP4 candidate with persisted flags | `src/lecture_localizer/mux.py` |
@@ -37,6 +38,7 @@ The integrated pipeline of stages 2 to 5 is delivered; stage 6 spoken example, l
 | Packaged Draft 2020 12 translation and job schemas | `src/lecture_localizer/schemas/` |
 | Local quality runner with artifact privacy gate | `scripts/qc-python-cli.sh` |
 | Deterministic synthetic fixtures | `scripts/make-synthetic-example.py` |
+| Public verified spoken source recipe | `scripts/make-spoken-example.py`, `scripts/spoken-example-v1.json` |
 
 Prepare verifies video and SRT hashes against the translation binding, parses cues by ordinal position, derives nonoverlapping windows, validates the media profile (H.264 yuv420p SDR, AAC LC or convertible mono/stereo audio) and requires explicit audio selection for multi track inputs. A refreshed translation with the new source hashes is an explicit rebind: affected window, fitting, subtitle and container identities are recomputed from the changed inputs while old revisions and artifacts stay in place. Cache eligibility requires current matching records with verified bytes for every required unit; fitted audio never stands in for missing raw provenance, and the distribution gate rejects runtime data under the package root. Stage signatures separate synthesis, fitting, subtitle and container work so reuse decisions follow the approved dependency table: changed narration invalidates affected synthesis and downstream work, translation only changes preserve speech, fitting changes reuse raw speech, startup default changes reuse prepared tracks, and changed video or SRT requires a rebound translation. Corrupt cache bytes fail prepare with exit 3 while status stays readable and reports blockers. Status is read only, exits 0 for a readable job and reports blocked conditions explicitly. Exit codes: 0 ok, 2 usage, 3 contract and input violations, 4 paid execution denied before any request, 5 provider or transport failure including unresolved operations, 6 timing refusal or failed verification, 7 tool or filesystem failures, 130 interruption.
 
@@ -56,10 +58,16 @@ The job artifacts below are implemented; the artifact table lists the actual per
 | Cached artifacts | Hash pinned files: raw provider responses, per segment normalized and placed PCM, the assembled timeline, prepared narration and original AAC tracks, Russian subtitles and the verified candidate MP4; missing or corrupt bytes are reported as blocked, never reconstructed from processed audio |
 | Publication receipt | Durable `evidence/publication.json` with the device, inode and size identity of the linked output; byte equality alone never proves ownership of an output file |
 | Run reports | Per invocation `evidence/run-*.json` with speech summary, fit evidence, verification checks, publication state, immutable text output hashes and separate pending human checks |
+| Local recovery receipt | Strict version 1 `evidence/recoveries/*.json` binding an unchanged failed HTTP attempt, original response, request and registered raw artifact; it records local validation and never fabricates a new request |
+| Canonical response WAV | Separately derived `evidence/canonical-wav/<source-sha256>.wav`; verified against the complete original response before PCM normalization |
 | Original media | The source video and audio retained independently of localized output |
 | Verification report | Evidence about the produced media; container and timing checks alone do not establish translation quality |
 
 Read the approved scenario linked in the knowledge index for resumption requirements, acceptance criteria and open technical choices.
+
+For completed-response compatibility, canonical WAV provenance and offline revalidation, read [response recovery](references/response-recovery.md) before diagnosing or changing that path. README owns command examples and the feature contract owns acceptance.
+
+For the obtainable spoken input, source identity checks and offline reproduction, read [spoken example](references/spoken-example.md). Keep tone tests, source preparation and paid narration as separate evidence.
 
 ## Development of this guide
 

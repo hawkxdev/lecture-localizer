@@ -27,7 +27,7 @@ Run the local quality runner from the repository root:
 scripts/qc-python-cli.sh
 ```
 
-The runner creates `.venv` when it is missing and then, propagating every failure: Ruff format check, Ruff check, mypy, the stage test suite, the package build, an artifact privacy gate that rejects any archive member outside the public allowlist and any runtime or user data under the package root, and a fresh-venv wheel installation smoke test that runs the `lecture-localizer` console entry and loads all three packaged schemas from the installed wheel. The doctor tests exercise the real local FFmpeg, ffprobe and MP4Box, so those tools must be installed for the suite to pass; this is a setup prerequisite, not a hidden skip. Full diagnostics on macOS additionally follow [README.md](README.md).
+The runner creates `.venv` when it is missing and then, propagating every failure: Ruff format check, Ruff check, mypy, the stage test suite, the package build, an artifact privacy gate that rejects any archive member outside the public allowlist and any runtime or user data under the package root, and a fresh-venv wheel installation smoke test that runs the `lecture-localizer` console entry and loads all four packaged schemas from the installed wheel. The doctor tests exercise the real local FFmpeg, ffprobe and MP4Box, so those tools must be installed for the suite to pass; this is a setup prerequisite, not a hidden skip. Full diagnostics on macOS additionally follow [README.md](README.md).
 
 Synthetic, rights-safe media fixtures are created only in an explicit new directory:
 
@@ -45,5 +45,7 @@ git diff --cached --check
 ```
 
 These commands inspect unstaged and staged changes to tracked files. Run checks locally; do not add GitHub Actions workflows.
+
+Recovery checks use fabricated PCM and HTTP evidence. Keep the ordinary strict WAV parser, incomplete-transfer refusal, unchanged response bytes, immutable failed-attempt history, exact request identity, one-writer locking and zero-network recovery controls. Test the recognized completed-response envelope separately from finite truncated WAV files. The installed package must load all four schemas, including `recovery-v1.schema.json`; the archive gate keeps an exact schema allowlist rather than admitting arbitrary package data. Real user jobs, provider bodies and private pilot evidence never become test fixtures or distribution content.
 
 Use only material you have the right to share. Contributions to this repository are under the [MIT License](LICENSE); review compatibility and required notices before introducing third-party material.

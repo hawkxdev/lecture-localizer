@@ -17,7 +17,14 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-from lecture_localizer import audio, media, mux, verification, xai_client
+from lecture_localizer import (
+    audio,
+    media,
+    mux,
+    recoveries,
+    verification,
+    xai_client,
+)
 from lecture_localizer.audio import NormalizedSpeech, SegmentPlacement
 from lecture_localizer.contracts import (
     ContractError,
@@ -809,6 +816,12 @@ def prepare_job(
         stored: dict[str, Any] | None = None
         if manifest_path.exists():
             stored = load_job_manifest(manifest_path)
+            recoveries.validate_manifest_links(
+                stored,
+                recoveries.read_receipts(
+                    job_dir, load_operations_journal(job_dir)
+                ),
+            )
             snapshot_failures = verify_integrity(
                 job_dir, _snapshot_integrity_records(stored)
             )
@@ -831,6 +844,13 @@ def prepare_job(
                     ' reusable work cannot be decided until the job'
                     ' directory is inspected'
                 )
+            _require_streamed_response_provenance(
+                job_dir,
+                stored,
+                recoveries.read_receipts(
+                    job_dir, load_operations_journal(job_dir)
+                ),
+            )
         else:
             _ensure_create_ready(job_dir)
         manifest, invalidated, created, unchanged = _build_job_state(
@@ -1583,6 +1603,16 @@ def read_job_status(job_dir: Path) -> dict[str, Any]:
     blocked.extend(assembly['blocked'])
     operations, journal_blocked = _status_operations_view(job_dir)
     blocked.extend(journal_blocked)
+    try:
+        recovered = recoveries.read_receipts(
+            job_dir, load_operations_journal(job_dir)
+        )
+        recoveries.validate_manifest_links(manifest, recovered)
+        _require_streamed_response_provenance(job_dir, manifest, recovered)
+        recovery_view = {'state': 'ok', 'receipts': recovered}
+    except (ContractError, OSError) as error:
+        recovery_view = {'state': 'invalid', 'receipts': []}
+        blocked.append(f'local recovery integrity failure: {error}')
     publication = _publication_status_view(
         job_dir, manifest, artifacts, failed_labels
     )
@@ -1605,6 +1635,7 @@ def read_job_status(job_dir: Path) -> dict[str, Any]:
         },
         'reuse': _reuse_view(manifest, failed_labels),
         'operations': operations,
+        'local_recoveries': recovery_view,
         'publication': {
             key: value
             for key, value in publication.items()
@@ -1775,7 +1806,8 @@ def load_operations_journal(job_dir: Path) -> dict[str, Any] | None:
 def _check_operations_journal(job_dir: Path) -> None:
     """Refuse preparation while the journal is malformed or unknown."""
     try:
-        load_operations_journal(job_dir)
+        journal = load_operations_journal(job_dir)
+        recoveries.read_receipts(job_dir, journal)
     except ContractError as error:
         raise ContractError(
             f'operations journal check failed: {error};'
@@ -1861,6 +1893,84 @@ def _verify_job_integrity(job_dir: Path, manifest: dict[str, Any]) -> None:
             f' {names}; damaged cached provenance stops paid execution'
             ' before any request'
         )
+    recovered = recoveries.read_receipts(
+        job_dir, load_operations_journal(job_dir)
+    )
+    recoveries.validate_manifest_links(manifest, recovered)
+    _require_streamed_response_provenance(job_dir, manifest, recovered)
+
+
+def _require_streamed_response_provenance(
+    job_dir: Path,
+    manifest: dict[str, Any],
+    recovered: list[dict[str, Any]],
+) -> None:
+    """Require completed HTTP ownership before using indeterminate WAV data."""
+    journal = load_operations_journal(job_dir)
+    for segment in manifest['segments']:
+        record = _current_record(
+            manifest,
+            'raw_response',
+            segment['id'],
+            segment['synthesis_signature'],
+        )
+        if record is None:
+            continue
+        path = job_dir / record['path']
+        if not xai_client.has_streamed_pcm_header(path):
+            continue
+        text = _posted_text(job_dir, manifest, segment['id'])
+        request = request_signature(text)
+        text_sha = _segment_text_hash(text)
+        if any(
+            receipt['artifact']['path'] == record['path']
+            and receipt['source']['sha256'] == record['sha256']
+            and receipt['posted_text_sha256'] == text_sha
+            and receipt['request_signature'] == request
+            for receipt in recovered
+        ):
+            continue
+        try:
+            facts = xai_client.parse_completed_wav(path).to_dict()
+        except xai_client.InvalidAudioResponse as error:
+            raise ContractError(
+                f'indeterminate WAV is invalid: {error}'
+            ) from error
+        proven = False
+        for operation in (journal or {}).get('operations', []):
+            if (
+                operation['segment_id'] != segment['id']
+                or operation['synthesis_signature'] != record['signature']
+                or operation['posted_text_sha256'] != text_sha
+                or operation['request_signature'] != request
+            ):
+                continue
+            _validate_operation_provenance(job_dir, operation, text)
+            for attempt in operation['attempts']:
+                response = attempt['response']
+                if (
+                    attempt['verdict'] == 'completed'
+                    and attempt['failure'] is None
+                    and attempt['finished_at']
+                    and attempt['request_signature'] == request
+                    and attempt['artifact']
+                    == {
+                        'path': record['path'],
+                        'sha256': record['sha256'],
+                    }
+                    and response is not None
+                    and response['status'] == 200
+                    and response['content_type'].split(';')[0].strip().lower()
+                    == 'audio/wav'
+                    and response['sha256'] == record['sha256']
+                    and response['bytes'] == path.stat().st_size
+                    and response['wav'] == facts
+                ):
+                    proven = True
+        if not proven:
+            raise ContractError(
+                'indeterminate WAV cache requires complete HTTP provenance'
+            )
 
 
 def _verify_window_feasibility(manifest: dict[str, Any]) -> None:
@@ -2543,6 +2653,72 @@ def _latest_failure_kind(journal: dict[str, Any], segment_id: str) -> str:
     return 'unknown'
 
 
+def recover_response(
+    job_dir: Path,
+    *,
+    operation_id: str,
+    attempt_number: int,
+    settings: Settings | None = None,
+    now: Callable[[], str] | None = None,
+) -> dict[str, Any]:
+    """Revalidate one retained failed response without HTTP or key access."""
+    if type(attempt_number) is not int or attempt_number < 1:
+        raise ContractError('recovery attempt must be a positive integer')
+    job_dir = job_dir.expanduser().resolve()
+    now_fn = now or utc_now_iso
+    with JobLock.acquire(job_dir):
+        manifest = load_job_manifest(job_dir / MANIFEST_NAME)
+        _verify_job_integrity(job_dir, manifest)
+        _verify_source_binding(manifest)
+        _verify_source_decodability(manifest, settings or load_settings())
+        _verify_window_feasibility(manifest)
+        journal = load_operations_journal(job_dir)
+        if journal is None:
+            raise ContractError(
+                'recovery needs its recorded operation journal'
+            )
+        operation = next(
+            (
+                o
+                for o in journal['operations']
+                if o['operation_id'] == operation_id
+            ),
+            None,
+        )
+        if operation is None:
+            raise ContractError('recovery operation was not found')
+        text = _posted_text(job_dir, manifest, operation['segment_id'])
+        _validate_operation_provenance(job_dir, operation, text)
+        receipt = recoveries.recover(
+            job_dir,
+            manifest,
+            journal,
+            operation_id=operation_id,
+            attempt_number=attempt_number,
+            posted_text_sha256=_segment_text_hash(text),
+            request_signature=request_signature(text),
+            validated_at=now_fn(),
+        )
+        artifact = receipt['artifact']
+        if not any(
+            r['path'] == artifact['path'] for r in manifest['artifacts']
+        ):
+            manifest['artifacts'].append(
+                {
+                    'kind': 'raw_response',
+                    'segment': receipt['segment_id'],
+                    'signature': receipt['synthesis_signature'],
+                    'path': artifact['path'],
+                    'sha256': artifact['sha256'],
+                    'created_at': receipt['validated_at'],
+                }
+            )
+            _rebuild_manifest_view(manifest)
+            manifest['updated_at'] = now_fn()
+            atomic_write_json(job_dir / MANIFEST_NAME, manifest)
+        return receipt
+
+
 def _validate_operation_provenance(
     job_dir: Path,
     operation: dict[str, Any],
@@ -2930,8 +3106,14 @@ def _build_normalized_unit(
         )
     temp = job_dir / 'artifacts' / f'.normalized-{uuid.uuid4().hex[:12]}.pcm'
     try:
-        audio.normalize_wav(
+        canonical = recoveries.canonical_path(job_dir, raw_record['sha256'])
+        xai_client.canonicalize_completed_wav(
             job_dir / raw_record['path'],
+            canonical,
+            source_sha256=raw_record['sha256'],
+        )
+        audio.normalize_wav(
+            canonical,
             temp,
             ffmpeg_path=tools['ffmpeg'],
             timeout_seconds=tools['timeout_seconds'],
@@ -3334,6 +3516,7 @@ def _reconcile_registered_operations(
     if not unresolved:
         return
     writable = _new_journal(journal, now_fn())
+    recovered = recoveries.read_receipts(job_dir, journal)
     now = now_fn()
     for operation in unresolved:
         segment_id = operation['segment_id']
@@ -3358,6 +3541,12 @@ def _reconcile_registered_operations(
         if (
             record is None
             or record['signature'] != operation['synthesis_signature']
+        ):
+            continue
+        if any(
+            receipt['artifact']['path'] == record['path']
+            and receipt['operation_id'] != operation['operation_id']
+            for receipt in recovered
         ):
             continue
         try:
@@ -3996,6 +4185,7 @@ def _write_run_report(
         'verification': verification_view,
         'failed_verification': failure_report,
         'publication': publication,
+        'local_recoveries': _local_recovery_report(job_dir),
         'text_outputs': text_outputs,
         'automated_checks': [
             'job manifest and retained artifact integrity verified',
@@ -4020,6 +4210,17 @@ def _write_run_report(
     relative = f'{EVIDENCE_DIR}/{name}'
     atomic_write_json(job_dir / relative, payload)
     return relative
+
+
+def _local_recovery_report(job_dir: Path) -> dict[str, Any]:
+    """Describe local validation separately from original HTTP attempts."""
+    try:
+        receipts = recoveries.read_receipts(
+            job_dir, load_operations_journal(job_dir)
+        )
+        return {'state': 'ok', 'receipts': receipts}
+    except (ContractError, OSError) as error:
+        return {'state': 'invalid', 'receipts': [], 'detail': str(error)}
 
 
 def _latest_report_name(job_dir: Path) -> str | None:

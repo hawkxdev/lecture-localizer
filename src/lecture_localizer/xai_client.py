@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import struct
+import tempfile
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +14,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from lecture_localizer.storage import sha256_bytes
+from lecture_localizer.storage import move_new_file, sha256_bytes, sha256_file
 
 TTS_URL = 'https://api.x.ai/v1/tts'
 KEY_ENV_VAR = 'XAI_API_KEY'
@@ -28,6 +29,11 @@ WAVE_FORMAT_EXTENSIBLE = 0xFFFE
 PCM_SUBFORMAT_GUID = bytes.fromhex('0100000000001000800000aa00389b71')
 SUPPORTED_BITS_PER_SAMPLE = frozenset({8, 16, 24, 32})
 MAX_TEXT_CHARS = 60000
+STREAMED_RIFF_SIZE = 0x80000023
+STREAMED_DATA_SIZE = 0x7FFFFFFF
+PCM_HEADER_BYTES = 44
+PCM_FRAME_BYTES = 2
+WAV_COPY_BYTES = 1 << 20
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0
 DEFAULT_READ_TIMEOUT_SECONDS = 120.0
 DEFAULT_WRITE_TIMEOUT_SECONDS = 30.0
@@ -460,7 +466,7 @@ class SpeechClient:
                 ),
             )
         try:
-            facts = parse_wav_header(sink)
+            facts = parse_completed_wav(sink)
         except InvalidAudioResponse as error:
             _, _, excerpt = _excerpt_from(sink)
             raise InvalidAudioResponse(
@@ -494,6 +500,126 @@ def parse_wav_header(path: Path) -> WavFacts:
             f'the response sink could not be read: {error}',
             FailureEvidence(None, None, 0, sha256_bytes(b''), ''),
         ) from error
+
+
+def _streamed_pcm_header() -> bytes:
+    """Describe the supported indeterminate PCM envelope."""
+    return struct.pack(
+        '<4sI4s4sIHHIIHH4sI',
+        b'RIFF',
+        STREAMED_RIFF_SIZE,
+        b'WAVE',
+        b'fmt ',
+        16,
+        WAVE_FORMAT_PCM,
+        1,
+        REQUIRED_SAMPLE_RATE_HZ,
+        REQUIRED_SAMPLE_RATE_HZ * PCM_FRAME_BYTES,
+        PCM_FRAME_BYTES,
+        16,
+        b'data',
+        STREAMED_DATA_SIZE,
+    )
+
+
+def has_streamed_pcm_header(path: Path) -> bool:
+    """Identify an envelope without asserting transport completion."""
+    with path.open('rb') as handle:
+        return handle.read(PCM_HEADER_BYTES) == _streamed_pcm_header()
+
+
+def parse_completed_wav(path: Path) -> WavFacts:
+    """Validate a fully received response without changing its bytes."""
+    try:
+        return parse_wav_header(path)
+    except InvalidAudioResponse as error:
+        with path.open('rb') as handle:
+            header = handle.read(PCM_HEADER_BYTES)
+            size = os.fstat(handle.fileno()).st_size
+        if header != _streamed_pcm_header():
+            raise
+        data_bytes = size - PCM_HEADER_BYTES
+        if (
+            data_bytes <= 0
+            or data_bytes >= STREAMED_DATA_SIZE
+            or data_bytes % PCM_FRAME_BYTES
+        ):
+            raise _invalid(
+                'streamed PCM must contain nonempty whole frames'
+            ) from error
+        return WavFacts(
+            WAVE_FORMAT_PCM, 1, REQUIRED_SAMPLE_RATE_HZ, 16, data_bytes
+        )
+
+
+def canonicalize_completed_wav(
+    source: Path, destination: Path, *, source_sha256: str
+) -> WavFacts:
+    """Materialize a distinct canonical WAV with verified source identity."""
+    facts = parse_completed_wav(source)
+    if source.resolve() == destination.resolve() or destination.is_symlink():
+        raise _invalid('canonical WAV destination must be a distinct file')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=destination.parent, suffix='.wav')
+    temporary_path = Path(temporary)
+    digest = hashlib.sha256()
+    try:
+        with os.fdopen(fd, 'wb') as writer, source.open('rb') as reader:
+            header = reader.read(PCM_HEADER_BYTES)
+            digest.update(header)
+            if header == _streamed_pcm_header():
+                canonical = bytearray(header)
+                struct.pack_into('<I', canonical, 4, facts.data_bytes + 36)
+                struct.pack_into('<I', canonical, 40, facts.data_bytes)
+                writer.write(canonical)
+            else:
+                writer.write(header)
+            while chunk := reader.read(WAV_COPY_BYTES):
+                digest.update(chunk)
+                writer.write(chunk)
+            writer.flush()
+            os.fsync(writer.fileno())
+        if digest.hexdigest() != source_sha256:
+            raise _invalid('completed response source hash changed')
+        canonical_facts = parse_wav_header(temporary_path)
+        if canonical_facts != facts:
+            raise _invalid('canonical WAV facts disagree with source PCM')
+        if destination.exists():
+            if sha256_file(destination) != sha256_file(temporary_path):
+                raise _invalid('existing canonical WAV has different bytes')
+        else:
+            move_new_file(temporary_path, destination)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return facts
+
+
+def validate_canonical_wav(
+    source: Path, canonical: Path, *, source_sha256: str
+) -> WavFacts:
+    """Verify the complete derivation without writing either file."""
+    facts = parse_completed_wav(source)
+    if parse_wav_header(canonical) != facts:
+        raise _invalid('canonical WAV facts disagree with source PCM')
+    digest = hashlib.sha256()
+    with source.open('rb') as reader, canonical.open('rb') as derived:
+        header = reader.read(PCM_HEADER_BYTES)
+        digest.update(header)
+        expected = bytearray(header)
+        if header == _streamed_pcm_header():
+            struct.pack_into('<I', expected, 4, facts.data_bytes + 36)
+            struct.pack_into('<I', expected, 40, facts.data_bytes)
+        if derived.read(PCM_HEADER_BYTES) != expected:
+            raise _invalid('canonical WAV header disagrees with source')
+        while chunk := reader.read(WAV_COPY_BYTES):
+            digest.update(chunk)
+            if derived.read(len(chunk)) != chunk:
+                raise _invalid('canonical WAV does not preserve source PCM')
+        if derived.read(1):
+            raise _invalid('canonical WAV has unexpected trailing bytes')
+    if digest.hexdigest() != source_sha256:
+        raise _invalid('completed response source hash changed')
+    return facts
 
 
 def _parse_wav_stream(handle: Any, file_size: int) -> WavFacts:
