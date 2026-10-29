@@ -13,7 +13,9 @@ The first stage ships an installable package whose `doctor` command inspects the
 Requirements: Python 3.12 or later, with FFmpeg, ffprobe and GPAC MP4Box installed locally for full diagnostics.
 
 ```sh
-python -m venv .venv
+git clone https://github.com/hawkxdev/lecture-localizer.git
+cd lecture-localizer
+python3 -m venv .venv
 .venv/bin/pip install .
 .venv/bin/lecture-localizer doctor
 .venv/bin/lecture-localizer doctor --json
@@ -71,11 +73,11 @@ Preparation needs no speech key or paid permission. `limits.example.json` descri
   --source-srt LECTURE.srt \
   --translation translation.json \
   --job /path/to/job-directory \
-  --output /path/to/new-output.mp4 \
-  [--source-audio INDEX] \
-  [--settings /path/to/settings.json]
-.venv/bin/lecture-localizer status --job /path/to/job-directory [--json]
+  --output /path/to/new-output.mp4
+.venv/bin/lecture-localizer status --job /path/to/job-directory --json
 ```
+
+Run these commands from the repository root, replacing the example filenames and paths with your inputs and fresh destinations. Add `--source-audio INDEX` to `prepare` when the video has multiple audio tracks, and `--settings /path/to/settings.json` when using a settings file. Omit `--json` from `status` for a human-readable report.
 
 `prepare` verifies the video and SRT hashes recorded in the translation JSON, parses source cues by ordinal position, derives positive nonoverlapping segment windows, inspects the actual media streams with ffprobe and requires an explicit `--source-audio INDEX` whenever the input carries more than one audio track. The job directory keeps a versioned `manifest.json`, immutable per revision snapshots of the full translation, the resolved narration text and the source cue text and times, and a one writer `lock` file. Repeated preparation with unchanged inputs reports `unchanged` and writes nothing; changed narration or translation text updates the stage signatures recorded in the manifest so later stages can tell preserved work from work that must be redone.
 
@@ -92,12 +94,11 @@ Settings files keep the documented tool fields and now accept the job policy fie
 `run` executes the complete guarded pipeline over one prepared job under a single writer lock: guarded speech synthesis, PCM normalization, per segment fitting, timeline assembly, narration and original audio preparation, Russian subtitle generation, MP4 candidate assembly, persisted candidate verification and non-overwriting publication.
 
 ```sh
-.venv/bin/lecture-localizer run --job /path/to/job-directory \
-  [--allow-paid --limits /path/to/limits.json] \
-  [--retry-uncertain OPERATION_ID]
-.venv/bin/lecture-localizer assemble --job /path/to/job-directory \
-  [--output /path/to/additional-fresh-output.mp4]
+.venv/bin/lecture-localizer run --job /path/to/job-directory
+.venv/bin/lecture-localizer assemble --job /path/to/job-directory
 ```
+
+These commands use retained speech artifacts without authorizing new paid requests. If synthesis is needed, `run` stops until you explicitly add `--allow-paid --limits /path/to/limits.json` and supply the required key. Add `--retry-uncertain OPERATION_ID` only for an explicitly approved retry of that exact unresolved operation. To publish an additional output with `assemble`, add `--output /path/to/additional-fresh-output.mp4` using a fresh destination.
 
 Paid requests require `--allow-paid` plus an explicit limits JSON file (`max_requests`, `max_text_chars`, `max_cost_estimate`, `price_per_request`, `price_basis`; unknown fields are rejected) and the `XAI_API_KEY` environment variable. The guards run in that order before any network activity; an unchanged complete cache makes zero provider calls and reads no key. An interrupted or unknown-outcome request stays visibly unresolved in the operations journal and blocks new paid work until the exact operation is retried by ID with refreshed limits; the original receipt is preserved.
 
