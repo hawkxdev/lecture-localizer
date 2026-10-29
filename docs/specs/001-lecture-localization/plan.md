@@ -1,6 +1,8 @@
 # HLD: Localize one lecture with a reviewed translation
 
-**Plan decision:** Approved design and stage sequence; implementation requires a separately assigned task.
+**Execution status:** Completed: all 6 stages and 28 planned tasks are delivered. The [specification](spec.md#preparation-state) owns feature acceptance and its evidence limits; this plan records execution against that accepted result.
+
+**Plan decision:** Approved design and stage sequence. Implementation was delivered through the separately assigned stage tasks linked below.
 
 **Requirements:** [spec.md](spec.md), approved baseline SHA-256 `2fe9d48919372bce1a87c225cd4136e8119a0165982af108d5ffe83b8d61af57`. Requirements and feature phase remain there.
 
@@ -116,14 +118,14 @@ Rejected alternatives: Implicit stream selection, forced subtitles, global playe
 
 ## Stage overview
 
-| Stage | Tasks | Deliverable |
-|---|---|---|
-| 1 | 4 | Installable package and local tool checks |
-| 2 | 5 | Validated persistent jobs and selective reuse |
-| 3 | 5 | Guarded direct speech adapter |
-| 4 | 5 | Complete fitted narration on a streaming timeline |
-| 5 | 5 | Verified MP4 and complete offline CLI flow |
-| 6 | 4 | Reproducible candidate and owner acceptance |
+| Stage | Tasks | Deliverable | Execution status |
+|---|---|---|---|
+| 1 | 4 | Installable package and local tool checks | Completed |
+| 2 | 5 | Validated persistent jobs and selective reuse | Completed |
+| 3 | 5 | Guarded direct speech adapter | Completed |
+| 4 | 5 | Complete fitted narration on a streaming timeline | Completed |
+| 5 | 5 | Verified MP4 and complete offline CLI flow | Completed |
+| 6 | 4 | Reproducible candidate and owner acceptance | Completed |
 
 <!-- === Stage 1: Installable package and local tool checks === -->
 ## Stage 1: Installable package and local tool checks
@@ -247,4 +249,4 @@ Each stage runs only checks its completed code supports, maintains affected docu
 
 ## Authority and next step
 
-The owner approved this design and stage sequence for saving. Stage 1 is delivered through [PR 6](https://github.com/hawkxdev/lecture-localizer/pull/6); Stage 2 is delivered through the merged [issue 7](https://github.com/hawkxdev/lecture-localizer/issues/7) work; the speech, audio and container components are delivered through PRs 16, 15 and 17; the stage 5.4-5.5 integration is implemented in [PR 18](https://github.com/hawkxdev/lecture-localizer/pull/18), which owns its current technical review and merge status. Stage 6 is reconciled against all six criteria at the specification, including the owner decisions on the short reference example. No additional implementation, paid execution, playback, publication, merge or deployment is assigned by that acceptance. Follow [CONTRIBUTING.md](../../../CONTRIBUTING.md) and the approved feature contract. No schedule, price or owner capacity is invented; dependency order is technical rather than a calendar forecast.
+All planned work is completed. Stage 1 is delivered through [PR 6](https://github.com/hawkxdev/lecture-localizer/pull/6); Stage 2 through the merged [issue 7](https://github.com/hawkxdev/lecture-localizer/issues/7) work; the speech, audio and container components through PRs [16](https://github.com/hawkxdev/lecture-localizer/pull/16), [15](https://github.com/hawkxdev/lecture-localizer/pull/15) and [17](https://github.com/hawkxdev/lecture-localizer/pull/17); and final integration through merged [PR 18](https://github.com/hawkxdev/lecture-localizer/pull/18). Stage 6 is completed against all six criteria at the [specification](spec.md#preparation-state), including the owner decisions on the short macOS/Eve reference example and the reproducible public recipe delivered through [PR 19](https://github.com/hawkxdev/lecture-localizer/pull/19). Acceptance documentation is delivered through merged [PR 20](https://github.com/hawkxdev/lecture-localizer/pull/20), and the component umbrella [issue 9](https://github.com/hawkxdev/lecture-localizer/issues/9) is closed. The specification remains the sole feature-phase owner. Further product work requires a separately assigned scope; completion does not assign new paid execution, playback, publication, merge, release or deployment.
