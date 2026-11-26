@@ -239,6 +239,17 @@ def test_render_srt_round_trips_through_parse_srt() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    'text',
+    ['日本語の字幕', 'مَرْحَبًا', 'café', 'cafe\u0301', 'Books 📚'],
+    ids=['japanese', 'arabic-diacritics', 'composed', 'decomposed', 'non-bmp'],
+)
+def test_srt_round_trip_preserves_unicode_text_and_timing(text: str) -> None:
+    entry = SubtitleEntry(start_ms=125, end_ms=2345, text=text)
+    (cue,) = parse_srt(render_srt([entry]))
+    assert (cue.text, cue.start_ms, cue.end_ms) == (text, 125, 2345)
+
+
 def test_render_srt_rejects_nonpositive_window() -> None:
     with pytest.raises(SubtitlesError, match='after its start'):
         render_srt(
