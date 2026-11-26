@@ -2,7 +2,7 @@
 
 ## Project sources
 
-Read `README.md` for purpose and status, and `.agents/skills/project-guide/SKILL.md` for media concepts and project knowledge. The current feature phase is owned by the [feature specification](docs/specs/001-lecture-localization/spec.md) Preparation state, together with its approved choices and open technical decisions.
+Read `README.md` for purpose and status, and `.agents/skills/project-guide/SKILL.md` for media concepts and project knowledge. Feature 001 keeps its accepted phase at the [feature specification](docs/specs/001-lecture-localization/spec.md#preparation-state). Feature 002 requirements belong to [spec.md](docs/specs/002-multilingual-localization/spec.md); its phase and local task assignments belong to [tasks.md](docs/specs/002-multilingual-localization/tasks.md#feature-state), and architecture belongs to [plan.md](docs/specs/002-multilingual-localization/plan.md).
 
 Before implementation, agree the intended user, inputs, outputs, automation boundaries, stop conditions and acceptance criteria in the feature contract. Proposed behavior is not an implementation assignment.
 
@@ -21,4 +21,4 @@ Use one Git root. Code belongs in `src/`, tests in `tests/`, utilities in `scrip
 
 ## Languages
 
-Write the primary README and agent instructions in English; skill discovery triggers use Russian and English. Other human-facing project notes use Russian unless requested otherwise. Ask before creating `README.ru.md` and reuse the current task's answer.
+Write all project-authored documentation in English, including specifications, plans, task files, reports, private process notes and handoffs. Conversation with the owner may remain Russian. Preserve exact quotations, original source evidence, language-dependent examples and Russian/English skill discovery triggers. Before saving a document, inspect authored prose outside those protected fragments and reject Russian prose; the current English project documents are the reference. Do not create `README.ru.md` unless the owner explicitly requests it.
